@@ -1,100 +1,65 @@
-#!/usr/bin/env -S deno run --allow-read --allow-write --allow-run
+#!/usr/bin/env node
 
 /**
- * Handoff Protocol - Save Script
- *
- * Collects current work context and writes to .handoff/ directory.
+ * Handoff Protocol - Save Script (Node.js Reference Implementation)
  *
  * Usage:
- *   deno run --allow-read --allow-write --allow-run save.ts [mode]
+ *   node save.mjs [mode]
  *
  * Modes:
- *   (default) - Standard save with current state
- *   compact   - Minimal summary (goal + status + next steps only)
- *   full      - Maximum context (extended history, full diff stats)
- *   diff      - Focus on code changes
+ *   (default) - Standard save
+ *   compact   - Minimal summary
+ *   full      - Maximum context
+ *   diff      - Focus on changes
  */
 
-import { parse } from "https://deno.land/std@0.224.0/flags/mod.ts";
-import { ensureDir, walk } from "https://deno.land/std@0.224.0/fs/mod.ts";
-import { join, extname } from "https://deno.land/std@0.224.0/path/mod.ts";
+import { execSync } from "node:child_process";
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { join, extname, relative } from "node:path";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
-interface ModifiedFile {
-  path: string;
-  description: string;
-  change_type: string;
-}
+/** @typedef {{ path: string; description: string; change_type: string }} ModifiedFile */
+/** @typedef {{ task: string; priority: string; status: string }} TodoItem */
+/** @typedef {{ title: string; context: string; decision: string; rationale: string }} Decision */
 
-interface TodoItem {
-  task: string;
-  priority: string;
-  status: string;
-}
-
-interface Decision {
-  title: string;
-  context: string;
-  decision: string;
-  rationale: string;
-}
-
-interface HandoffContext {
-  version: string;
-  timestamp: string;
-  agent: string;
-  project: string;
-  current_goal: string;
-  status: string;
-  completed: string[];
-  modified_files: ModifiedFile[];
-  todos: TodoItem[];
-  blockers: string[];
-  decisions: Decision[];
-  next_steps: string[];
-  git: {
-    branch: string;
-    latest_commit: string;
-    commit_message: string;
-    is_dirty: boolean;
-  };
-  risks: string[];
-  notes: string;
-}
+/**
+ * @typedef {Object} HandoffContext
+ * @property {string} version
+ * @property {string} timestamp
+ * @property {string} agent
+ * @property {string} project
+ * @property {string} current_goal
+ * @property {string} status
+ * @property {string[]} completed
+ * @property {ModifiedFile[]} modified_files
+ * @property {TodoItem[]} todos
+ * @property {string[]} blockers
+ * @property {Decision[]} decisions
+ * @property {string[]} next_steps
+ * @property {{ branch: string; latest_commit: string; commit_message: string; is_dirty: boolean }} git
+ * @property {string[]} risks
+ * @property {string} notes
+ */
 
 // ── Security ─────────────────────────────────────────────────────────────────
 
-const SENSITIVE_PATTERNS: RegExp[] = [
-  // API keys (generic)
+const SENSITIVE_PATTERNS = [
   /api[_-]?key\s*[:=]\s*["']?[a-zA-Z0-9\-]{16,}["']?/gi,
-  // Bearer tokens
   /bearer\s+[a-zA-Z0-9\-._~+/]{20,}=*/gi,
-  // Cookie headers
   /cookie\s*:\s*[^\n]+/gi,
-  // Passwords
   /password\s*[:=]\s*["']?[^\s"']+["']?/gi,
-  // Private key references
   /private[_-]?key\s*[:=]\s*-----BEGIN/gi,
-  // PEM private keys
   /-----BEGIN\s+(RSA\s+|EC\s+|OPENSSH\s+)?PRIVATE\s+KEY-----[\s\S]*?-----END\s+(RSA\s+|EC\s+|OPENSSH\s+)?PRIVATE\s+KEY-----/g,
-  // GitHub tokens
   /gh[pousr]_[a-zA-Z0-9]{36,}/g,
-  // GitLab tokens
   /glpat-[a-zA-Z0-9\-]{20,}/g,
-  // AWS access keys
   /AKIA[0-9A-Z]{16}/g,
-  // Generic secrets with assignment
   /(?:secret|token|credential)\s*[:=]\s*["']?[a-zA-Z0-9\-._]{16,}["']?/gi,
-  // JWT tokens
   /eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*/g,
-  // SSH private key content
-  /-----BEGIN\s+OPENSSH\s+PRIVATE\s+KEY-----/g,
-  // Connection strings with credentials
-  /(?:mongodb|postgres|mysql|redis):\/\/[^\s"']+:[^\s"']+@[^\s"']+["']?/gi,
+  /(?:mongodb|postgres|mysql|redis):\/\/[^\s"']+:[^\s"']+@[^\s"']+/gi,
 ];
 
-function filterSensitive(text: string): string {
+function filterSensitive(text) {
   let filtered = text;
   for (const pattern of SENSITIVE_PATTERNS) {
     filtered = filtered.replace(pattern, "[REDACTED]");
@@ -104,20 +69,9 @@ function filterSensitive(text: string): string {
 
 // ── Command Execution ────────────────────────────────────────────────────────
 
-async function runCommand(
-  cmd: string[],
-  opts?: { cwd?: string }
-): Promise<string> {
+function runCommand(cmd) {
   try {
-    const command = new Deno.Command(cmd[0], {
-      args: cmd.slice(1),
-      stdout: "piped",
-      stderr: "piped",
-      cwd: opts?.cwd,
-    });
-    const { code, stdout } = await command.output();
-    if (code !== 0) return "";
-    return new TextDecoder().decode(stdout).trim();
+    return execSync(cmd, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
   } catch {
     return "";
   }
@@ -125,13 +79,11 @@ async function runCommand(
 
 // ── Git Functions ────────────────────────────────────────────────────────────
 
-async function getGitState(): Promise<HandoffContext["git"]> {
-  const [branch, latestCommit, commitMessage, status] = await Promise.all([
-    runCommand(["git", "branch", "--show-current"]),
-    runCommand(["git", "log", "-1", "--format=%h"]),
-    runCommand(["git", "log", "-1", "--format=%s"]),
-    runCommand(["git", "status", "--porcelain"]),
-  ]);
+function getGitState() {
+  const branch = runCommand("git branch --show-current");
+  const latestCommit = runCommand("git log -1 --format=%h");
+  const commitMessage = runCommand("git log -1 --format=%s");
+  const status = runCommand("git status --porcelain");
 
   return {
     branch: branch || "unknown",
@@ -141,8 +93,8 @@ async function getGitState(): Promise<HandoffContext["git"]> {
   };
 }
 
-async function getModifiedFiles(): Promise<ModifiedFile[]> {
-  const status = await runCommand(["git", "status", "--porcelain"]);
+function getModifiedFiles() {
+  const status = runCommand("git status --porcelain");
   if (!status) return [];
 
   return status
@@ -160,22 +112,15 @@ async function getModifiedFiles(): Promise<ModifiedFile[]> {
     });
 }
 
-async function getRecentCommits(count: number = 5): Promise<string[]> {
-  const log = await runCommand([
-    "git", "log", "--oneline", "-n", count.toString(),
-  ]);
+function getRecentCommits(count = 5) {
+  const log = runCommand(`git log --oneline -n ${count}`);
   if (!log) return [];
   return log.split("\n").filter((line) => line.trim());
 }
 
-async function getDiffStat(): Promise<string> {
-  return await runCommand(["git", "diff", "--stat"]) ||
-    await runCommand(["git", "diff", "--stat", "--cached"]) || "";
-}
-
-async function getDiffSummary(): Promise<string> {
-  return await runCommand(["git", "diff", "--shortstat"]) ||
-    await runCommand(["git", "diff", "--shortstat", "--cached"]) || "";
+function getDiffSummary() {
+  return runCommand("git diff --shortstat") ||
+    runCommand("git diff --shortstat --cached") || "";
 }
 
 // ── Auto-Analysis ────────────────────────────────────────────────────────────
@@ -185,72 +130,85 @@ const SOURCE_EXTENSIONS = new Set([
   ".c", ".cpp", ".h", ".hpp", ".rb", ".php", ".swift", ".kt",
 ]);
 
-async function scanTodos(cwd: string): Promise<TodoItem[]> {
-  const todos: TodoItem[] = [];
+const SKIP_DIRS = new Set([
+  "node_modules", ".git", ".handoff", "dist", "build", "vendor", "__pycache__",
+]);
+
+function scanTodos(dir, maxFiles = 200) {
+  const todos = [];
   const todoPattern = /\b(TODO|FIXME|HACK|XXX)\b[:\s]+(.+)/gi;
   let fileCount = 0;
-  const maxFiles = 200;
 
-  try {
-    for await (const entry of walk(cwd, { skip: [/node_modules/, /\.git/, /\.handoff/, /dist/, /build/, /vendor/, /__pycache__/] })) {
-      if (!entry.isFile) continue;
-      if (!SOURCE_EXTENSIONS.has(extname(entry.path))) continue;
-      if (++fileCount > maxFiles) break;
+  function walkDir(currentDir) {
+    if (++fileCount > maxFiles) return;
+
+    let entries;
+    try {
+      entries = readdirSync(currentDir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      if (fileCount > maxFiles) break;
+
+      const fullPath = join(currentDir, entry.name);
+
+      if (entry.isDirectory()) {
+        if (!SKIP_DIRS.has(entry.name)) {
+          walkDir(fullPath);
+        }
+        continue;
+      }
+
+      if (!entry.isFile()) continue;
+      if (!SOURCE_EXTENSIONS.has(extname(entry.name))) continue;
 
       try {
-        const content = await Deno.readTextFile(entry.path);
+        const content = readFileSync(fullPath, "utf-8");
         const lines = content.split("\n");
         for (let i = 0; i < lines.length; i++) {
-          const match = todoPattern.exec(lines[i]);
-          if (match) {
+          let match;
+          todoPattern.lastIndex = 0;
+          while ((match = todoPattern.exec(lines[i])) !== null) {
             const tag = match[1].toUpperCase();
             const task = match[2].trim();
-            const priority = tag === "FIXME" ? "high" : tag === "HACK" ? "high" : "medium";
-            const relPath = entry.path.replace(cwd + "/", "");
+            const priority = (tag === "FIXME" || tag === "HACK") ? "high" : "medium";
+            const relPath = relative(dir, fullPath);
             todos.push({
               task: `${task} (${relPath}:${i + 1})`,
               priority,
               status: "pending",
             });
           }
-          todoPattern.lastIndex = 0;
         }
       } catch {
         // skip unreadable files
       }
     }
-  } catch {
-    // walk failed, skip
   }
 
+  walkDir(dir);
   return todos.slice(0, 20);
 }
 
-function inferGoalFromCommits(commits: string[]): string {
+function inferGoalFromCommits(commits) {
   if (commits.length === 0) return "";
-
-  // Use the most recent commit message as the current goal hint
-  const latest = commits[0];
-  const msg = latest.replace(/^[a-f0-9]+\s+/, "");
-  return msg;
+  return commits[0].replace(/^[a-f0-9]+\s+/, "");
 }
 
-function inferCompletedFromCommits(commits: string[]): string[] {
+function inferCompletedFromCommits(commits) {
   return commits.slice(1, 6).map((c) => c.replace(/^[a-f0-9]+\s+/, ""));
 }
 
-function inferStatusFromGit(git: HandoffContext["git"], modifiedFiles: ModifiedFile[]): string {
+function inferStatusFromGit(git, modifiedFiles) {
   if (modifiedFiles.length === 0) return "idle - no pending changes";
   if (git.is_dirty) return `in-progress - ${modifiedFiles.length} file(s) modified`;
   return "ready - changes committed";
 }
 
-function inferRisksFromState(
-  git: HandoffContext["git"],
-  todos: TodoItem[],
-  modifiedFiles: ModifiedFile[]
-): string[] {
-  const risks: string[] = [];
+function inferRisksFromState(git, todos, modifiedFiles) {
+  const risks = [];
 
   const highPriority = todos.filter((t) => t.priority === "high" && t.status === "pending");
   if (highPriority.length > 0) {
@@ -267,7 +225,7 @@ function inferRisksFromState(
 
 // ── Project Detection ────────────────────────────────────────────────────────
 
-async function readProjectInfo(): Promise<{ name: string; language: string }> {
+function readProjectInfo() {
   const manifests = [
     { file: "package.json", lang: "typescript/javascript" },
     { file: "Cargo.toml", lang: "rust" },
@@ -279,7 +237,7 @@ async function readProjectInfo(): Promise<{ name: string; language: string }> {
 
   for (const { file, lang } of manifests) {
     try {
-      const content = await Deno.readTextFile(file);
+      const content = readFileSync(file, "utf-8");
       if (file === "package.json") {
         const pkg = JSON.parse(content);
         return { name: pkg.name || "unknown", language: lang };
@@ -309,7 +267,7 @@ async function readProjectInfo(): Promise<{ name: string; language: string }> {
 
 // ── Markdown Generation ──────────────────────────────────────────────────────
 
-function generateHandoffMarkdown(ctx: HandoffContext): string {
+function generateHandoffMarkdown(ctx) {
   const completed = ctx.completed.map((item) => `- ${item}`).join("\n");
   const modified = ctx.modified_files
     .map((f) => `- \`${f.path}\` [${f.change_type}]`)
@@ -365,13 +323,12 @@ ${risks || "No risks identified."}
 `;
 }
 
-function generateTasksMarkdown(ctx: HandoffContext): string {
+function generateTasksMarkdown(ctx) {
   const high = ctx.todos.filter((t) => t.priority === "high");
   const medium = ctx.todos.filter((t) => t.priority === "medium");
   const low = ctx.todos.filter((t) => t.priority === "low");
 
-  const fmt = (tasks: TodoItem[]) =>
-    tasks.map((t) => `- [ ] ${t.task}`).join("\n") || "None";
+  const fmt = (tasks) => tasks.map((t) => `- [ ] ${t.task}`).join("\n") || "None";
 
   return `# Pending Tasks
 
@@ -386,17 +343,13 @@ ${fmt(low)}
 `;
 }
 
-function generateDecisionsMarkdown(ctx: HandoffContext): string {
+function generateDecisionsMarkdown(ctx) {
   if (ctx.decisions.length === 0) {
     return "# Architecture Decisions\n\nNo decisions recorded.\n";
   }
 
   const decisions = ctx.decisions
-    .map((d) => `## ${d.title}
-
-- **Context**: ${d.context || "N/A"}
-- **Decision**: ${d.decision}
-- **Rationale**: ${d.rationale || "N/A"}`)
+    .map((d) => `## ${d.title}\n\n- **Context**: ${d.context || "N/A"}\n- **Decision**: ${d.decision}\n- **Rationale**: ${d.rationale || "N/A"}`)
     .join("\n\n");
 
   return `# Architecture Decisions\n\n${decisions}\n`;
@@ -404,94 +357,55 @@ function generateDecisionsMarkdown(ctx: HandoffContext): string {
 
 // ── Mode Handling ────────────────────────────────────────────────────────────
 
-interface ModeConfig {
-  commitCount: number;
-  maxTodos: number;
-  includeDiffStat: boolean;
-  includeRiskAnalysis: boolean;
-  includeTodoScan: boolean;
-}
-
-function getModeConfig(mode: string): ModeConfig {
+function getModeConfig(mode) {
   switch (mode) {
     case "compact":
-      return {
-        commitCount: 3,
-        maxTodos: 5,
-        includeDiffStat: false,
-        includeRiskAnalysis: false,
-        includeTodoScan: false,
-      };
+      return { commitCount: 3, maxTodos: 5, includeDiffStat: false, includeRiskAnalysis: false, includeTodoScan: false };
     case "full":
-      return {
-        commitCount: 20,
-        maxTodos: 50,
-        includeDiffStat: true,
-        includeRiskAnalysis: true,
-        includeTodoScan: true,
-      };
+      return { commitCount: 20, maxTodos: 50, includeDiffStat: true, includeRiskAnalysis: true, includeTodoScan: true };
     case "diff":
-      return {
-        commitCount: 5,
-        maxTodos: 10,
-        includeDiffStat: true,
-        includeRiskAnalysis: false,
-        includeTodoScan: false,
-      };
-    default: // standard
-      return {
-        commitCount: 5,
-        maxTodos: 20,
-        includeDiffStat: true,
-        includeRiskAnalysis: true,
-        includeTodoScan: true,
-      };
+      return { commitCount: 5, maxTodos: 10, includeDiffStat: true, includeRiskAnalysis: false, includeTodoScan: false };
+    default:
+      return { commitCount: 5, maxTodos: 20, includeDiffStat: true, includeRiskAnalysis: true, includeTodoScan: true };
   }
 }
 
-// ── Main Save Logic ──────────────────────────────────────────────────────────
+// ── Main ─────────────────────────────────────────────────────────────────────
 
-async function save(mode: string): Promise<void> {
-  const cwd = Deno.cwd();
+function save(mode) {
+  const cwd = process.cwd();
   const handoffDir = join(cwd, ".handoff");
   const config = getModeConfig(mode);
 
-  // Check git availability
-  const gitAvailable = (await runCommand(["git", "--version"])).length > 0;
+  const gitAvailable = !!runCommand("git --version");
   if (!gitAvailable) {
-    console.error("Error: git is not available. Install git or run in a git repository.");
-    console.error("Falling back to file-scan mode.");
+    console.error("Error: git is not available. Falling back to file-scan mode.");
   }
 
-  await ensureDir(handoffDir);
+  mkdirSync(handoffDir, { recursive: true });
 
-  const { name, language } = await readProjectInfo();
-  const git = await getGitState();
-  const modifiedFiles = await getModifiedFiles();
-  const recentCommits = await getRecentCommits(config.commitCount);
+  const { name, language } = readProjectInfo();
+  const git = getGitState();
+  const modifiedFiles = getModifiedFiles();
+  const recentCommits = getRecentCommits(config.commitCount);
 
-  // Auto-analysis
-  const todos = config.includeTodoScan ? await scanTodos(cwd) : [];
+  const todos = config.includeTodoScan ? scanTodos(cwd) : [];
   const inferredGoal = inferGoalFromCommits(recentCommits);
   const completed = inferCompletedFromCommits(recentCommits);
   const status = inferStatusFromGit(git, modifiedFiles);
-  const risks = config.includeRiskAnalysis
-    ? inferRisksFromState(git, todos, modifiedFiles)
-    : [];
+  const risks = config.includeRiskAnalysis ? inferRisksFromState(git, todos, modifiedFiles) : [];
 
-  // Diff mode: add diff summary to notes
   let notes = recentCommits.join("\n");
   if (config.includeDiffStat) {
-    const diffSummary = await getDiffSummary();
-    if (diffSummary) {
-      notes = `Diff summary: ${diffSummary}\n\n${notes}`;
-    }
+    const diffSummary = getDiffSummary();
+    if (diffSummary) notes = `Diff summary: ${diffSummary}\n\n${notes}`;
   }
 
-  const ctx: HandoffContext = {
+  /** @type {HandoffContext} */
+  const ctx = {
     version: "1.0.0",
     timestamp: new Date().toISOString(),
-    agent: Deno.env.get("AGENT_NAME") || "opencode",
+    agent: process.env.AGENT_NAME || "opencode",
     project: name,
     current_goal: inferredGoal,
     status,
@@ -511,44 +425,32 @@ async function save(mode: string): Promise<void> {
   const decisionsMd = generateDecisionsMarkdown(ctx);
   const contextJson = JSON.stringify(ctx, null, 2);
 
-  await Promise.all([
-    Deno.writeTextFile(join(handoffDir, "HANDOFF.md"), filterSensitive(handoffMd)),
-    Deno.writeTextFile(join(handoffDir, "context.json"), filterSensitive(contextJson)),
-    Deno.writeTextFile(join(handoffDir, "tasks.md"), filterSensitive(tasksMd)),
-    Deno.writeTextFile(join(handoffDir, "decisions.md"), filterSensitive(decisionsMd)),
-  ]);
+  writeFileSync(join(handoffDir, "HANDOFF.md"), filterSensitive(handoffMd));
+  writeFileSync(join(handoffDir, "context.json"), filterSensitive(contextJson));
+  writeFileSync(join(handoffDir, "tasks.md"), filterSensitive(tasksMd));
+  writeFileSync(join(handoffDir, "decisions.md"), filterSensitive(decisionsMd));
 
   console.log(`Handoff saved to ${handoffDir}`);
   console.log(`Mode: ${mode}`);
   console.log(`Project: ${name} (${language})`);
   console.log(`Goal: ${inferredGoal || "(inferred from commits)"}`);
   console.log(`Files: HANDOFF.md, context.json, tasks.md, decisions.md`);
-  if (todos.length > 0) {
-    console.log(`Scanned: ${todos.length} TODO/FIXME items found`);
-  }
+  if (todos.length > 0) console.log(`Scanned: ${todos.length} TODO/FIXME items found`);
 }
 
 // ── Entry Point ──────────────────────────────────────────────────────────────
 
-async function main() {
-  const args = parse(Deno.args, {
-    default: { _: ["save"] },
-  });
-
-  const mode = args._[0]?.toString() || "default";
-  const validModes = ["default", "compact", "full", "diff"];
-  if (!validModes.includes(mode)) {
-    console.error(`Error: Unknown mode '${mode}'`);
-    console.error(`Valid modes: ${validModes.join(", ")}`);
-    Deno.exit(1);
-  }
-
-  try {
-    await save(mode);
-  } catch (err) {
-    console.error(`Error during save: ${err instanceof Error ? err.message : err}`);
-    Deno.exit(1);
-  }
+const mode = process.argv[2] || "default";
+const validModes = ["default", "compact", "full", "diff"];
+if (!validModes.includes(mode)) {
+  console.error(`Error: Unknown mode '${mode}'`);
+  console.error(`Valid modes: ${validModes.join(", ")}`);
+  process.exit(1);
 }
 
-main();
+try {
+  save(mode);
+} catch (err) {
+  console.error(`Error during save: ${err.message}`);
+  process.exit(1);
+}

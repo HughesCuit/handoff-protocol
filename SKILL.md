@@ -89,21 +89,29 @@ Nothing sensitive is written to `.handoff/`.
 
 ## Template Reference
 
-See templates for output format:
-- `templates/HANDOFF.template.md`
-- `templates/context.template.json`
+See assets for output format:
+- `assets/HANDOFF.template.md`
+- `assets/context.template.json`
+- `assets/tasks.template.md`
+- `assets/decisions.template.md`
 
 ## Command Details
 
 For full command specifications:
-- `commands/save.md`
-- `commands/load.md`
+- `references/save.md`
+- `references/load.md`
 
 ## Scripts
 
-Enhanced functionality (optional):
+Enhanced functionality (optional). Two runtimes supported:
+
+**Deno (recommended):**
 - `scripts/save.ts`
 - `scripts/load.ts`
+
+**Node.js:**
+- `scripts/node/save.mjs`
+- `scripts/node/load.mjs`
 
 The skill works purely via prompt - scripts provide additional capabilities when available.
 

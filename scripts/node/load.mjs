@@ -1,78 +1,24 @@
-#!/usr/bin/env -S deno run --allow-read --allow-run
+#!/usr/bin/env node
 
 /**
- * Handoff Protocol - Load Script
- *
- * Reads and analyzes handoff context from .handoff/ directory.
+ * Handoff Protocol - Load Script (Node.js Reference Implementation)
  *
  * Usage:
- *   deno run --allow-read --allow-run load.ts [mode]
+ *   node load.mjs [mode]
  *
  * Modes:
  *   (default) - Standard read and summarize
- *   auto      - Auto-infer next steps with detailed analysis
+ *   auto      - Auto-infer next steps
  *   merge     - Merge with current git context
  */
 
-import { parse } from "https://deno.land/std@0.224.0/flags/mod.ts";
-import { exists } from "https://deno.land/std@0.224.0/fs/mod.ts";
-import { join } from "https://deno.land/std@0.224.0/path/mod.ts";
-
-// ── Types ────────────────────────────────────────────────────────────────────
-
-interface ModifiedFile {
-  path: string;
-  description: string;
-  change_type: string;
-}
-
-interface TodoItem {
-  task: string;
-  priority: string;
-  status: string;
-}
-
-interface Decision {
-  title: string;
-  context: string;
-  decision: string;
-  rationale: string;
-}
-
-interface HandoffContext {
-  version: string;
-  timestamp: string;
-  agent: string;
-  project: string;
-  current_goal: string;
-  status: string;
-  completed: string[];
-  modified_files: ModifiedFile[];
-  todos: TodoItem[];
-  blockers: string[];
-  decisions: Decision[];
-  next_steps: string[];
-  git: {
-    branch: string;
-    latest_commit: string;
-    commit_message: string;
-    is_dirty: boolean;
-  };
-  risks: string[];
-  notes: string;
-}
-
-interface LoadResult {
-  understanding: string;
-  nextActions: string[];
-  risks: string[];
-  pendingTasks: number;
-  context: HandoffContext | null;
-}
+import { execSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 
 // ── Security ─────────────────────────────────────────────────────────────────
 
-const SENSITIVE_PATTERNS: RegExp[] = [
+const SENSITIVE_PATTERNS = [
   /api[_-]?key\s*[:=]\s*["']?[a-zA-Z0-9\-]{16,}["']?/gi,
   /bearer\s+[a-zA-Z0-9\-._~+/]{20,}=*/gi,
   /cookie\s*:\s*[^\n]+/gi,
@@ -87,7 +33,7 @@ const SENSITIVE_PATTERNS: RegExp[] = [
   /(?:mongodb|postgres|mysql|redis):\/\/[^\s"']+:[^\s"']+@[^\s"']+/gi,
 ];
 
-function filterSensitive(text: string): string {
+function filterSensitive(text) {
   let filtered = text;
   for (const pattern of SENSITIVE_PATTERNS) {
     filtered = filtered.replace(pattern, "[REDACTED]");
@@ -97,16 +43,9 @@ function filterSensitive(text: string): string {
 
 // ── Command Execution ────────────────────────────────────────────────────────
 
-async function runCommand(cmd: string[]): Promise<string> {
+function runCommand(cmd) {
   try {
-    const command = new Deno.Command(cmd[0], {
-      args: cmd.slice(1),
-      stdout: "piped",
-      stderr: "piped",
-    });
-    const { code, stdout } = await command.output();
-    if (code !== 0) return "";
-    return new TextDecoder().decode(stdout).trim();
+    return execSync(cmd, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
   } catch {
     return "";
   }
@@ -114,32 +53,31 @@ async function runCommand(cmd: string[]): Promise<string> {
 
 // ── Parsing ──────────────────────────────────────────────────────────────────
 
-async function loadContextJson(handoffDir: string): Promise<HandoffContext | null> {
+function loadContextJson(handoffDir) {
   const contextPath = join(handoffDir, "context.json");
 
-  if (!await exists(contextPath)) {
+  if (!existsSync(contextPath)) {
     return null;
   }
 
   try {
-    const content = await Deno.readTextFile(contextPath);
+    const content = readFileSync(contextPath, "utf-8");
     const parsed = JSON.parse(content);
 
-    // Validate required fields
     if (!parsed.project || !parsed.timestamp) {
       console.error("Warning: context.json is missing required fields (project, timestamp)");
       return null;
     }
 
-    return parsed as HandoffContext;
+    return parsed;
   } catch (err) {
-    console.error(`Warning: Failed to parse context.json: ${err instanceof Error ? err.message : err}`);
+    console.error(`Warning: Failed to parse context.json: ${err.message}`);
     return null;
   }
 }
 
-function parseHandoffMd(content: string): Partial<HandoffContext> {
-  const result: Partial<HandoffContext> = {
+function parseHandoffMd(content) {
+  const result = {
     completed: [],
     modified_files: [],
     todos: [],
@@ -173,12 +111,12 @@ function parseHandoffMd(content: string): Partial<HandoffContext> {
         if (!result.status) result.status = item;
         break;
       case "completed work":
-        result.completed!.push(item);
+        result.completed.push(item);
         break;
       case "modified files":
         const fileMatch = item.match(/`([^`]+)`/);
         if (fileMatch) {
-          result.modified_files!.push({
+          result.modified_files.push({
             path: fileMatch[1],
             description: item,
             change_type: "modified",
@@ -186,27 +124,27 @@ function parseHandoffMd(content: string): Partial<HandoffContext> {
         }
         break;
       case "outstanding issues":
-        result.blockers!.push(item);
+        result.blockers.push(item);
         break;
       case "todo":
         const todoText = item.replace(/^\[[ x]\]\s*/, "");
-        result.todos!.push({
+        result.todos.push({
           task: todoText,
           priority: "medium",
           status: item.includes("[x]") ? "completed" : "pending",
         });
         break;
       case "recommended next steps":
-        result.next_steps!.push(item.replace(/^\d+\.\s*/, ""));
+        result.next_steps.push(item.replace(/^\d+\.\s*/, ""));
         break;
       case "risks / notes":
       case "risks":
-        result.risks!.push(item);
+        result.risks.push(item);
         break;
     }
   }
 
-  // Extract project and branch from header lines
+  // Extract metadata from header
   for (const line of lines.slice(0, 10)) {
     const projectMatch = line.match(/\*\*Project\*\*:\s*(.+)/);
     if (projectMatch) result.project = projectMatch[1].trim();
@@ -220,28 +158,15 @@ function parseHandoffMd(content: string): Partial<HandoffContext> {
         is_dirty: false,
       };
     }
-
-    const goalMatch = line.match(/\*\*Goal\*\*:\s*(.+)/);
-    if (goalMatch && !result.current_goal) result.current_goal = goalMatch[1].trim();
   }
 
   return result;
 }
 
-async function loadHandoffMd(handoffDir: string): Promise<string> {
-  const mdPath = join(handoffDir, "HANDOFF.md");
-
-  if (!await exists(mdPath)) {
-    return "";
-  }
-
-  return await Deno.readTextFile(mdPath);
-}
-
 // ── Analysis ─────────────────────────────────────────────────────────────────
 
-function generateUnderstanding(ctx: HandoffContext): string {
-  const parts: string[] = [];
+function generateUnderstanding(ctx) {
+  const parts = [];
 
   parts.push(`Project: ${ctx.project}`);
   parts.push(`Status: ${ctx.status}`);
@@ -266,15 +191,13 @@ function generateUnderstanding(ctx: HandoffContext): string {
   return parts.join(" | ");
 }
 
-function generateNextActions(ctx: HandoffContext, mode: string): string[] {
-  const actions: string[] = [];
+function generateNextActions(ctx, mode) {
+  const actions = [];
 
-  // Always include explicit next steps
   if (ctx.next_steps.length > 0) {
     actions.push(...ctx.next_steps);
   }
 
-  // High-priority todos
   const highPriority = ctx.todos.filter(
     (t) => t.priority === "high" && t.status === "pending"
   );
@@ -282,26 +205,19 @@ function generateNextActions(ctx: HandoffContext, mode: string): string[] {
     actions.push(`[HIGH] ${todo.task}`);
   }
 
-  // Blockers
   if (ctx.blockers.length > 0) {
     actions.push(`Resolve blocker: ${ctx.blockers[0]}`);
   }
 
   if (mode === "auto") {
-    // Infer from modified files
     if (ctx.modified_files.length > 0) {
       const addedFiles = ctx.modified_files.filter((f) => f.change_type === "added");
       const modifiedFiles = ctx.modified_files.filter((f) => f.change_type === "modified");
 
-      if (addedFiles.length > 0) {
-        actions.push(`Review ${addedFiles.length} newly added file(s)`);
-      }
-      if (modifiedFiles.length > 0) {
-        actions.push(`Review changes to ${modifiedFiles.length} modified file(s)`);
-      }
+      if (addedFiles.length > 0) actions.push(`Review ${addedFiles.length} newly added file(s)`);
+      if (modifiedFiles.length > 0) actions.push(`Review changes to ${modifiedFiles.length} modified file(s)`);
     }
 
-    // Pending medium-priority todos
     const mediumTodos = ctx.todos.filter(
       (t) => t.priority === "medium" && t.status === "pending"
     );
@@ -309,7 +225,6 @@ function generateNextActions(ctx: HandoffContext, mode: string): string[] {
       actions.push(`Address ${mediumTodos.length} medium-priority TODO items`);
     }
 
-    // Git state
     if (ctx.git.is_dirty) {
       actions.push("Review and commit pending changes");
     }
@@ -322,25 +237,17 @@ function generateNextActions(ctx: HandoffContext, mode: string): string[] {
   return actions.slice(0, 8);
 }
 
-function generateRisks(ctx: HandoffContext): string[] {
-  const risks: string[] = [...ctx.risks];
+function generateRisks(ctx) {
+  const risks = [...ctx.risks];
 
-  if (ctx.blockers.length > 0) {
-    risks.push(`Active blocker: ${ctx.blockers[0]}`);
-  }
-
-  if (ctx.git.is_dirty) {
-    risks.push("Uncommitted changes in working directory");
-  }
+  if (ctx.blockers.length > 0) risks.push(`Active blocker: ${ctx.blockers[0]}`);
+  if (ctx.git.is_dirty) risks.push("Uncommitted changes in working directory");
 
   const pendingHigh = ctx.todos.filter(
     (t) => t.priority === "high" && t.status === "pending"
   );
-  if (pendingHigh.length > 0) {
-    risks.push(`${pendingHigh.length} high-priority task(s) pending`);
-  }
+  if (pendingHigh.length > 0) risks.push(`${pendingHigh.length} high-priority task(s) pending`);
 
-  // Check for stale handoff
   if (ctx.timestamp) {
     const savedTime = new Date(ctx.timestamp).getTime();
     const hoursSince = (Date.now() - savedTime) / (1000 * 60 * 60);
@@ -352,75 +259,45 @@ function generateRisks(ctx: HandoffContext): string[] {
   return risks;
 }
 
-// ── Git Merge Analysis ───────────────────────────────────────────────────────
+// ── Merge Analysis ───────────────────────────────────────────────────────────
 
-async function getCurrentGitState(): Promise<{
-  branch: string;
-  latestCommit: string;
-  status: string;
-}> {
-  const [branch, latestCommit, status] = await Promise.all([
-    runCommand(["git", "branch", "--show-current"]),
-    runCommand(["git", "log", "-1", "--format=%h"]),
-    runCommand(["git", "status", "--porcelain"]),
-  ]);
+function analyzeMerge(ctx, risks, nextActions) {
+  const branch = runCommand("git branch --show-current");
+  const latestCommit = runCommand("git log -1 --format=%h");
+  const status = runCommand("git status --porcelain");
 
-  return {
-    branch: branch || "unknown",
-    latestCommit: latestCommit || "unknown",
-    status: status || "",
-  };
-}
-
-async function analyzeMerge(
-  ctx: HandoffContext,
-  risks: string[],
-  nextActions: string[]
-): Promise<void> {
-  const currentState = await getCurrentGitState();
-
-  if (currentState.branch === "unknown") {
+  if (!branch) {
     risks.push("Git not available - cannot verify merge state");
     return;
   }
 
-  // Branch mismatch
-  if (currentState.branch !== ctx.git.branch) {
-    risks.push(
-      `Branch mismatch: handoff on '${ctx.git.branch}', current on '${currentState.branch}'`
-    );
+  if (branch !== ctx.git.branch) {
+    risks.push(`Branch mismatch: handoff on '${ctx.git.branch}', current on '${branch}'`);
   }
 
-  // New commits since handoff
   if (ctx.git.latest_commit && ctx.git.latest_commit !== "unknown") {
-    const commitsSince = await runCommand([
-      "git", "rev-list", "--count", `${ctx.git.latest_commit}..HEAD`,
-    ]);
+    const commitsSince = runCommand(`git rev-list --count ${ctx.git.latest_commit}..HEAD`);
     const count = parseInt(commitsSince);
     if (!isNaN(count) && count > 0) {
       nextActions.unshift(`Sync with ${count} new commit(s) since handoff`);
 
-      // Show what changed
-      const newCommits = await runCommand([
-        "git", "log", "--oneline", `${ctx.git.latest_commit}..HEAD`,
-      ]);
+      const newCommits = runCommand(`git log --oneline ${ctx.git.latest_commit}..HEAD`);
       if (newCommits) {
         risks.push(`New commits since handoff:\n${newCommits}`);
       }
     }
   }
 
-  // Current dirty state
-  if (currentState.status) {
-    const changedFiles = currentState.status.split("\n").filter((l) => l.trim()).length;
+  if (status) {
+    const changedFiles = status.split("\n").filter((l) => l.trim()).length;
     risks.push(`${changedFiles} file(s) have uncommitted changes`);
   }
 }
 
 // ── Output Formatting ────────────────────────────────────────────────────────
 
-function formatOutput(result: LoadResult, mode: string): string {
-  const lines: string[] = [];
+function formatOutput(result, mode) {
+  const lines = [];
 
   lines.push("Current understanding:");
   lines.push(result.understanding);
@@ -458,14 +335,13 @@ function formatOutput(result: LoadResult, mode: string): string {
   return lines.join("\n");
 }
 
-// ── Main Load Logic ──────────────────────────────────────────────────────────
+// ── Main ─────────────────────────────────────────────────────────────────────
 
-async function load(mode: string): Promise<LoadResult> {
-  const cwd = Deno.cwd();
+function load(mode) {
+  const cwd = process.cwd();
   const handoffDir = join(cwd, ".handoff");
 
-  // Check .handoff/ exists
-  if (!await exists(handoffDir)) {
+  if (!existsSync(handoffDir)) {
     console.error("Error: No .handoff/ directory found.");
     console.error("Possible causes:");
     console.error("  1. Run `/handoff save` first to create context");
@@ -480,15 +356,14 @@ async function load(mode: string): Promise<LoadResult> {
     };
   }
 
-  // Try loading context.json first
-  let ctx = await loadContextJson(handoffDir);
+  let ctx = loadContextJson(handoffDir);
 
-  // Fallback: parse HANDOFF.md if context.json is missing/invalid
+  // Fallback to HANDOFF.md
   if (!ctx) {
     console.error("Warning: context.json missing or invalid. Falling back to HANDOFF.md parsing.");
 
-    const handoffMd = await loadHandoffMd(handoffDir);
-    if (!handoffMd) {
+    const mdPath = join(handoffDir, "HANDOFF.md");
+    if (!existsSync(mdPath)) {
       console.error("Error: Neither context.json nor HANDOFF.md found in .handoff/");
       console.error("Run `/handoff save` to regenerate both files.");
       return {
@@ -500,7 +375,8 @@ async function load(mode: string): Promise<LoadResult> {
       };
     }
 
-    const parsed = parseHandoffMd(handoffMd);
+    const content = readFileSync(mdPath, "utf-8");
+    const parsed = parseHandoffMd(content);
     ctx = {
       version: "1.0.0",
       timestamp: new Date().toISOString(),
@@ -527,20 +403,14 @@ async function load(mode: string): Promise<LoadResult> {
   const risks = generateRisks(ctx);
   const pendingTasks = ctx.todos.filter((t) => t.status === "pending").length;
 
-  // Merge mode: analyze current git state against handoff
   if (mode === "merge") {
-    await analyzeMerge(ctx, risks, nextActions);
+    analyzeMerge(ctx, risks, nextActions);
   }
 
-  // Sanitize output
-  const sanitizedUnderstanding = filterSensitive(understanding);
-  const sanitizedActions = nextActions.map((a) => filterSensitive(a));
-  const sanitizedRisks = risks.map((r) => filterSensitive(r));
-
   return {
-    understanding: sanitizedUnderstanding,
-    nextActions: sanitizedActions,
-    risks: sanitizedRisks,
+    understanding: filterSensitive(understanding),
+    nextActions: nextActions.map((a) => filterSensitive(a)),
+    risks: risks.map((r) => filterSensitive(r)),
     pendingTasks,
     context: ctx,
   };
@@ -548,26 +418,18 @@ async function load(mode: string): Promise<LoadResult> {
 
 // ── Entry Point ──────────────────────────────────────────────────────────────
 
-async function main() {
-  const args = parse(Deno.args, {
-    default: { _: ["default"] },
-  });
-
-  const mode = args._[0]?.toString() || "default";
-  const validModes = ["default", "auto", "merge"];
-  if (!validModes.includes(mode)) {
-    console.error(`Error: Unknown mode '${mode}'`);
-    console.error(`Valid modes: ${validModes.join(", ")}`);
-    Deno.exit(1);
-  }
-
-  try {
-    const result = await load(mode);
-    console.log(formatOutput(result, mode));
-  } catch (err) {
-    console.error(`Error during load: ${err instanceof Error ? err.message : err}`);
-    Deno.exit(1);
-  }
+const mode = process.argv[2] || "default";
+const validModes = ["default", "auto", "merge"];
+if (!validModes.includes(mode)) {
+  console.error(`Error: Unknown mode '${mode}'`);
+  console.error(`Valid modes: ${validModes.join(", ")}`);
+  process.exit(1);
 }
 
-main();
+try {
+  const result = load(mode);
+  console.log(formatOutput(result, mode));
+} catch (err) {
+  console.error(`Error during load: ${err.message}`);
+  process.exit(1);
+}
