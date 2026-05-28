@@ -13,10 +13,14 @@
  *   compact   - Minimal summary (goal + status + next steps only)
  *   full      - Maximum context (extended history, full diff stats)
  *   diff      - Focus on code changes
+ *
+ * Storage modes (configured via .handoff.config.json):
+ *   direct    - .handoff/ as local directory
+ *   submodule - .handoff/ as git submodule
  */
 
 import { parse } from "https://deno.land/std@0.224.0/flags/mod.ts";
-import { ensureDir, walk } from "https://deno.land/std@0.224.0/fs/mod.ts";
+import { ensureDir, walk, exists } from "https://deno.land/std@0.224.0/fs/mod.ts";
 import { join, extname } from "https://deno.land/std@0.224.0/path/mod.ts";
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -63,35 +67,34 @@ interface HandoffContext {
   notes: string;
 }
 
+interface StorageConfig {
+  version: string;
+  storage: {
+    mode: "direct" | "submodule";
+    path: string;
+    remote?: string;
+  };
+}
+
 // ── Security ─────────────────────────────────────────────────────────────────
 
 const SENSITIVE_PATTERNS: RegExp[] = [
-  // API keys (generic)
   /api[_-]?key\s*[:=]\s*["']?[a-zA-Z0-9\-]{16,}["']?/gi,
-  // Bearer tokens
   /bearer\s+[a-zA-Z0-9\-._~+/]{20,}=*/gi,
-  // Cookie headers
   /cookie\s*:\s*[^\n]+/gi,
-  // Passwords
   /password\s*[:=]\s*["']?[^\s"']+["']?/gi,
-  // Private key references
   /private[_-]?key\s*[:=]\s*-----BEGIN/gi,
-  // PEM private keys
   /-----BEGIN\s+(RSA\s+|EC\s+|OPENSSH\s+)?PRIVATE\s+KEY-----[\s\S]*?-----END\s+(RSA\s+|EC\s+|OPENSSH\s+)?PRIVATE\s+KEY-----/g,
-  // GitHub tokens
   /gh[pousr]_[a-zA-Z0-9]{36,}/g,
-  // GitLab tokens
   /glpat-[a-zA-Z0-9\-]{20,}/g,
-  // AWS access keys
   /AKIA[0-9A-Z]{16}/g,
-  // Generic secrets with assignment
   /(?:secret|token|credential)\s*[:=]\s*["']?[a-zA-Z0-9\-._]{16,}["']?/gi,
-  // JWT tokens
   /eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*/g,
-  // SSH private key content
   /-----BEGIN\s+OPENSSH\s+PRIVATE\s+KEY-----/g,
-  // Connection strings with credentials
   /(?:mongodb|postgres|mysql|redis):\/\/[^\s"']+:[^\s"']+@[^\s"']+["']?/gi,
+  /(?:OPENAI_API_KEY|AWS_SECRET_ACCESS_KEY|AZURE_CLIENT_SECRET|GCP_KEY)\s*[:=]\s*["']?[^\s"']+["']?/gi,
+  /(?:xox[bpsa]-[a-zA-Z0-9-]+)/g,
+  /(?:sk-[a-zA-Z0-9]{20,})/g,
 ];
 
 function filterSensitive(text: string): string {
@@ -107,7 +110,7 @@ function filterSensitive(text: string): string {
 async function runCommand(
   cmd: string[],
   opts?: { cwd?: string }
-): Promise<string> {
+): Promise<{ stdout: string; code: number }> {
   try {
     const command = new Deno.Command(cmd[0], {
       args: cmd.slice(1),
@@ -116,21 +119,269 @@ async function runCommand(
       cwd: opts?.cwd,
     });
     const { code, stdout } = await command.output();
-    if (code !== 0) return "";
-    return new TextDecoder().decode(stdout).trim();
+    return { stdout: new TextDecoder().decode(stdout).trim(), code };
   } catch {
-    return "";
+    return { stdout: "", code: -1 };
   }
+}
+
+async function run(cmd: string[], opts?: { cwd?: string }): Promise<string> {
+  const { stdout } = await runCommand(cmd, opts);
+  return stdout;
+}
+
+// ── Storage Config ───────────────────────────────────────────────────────────
+
+async function readStorageConfig(cwd: string): Promise<StorageConfig | null> {
+  const configPath = join(cwd, ".handoff.config.json");
+  try {
+    const content = await Deno.readTextFile(configPath);
+    const config = JSON.parse(content) as StorageConfig;
+    if (config.storage && config.storage.mode) {
+      return config;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeStorageConfig(cwd: string, config: StorageConfig): Promise<void> {
+  const configPath = join(cwd, ".handoff.config.json");
+  await Deno.writeTextFile(configPath, JSON.stringify(config, null, 2) + "\n");
+}
+
+async function isGitRepo(cwd: string): Promise<boolean> {
+  const { code } = await runCommand(["git", "rev-parse", "--git-dir"], { cwd });
+  return code === 0;
+}
+
+async function isSubmoduleInitialized(cwd: string): Promise<boolean> {
+  const gitmodulesPath = join(cwd, ".gitmodules");
+  if (!await exists(gitmodulesPath)) return false;
+
+  try {
+    const content = await Deno.readTextFile(gitmodulesPath);
+    return content.includes('.handoff');
+  } catch {
+    return false;
+  }
+}
+
+async function isInGitignore(cwd: string): Promise<boolean> {
+  const gitignorePath = join(cwd, ".gitignore");
+  try {
+    const content = await Deno.readTextFile(gitignorePath);
+    const lines = content.split("\n").map((l) => l.trim());
+    return lines.some((l) => l === ".handoff" || l === ".handoff/" || l === ".handoff/**");
+  } catch {
+    return false;
+  }
+}
+
+async function hasRemote(cwd: string): Promise<boolean> {
+  const remote = await run(["git", "remote"], { cwd });
+  return remote.length > 0;
+}
+
+async function initSubmodule(cwd: string, remoteUrl: string): Promise<boolean> {
+  console.log(`Adding submodule from ${remoteUrl}...`);
+  const { code } = await runCommand(["git", "submodule", "add", remoteUrl, ".handoff"], { cwd });
+  if (code !== 0) {
+    console.error("Failed to add submodule.");
+    return false;
+  }
+
+  console.log("Initializing submodule...");
+  const { code: initCode } = await runCommand(
+    ["git", "submodule", "update", "--init", "--recursive", ".handoff"],
+    { cwd }
+  );
+  return initCode === 0;
+}
+
+async function ensureSubmoduleReady(cwd: string): Promise<boolean> {
+  // Check if .handoff is a submodule
+  if (await isSubmoduleInitialized(cwd)) {
+    // Try to init/update
+    const { code } = await runCommand(
+      ["git", "submodule", "update", "--init", "--recursive", ".handoff"],
+      { cwd }
+    );
+    if (code !== 0) {
+      console.error("Unable to initialize .handoff submodule.");
+      console.error("This may be a private repository. Please make sure your SSH key");
+      console.error("or GitHub credentials have access to the remote repository.");
+      return false;
+    }
+    return true;
+  }
+
+  console.error("Error: .handoff is not registered as a submodule.");
+  console.error("Run `/handoff init submodule` first.");
+  return false;
+}
+
+async function commitAndPushSubmodule(handoffDir: string): Promise<boolean> {
+  const files = ["HANDOFF.md", "context.json", "tasks.md", "decisions.md"];
+
+  for (const file of files) {
+    await run(["git", "add", file], { cwd: handoffDir });
+  }
+
+  const { code: commitCode } = await runCommand(
+    ["git", "commit", "-m", "Update handoff context"],
+    { cwd: handoffDir }
+  );
+
+  if (commitCode !== 0) {
+    // No changes to commit is OK
+    console.log("No changes to commit in submodule (context unchanged).");
+    return true;
+  }
+
+  const { code: pushCode } = await runCommand(["git", "push"], { cwd: handoffDir });
+  if (pushCode !== 0) {
+    console.error("Warning: Failed to push submodule. Changes are committed locally.");
+    return false;
+  }
+
+  return true;
+}
+
+// ── Init Flow ────────────────────────────────────────────────────────────────
+
+async function promptUser(message: string): Promise<string> {
+  const buf = new Uint8Array(1024);
+  await Deno.stdout.write(new TextEncoder().encode(message));
+  const n = await Deno.stdin.read(buf);
+  if (n === null) return "";
+  return new TextDecoder().decode(buf.subarray(0, n)).trim();
+}
+
+async function initStorage(cwd: string, mode?: string): Promise<StorageConfig | null> {
+  let selectedMode = mode;
+
+  if (!selectedMode) {
+    console.log("");
+    console.log("Handoff storage is not configured.");
+    console.log("");
+    console.log("Choose where to store .handoff:");
+    console.log("");
+    console.log("1. direct");
+    console.log("   Store .handoff/ directly in this project.");
+    console.log("   Recommended for private repositories or local-only projects.");
+    console.log("");
+    console.log("2. submodule");
+    console.log("   Store .handoff/ as a Git submodule.");
+    console.log("   Recommended for public repositories where handoff context");
+    console.log("   should not be exposed.");
+    console.log("");
+
+    const choice = await promptUser("Please choose: direct or submodule. > ");
+    if (choice === "1" || choice === "direct") {
+      selectedMode = "direct";
+    } else if (choice === "2" || choice === "submodule") {
+      selectedMode = "submodule";
+    } else {
+      console.error("Invalid choice. Please run `/handoff init direct` or `/handoff init submodule`.");
+      return null;
+    }
+  }
+
+  if (selectedMode === "direct") {
+    await ensureDir(join(cwd, ".handoff"));
+
+    const config: StorageConfig = {
+      version: "1.1.0",
+      storage: { mode: "direct", path: ".handoff" },
+    };
+    await writeStorageConfig(cwd, config);
+
+    // Check if public repo and warn
+    if (await hasRemote(cwd)) {
+      console.log("");
+      console.log("Warning: .handoff/ may contain private context.");
+      console.log("");
+      console.log("For public repositories, consider adding .handoff/ to .gitignore");
+      console.log("or use submodule mode.");
+      console.log("");
+
+      const addGitignore = await promptUser("Add .handoff/ to .gitignore? (y/n) > ");
+      if (addGitignore.toLowerCase() === "y" || addGitignore.toLowerCase() === "yes") {
+        const gitignorePath = join(cwd, ".gitignore");
+        let existing = "";
+        try {
+          existing = await Deno.readTextFile(gitignorePath);
+        } catch {
+          // no .gitignore yet
+        }
+        if (!existing.includes(".handoff")) {
+          const separator = existing.endsWith("\n") || existing === "" ? "" : "\n";
+          await Deno.writeTextFile(gitignorePath, `${existing}${separator}.handoff\n`);
+          console.log("Added .handoff/ to .gitignore");
+        }
+      }
+    }
+
+    console.log("Initialized direct storage mode.");
+    return config;
+
+  } else if (selectedMode === "submodule") {
+    let remoteUrl = "";
+
+    // Check if submodule already exists
+    if (await isSubmoduleInitialized(cwd)) {
+      console.log("Submodule already registered.");
+      // Read remote from .gitmodules
+      try {
+        const content = await Deno.readTextFile(join(cwd, ".gitmodules"));
+        const match = content.match(/url\s*=\s*(.+)/);
+        if (match) remoteUrl = match[1].trim();
+      } catch {
+        // ignore
+      }
+    }
+
+    if (!remoteUrl) {
+      remoteUrl = await promptUser("Please provide the private handoff repository URL.\nExample: git@github.com:USER/PROJECT-handoff.git\n> ");
+      if (!remoteUrl) {
+        console.error("Error: Repository URL is required for submodule mode.");
+        return null;
+      }
+    }
+
+    // Init submodule
+    if (!await isSubmoduleInitialized(cwd)) {
+      const success = await initSubmodule(cwd, remoteUrl);
+      if (!success) {
+        console.error("Failed to initialize submodule.");
+        return null;
+      }
+    }
+
+    const config: StorageConfig = {
+      version: "1.1.0",
+      storage: { mode: "submodule", path: ".handoff", remote: remoteUrl },
+    };
+    await writeStorageConfig(cwd, config);
+
+    console.log(`Initialized submodule storage mode.`);
+    console.log(`Remote: ${remoteUrl}`);
+    return config;
+  }
+
+  return null;
 }
 
 // ── Git Functions ────────────────────────────────────────────────────────────
 
 async function getGitState(): Promise<HandoffContext["git"]> {
   const [branch, latestCommit, commitMessage, status] = await Promise.all([
-    runCommand(["git", "branch", "--show-current"]),
-    runCommand(["git", "log", "-1", "--format=%h"]),
-    runCommand(["git", "log", "-1", "--format=%s"]),
-    runCommand(["git", "status", "--porcelain"]),
+    run(["git", "branch", "--show-current"]),
+    run(["git", "log", "-1", "--format=%h"]),
+    run(["git", "log", "-1", "--format=%s"]),
+    run(["git", "status", "--porcelain"]),
   ]);
 
   return {
@@ -142,7 +393,7 @@ async function getGitState(): Promise<HandoffContext["git"]> {
 }
 
 async function getModifiedFiles(): Promise<ModifiedFile[]> {
-  const status = await runCommand(["git", "status", "--porcelain"]);
+  const status = await run(["git", "status", "--porcelain"]);
   if (!status) return [];
 
   return status
@@ -161,21 +412,14 @@ async function getModifiedFiles(): Promise<ModifiedFile[]> {
 }
 
 async function getRecentCommits(count: number = 5): Promise<string[]> {
-  const log = await runCommand([
-    "git", "log", "--oneline", "-n", count.toString(),
-  ]);
+  const log = await run(["git", "log", "--oneline", "-n", count.toString()]);
   if (!log) return [];
   return log.split("\n").filter((line) => line.trim());
 }
 
-async function getDiffStat(): Promise<string> {
-  return await runCommand(["git", "diff", "--stat"]) ||
-    await runCommand(["git", "diff", "--stat", "--cached"]) || "";
-}
-
 async function getDiffSummary(): Promise<string> {
-  return await runCommand(["git", "diff", "--shortstat"]) ||
-    await runCommand(["git", "diff", "--shortstat", "--cached"]) || "";
+  return await run(["git", "diff", "--shortstat"]) ||
+    await run(["git", "diff", "--shortstat", "--cached"]) || "";
 }
 
 // ── Auto-Analysis ────────────────────────────────────────────────────────────
@@ -228,11 +472,7 @@ async function scanTodos(cwd: string): Promise<TodoItem[]> {
 
 function inferGoalFromCommits(commits: string[]): string {
   if (commits.length === 0) return "";
-
-  // Use the most recent commit message as the current goal hint
-  const latest = commits[0];
-  const msg = latest.replace(/^[a-f0-9]+\s+/, "");
-  return msg;
+  return commits[0].replace(/^[a-f0-9]+\s+/, "");
 }
 
 function inferCompletedFromCommits(commits: string[]): string[] {
@@ -457,13 +697,33 @@ async function save(mode: string): Promise<void> {
   const config = getModeConfig(mode);
 
   // Check git availability
-  const gitAvailable = (await runCommand(["git", "--version"])).length > 0;
+  const gitAvailable = (await run(["git", "--version"])).length > 0;
   if (!gitAvailable) {
     console.error("Error: git is not available. Install git or run in a git repository.");
     console.error("Falling back to file-scan mode.");
   }
 
-  await ensureDir(handoffDir);
+  // Read storage config
+  let storageConfig = await readStorageConfig(cwd);
+
+  if (!storageConfig) {
+    // Need to initialize
+    storageConfig = await initStorage(cwd);
+    if (!storageConfig) {
+      console.error("Error: Storage initialization failed. Cannot save.");
+      Deno.exit(1);
+    }
+  }
+
+  const storageMode = storageConfig.storage.mode;
+
+  // Ensure .handoff is ready based on storage mode
+  if (storageMode === "submodule") {
+    const ready = await ensureSubmoduleReady(cwd);
+    if (!ready) Deno.exit(1);
+  } else {
+    await ensureDir(handoffDir);
+  }
 
   const { name, language } = await readProjectInfo();
   const git = await getGitState();
@@ -489,7 +749,7 @@ async function save(mode: string): Promise<void> {
   }
 
   const ctx: HandoffContext = {
-    version: "1.0.0",
+    version: "1.1.0",
     timestamp: new Date().toISOString(),
     agent: Deno.env.get("AGENT_NAME") || "opencode",
     project: name,
@@ -518,7 +778,22 @@ async function save(mode: string): Promise<void> {
     Deno.writeTextFile(join(handoffDir, "decisions.md"), filterSensitive(decisionsMd)),
   ]);
 
+  // Post-save actions based on storage mode
+  if (storageMode === "submodule") {
+    const pushed = await commitAndPushSubmodule(handoffDir);
+    if (pushed) {
+      console.log("");
+      console.log("Handoff context has been saved and pushed to the .handoff submodule.");
+      console.log("");
+      console.log("The parent repository now has an updated submodule pointer.");
+      console.log("Commit it in the parent repository only if you want collaborators");
+      console.log("to use this exact handoff revision.");
+    }
+  }
+
+  console.log("");
   console.log(`Handoff saved to ${handoffDir}`);
+  console.log(`Storage: ${storageMode}`);
   console.log(`Mode: ${mode}`);
   console.log(`Project: ${name} (${language})`);
   console.log(`Goal: ${inferredGoal || "(inferred from commits)"}`);
@@ -535,7 +810,36 @@ async function main() {
     default: { _: ["save"] },
   });
 
-  const mode = args._[0]?.toString() || "default";
+  const subcommand = args._[0]?.toString() || "save";
+
+  // Handle init subcommand
+  if (subcommand === "init") {
+    const mode = args._[1]?.toString();
+    const cwd = Deno.cwd();
+    await initStorage(cwd, mode);
+    return;
+  }
+
+  // Handle storage subcommand
+  if (subcommand === "storage") {
+    const cwd = Deno.cwd();
+    const config = await readStorageConfig(cwd);
+    if (!config) {
+      console.log("Handoff storage is not configured.");
+      console.log("Run `/handoff init` to set up storage.");
+      return;
+    }
+    console.log("Handoff storage:");
+    console.log(`  mode: ${config.storage.mode}`);
+    console.log(`  path: ${config.storage.path}`);
+    if (config.storage.remote) {
+      console.log(`  remote: ${config.storage.remote}`);
+    }
+    return;
+  }
+
+  // Handle save with mode
+  const mode = subcommand;
   const validModes = ["default", "compact", "full", "diff"];
   if (!validModes.includes(mode)) {
     console.error(`Error: Unknown mode '${mode}'`);

@@ -11,36 +11,16 @@
  *   compact   - Minimal summary
  *   full      - Maximum context
  *   diff      - Focus on changes
+ *
+ * Subcommands:
+ *   node save.mjs init [direct|submodule]
+ *   node save.mjs storage
  */
 
 import { execSync } from "node:child_process";
-import { mkdirSync, writeFileSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, statSync, existsSync } from "node:fs";
 import { join, extname, relative } from "node:path";
-
-// ── Types ────────────────────────────────────────────────────────────────────
-
-/** @typedef {{ path: string; description: string; change_type: string }} ModifiedFile */
-/** @typedef {{ task: string; priority: string; status: string }} TodoItem */
-/** @typedef {{ title: string; context: string; decision: string; rationale: string }} Decision */
-
-/**
- * @typedef {Object} HandoffContext
- * @property {string} version
- * @property {string} timestamp
- * @property {string} agent
- * @property {string} project
- * @property {string} current_goal
- * @property {string} status
- * @property {string[]} completed
- * @property {ModifiedFile[]} modified_files
- * @property {TodoItem[]} todos
- * @property {string[]} blockers
- * @property {Decision[]} decisions
- * @property {string[]} next_steps
- * @property {{ branch: string; latest_commit: string; commit_message: string; is_dirty: boolean }} git
- * @property {string[]} risks
- * @property {string} notes
- */
+import { createInterface } from "node:readline";
 
 // ── Security ─────────────────────────────────────────────────────────────────
 
@@ -57,6 +37,8 @@ const SENSITIVE_PATTERNS = [
   /(?:secret|token|credential)\s*[:=]\s*["']?[a-zA-Z0-9\-._]{16,}["']?/gi,
   /eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*/g,
   /(?:mongodb|postgres|mysql|redis):\/\/[^\s"']+:[^\s"']+@[^\s"']+/gi,
+  /(?:OPENAI_API_KEY|AWS_SECRET_ACCESS_KEY|AZURE_CLIENT_SECRET|GCP_KEY)\s*[:=]\s*["']?[^\s"']+["']?/gi,
+  /(?:sk-[a-zA-Z0-9]{20,})/g,
 ];
 
 function filterSensitive(text) {
@@ -69,58 +51,199 @@ function filterSensitive(text) {
 
 // ── Command Execution ────────────────────────────────────────────────────────
 
-function runCommand(cmd) {
+function runCommand(cmd, opts) {
   try {
-    return execSync(cmd, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
+    return execSync(cmd, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"], ...opts }).trim();
   } catch {
     return "";
   }
 }
 
-// ── Git Functions ────────────────────────────────────────────────────────────
+// ── Storage Config ───────────────────────────────────────────────────────────
 
-function getGitState() {
-  const branch = runCommand("git branch --show-current");
-  const latestCommit = runCommand("git log -1 --format=%h");
-  const commitMessage = runCommand("git log -1 --format=%s");
-  const status = runCommand("git status --porcelain");
-
-  return {
-    branch: branch || "unknown",
-    latest_commit: latestCommit || "unknown",
-    commit_message: filterSensitive(commitMessage || ""),
-    is_dirty: status.length > 0,
-  };
+function readStorageConfig(cwd) {
+  const configPath = join(cwd, ".handoff.config.json");
+  try {
+    const content = readFileSync(configPath, "utf-8");
+    const config = JSON.parse(content);
+    if (config.storage && config.storage.mode) return config;
+    return null;
+  } catch {
+    return null;
+  }
 }
 
-function getModifiedFiles() {
-  const status = runCommand("git status --porcelain");
-  if (!status) return [];
+function writeStorageConfig(cwd, config) {
+  writeFileSync(join(cwd, ".handoff.config.json"), JSON.stringify(config, null, 2) + "\n");
+}
 
-  return status
-    .split("\n")
-    .filter((line) => line.trim())
-    .map((line) => {
-      const statusCode = line.substring(0, 2).trim();
-      const path = line.substring(3).trim();
-      let changeType = "modified";
-      if (statusCode === "A") changeType = "added";
-      else if (statusCode === "D") changeType = "deleted";
-      else if (statusCode.startsWith("R")) changeType = "renamed";
-      else if (statusCode === "??") changeType = "untracked";
-      return { path, description: "", change_type: changeType };
+function isSubmoduleInitialized(cwd) {
+  const gitmodulesPath = join(cwd, ".gitmodules");
+  if (!existsSync(gitmodulesPath)) return false;
+  try {
+    return readFileSync(gitmodulesPath, "utf-8").includes(".handoff");
+  } catch {
+    return false;
+  }
+}
+
+function hasRemote(cwd) {
+  return !!runCommand("git remote", { cwd });
+}
+
+function initSubmodule(cwd, remoteUrl) {
+  console.log(`Adding submodule from ${remoteUrl}...`);
+  const result = runCommand(`git submodule add ${remoteUrl} .handoff`, { cwd });
+  if (!result && result !== "") {
+    console.error("Failed to add submodule.");
+    return false;
+  }
+  console.log("Initializing submodule...");
+  runCommand("git submodule update --init --recursive .handoff", { cwd });
+  return true;
+}
+
+function ensureSubmoduleReady(cwd) {
+  if (isSubmoduleInitialized(cwd)) {
+    runCommand("git submodule update --init --recursive .handoff", { cwd });
+    return true;
+  }
+  console.error("Error: .handoff is not registered as a submodule.");
+  console.error("Run `/handoff init submodule` first.");
+  return false;
+}
+
+function commitAndPushSubmodule(handoffDir) {
+  const files = ["HANDOFF.md", "context.json", "tasks.md", "decisions.md"];
+  for (const file of files) {
+    runCommand(`git add ${file}`, { cwd: handoffDir });
+  }
+
+  const commitResult = runCommand('git commit -m "Update handoff context"', { cwd: handoffDir });
+  if (!commitResult) {
+    console.log("No changes to commit in submodule (context unchanged).");
+    return true;
+  }
+
+  const pushResult = runCommand("git push", { cwd: handoffDir });
+  if (!pushResult) {
+    console.error("Warning: Failed to push submodule. Changes are committed locally.");
+    return false;
+  }
+  return true;
+}
+
+// ── Init Flow ────────────────────────────────────────────────────────────────
+
+async function promptUser(message) {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    rl.question(message, (answer) => {
+      rl.close();
+      resolve(answer.trim());
     });
+  });
 }
 
-function getRecentCommits(count = 5) {
-  const log = runCommand(`git log --oneline -n ${count}`);
-  if (!log) return [];
-  return log.split("\n").filter((line) => line.trim());
-}
+async function initStorage(cwd, mode) {
+  let selectedMode = mode;
 
-function getDiffSummary() {
-  return runCommand("git diff --shortstat") ||
-    runCommand("git diff --shortstat --cached") || "";
+  if (!selectedMode) {
+    console.log("");
+    console.log("Handoff storage is not configured.");
+    console.log("");
+    console.log("Choose where to store .handoff:");
+    console.log("");
+    console.log("1. direct");
+    console.log("   Store .handoff/ directly in this project.");
+    console.log("   Recommended for private repositories or local-only projects.");
+    console.log("");
+    console.log("2. submodule");
+    console.log("   Store .handoff/ as a Git submodule.");
+    console.log("   Recommended for public repositories where handoff context");
+    console.log("   should not be exposed.");
+    console.log("");
+
+    const choice = await promptUser("Please choose: direct or submodule. > ");
+    if (choice === "1" || choice === "direct") selectedMode = "direct";
+    else if (choice === "2" || choice === "submodule") selectedMode = "submodule";
+    else {
+      console.error("Invalid choice. Please run `/handoff init direct` or `/handoff init submodule`.");
+      return null;
+    }
+  }
+
+  if (selectedMode === "direct") {
+    mkdirSync(join(cwd, ".handoff"), { recursive: true });
+
+    const config = {
+      version: "1.1.0",
+      storage: { mode: "direct", path: ".handoff" },
+    };
+    writeStorageConfig(cwd, config);
+
+    if (hasRemote(cwd)) {
+      console.log("");
+      console.log("Warning: .handoff/ may contain private context.");
+      console.log("For public repositories, consider adding .handoff/ to .gitignore");
+      console.log("or use submodule mode.");
+      console.log("");
+
+      const addGitignore = await promptUser("Add .handoff/ to .gitignore? (y/n) > ");
+      if (addGitignore.toLowerCase() === "y" || addGitignore.toLowerCase() === "yes") {
+        const gitignorePath = join(cwd, ".gitignore");
+        let existing = "";
+        try { existing = readFileSync(gitignorePath, "utf-8"); } catch {}
+        if (!existing.includes(".handoff")) {
+          const sep = existing.endsWith("\n") || existing === "" ? "" : "\n";
+          writeFileSync(gitignorePath, `${existing}${sep}.handoff\n`);
+          console.log("Added .handoff/ to .gitignore");
+        }
+      }
+    }
+
+    console.log("Initialized direct storage mode.");
+    return config;
+
+  } else if (selectedMode === "submodule") {
+    let remoteUrl = "";
+
+    if (isSubmoduleInitialized(cwd)) {
+      console.log("Submodule already registered.");
+      try {
+        const content = readFileSync(join(cwd, ".gitmodules"), "utf-8");
+        const match = content.match(/url\s*=\s*(.+)/);
+        if (match) remoteUrl = match[1].trim();
+      } catch {}
+    }
+
+    if (!remoteUrl) {
+      remoteUrl = await promptUser("Please provide the private handoff repository URL.\nExample: git@github.com:USER/PROJECT-handoff.git\n> ");
+      if (!remoteUrl) {
+        console.error("Error: Repository URL is required for submodule mode.");
+        return null;
+      }
+    }
+
+    if (!isSubmoduleInitialized(cwd)) {
+      if (!initSubmodule(cwd, remoteUrl)) {
+        console.error("Failed to initialize submodule.");
+        return null;
+      }
+    }
+
+    const config = {
+      version: "1.1.0",
+      storage: { mode: "submodule", path: ".handoff", remote: remoteUrl },
+    };
+    writeStorageConfig(cwd, config);
+
+    console.log(`Initialized submodule storage mode.`);
+    console.log(`Remote: ${remoteUrl}`);
+    return config;
+  }
+
+  return null;
 }
 
 // ── Auto-Analysis ────────────────────────────────────────────────────────────
@@ -141,28 +264,14 @@ function scanTodos(dir, maxFiles = 200) {
 
   function walkDir(currentDir) {
     if (++fileCount > maxFiles) return;
-
     let entries;
-    try {
-      entries = readdirSync(currentDir, { withFileTypes: true });
-    } catch {
-      return;
-    }
+    try { entries = readdirSync(currentDir, { withFileTypes: true }); } catch { return; }
 
     for (const entry of entries) {
       if (fileCount > maxFiles) break;
-
       const fullPath = join(currentDir, entry.name);
-
-      if (entry.isDirectory()) {
-        if (!SKIP_DIRS.has(entry.name)) {
-          walkDir(fullPath);
-        }
-        continue;
-      }
-
-      if (!entry.isFile()) continue;
-      if (!SOURCE_EXTENSIONS.has(extname(entry.name))) continue;
+      if (entry.isDirectory()) { if (!SKIP_DIRS.has(entry.name)) walkDir(fullPath); continue; }
+      if (!entry.isFile() || !SOURCE_EXTENSIONS.has(extname(entry.name))) continue;
 
       try {
         const content = readFileSync(fullPath, "utf-8");
@@ -172,19 +281,11 @@ function scanTodos(dir, maxFiles = 200) {
           todoPattern.lastIndex = 0;
           while ((match = todoPattern.exec(lines[i])) !== null) {
             const tag = match[1].toUpperCase();
-            const task = match[2].trim();
             const priority = (tag === "FIXME" || tag === "HACK") ? "high" : "medium";
-            const relPath = relative(dir, fullPath);
-            todos.push({
-              task: `${task} (${relPath}:${i + 1})`,
-              priority,
-              status: "pending",
-            });
+            todos.push({ task: `${match[2].trim()} (${relative(dir, fullPath)}:${i + 1})`, priority, status: "pending" });
           }
         }
-      } catch {
-        // skip unreadable files
-      }
+      } catch {}
     }
   }
 
@@ -192,265 +293,117 @@ function scanTodos(dir, maxFiles = 200) {
   return todos.slice(0, 20);
 }
 
-function inferGoalFromCommits(commits) {
-  if (commits.length === 0) return "";
-  return commits[0].replace(/^[a-f0-9]+\s+/, "");
-}
-
-function inferCompletedFromCommits(commits) {
-  return commits.slice(1, 6).map((c) => c.replace(/^[a-f0-9]+\s+/, ""));
-}
-
-function inferStatusFromGit(git, modifiedFiles) {
-  if (modifiedFiles.length === 0) return "idle - no pending changes";
-  if (git.is_dirty) return `in-progress - ${modifiedFiles.length} file(s) modified`;
-  return "ready - changes committed";
-}
-
-function inferRisksFromState(git, todos, modifiedFiles) {
-  const risks = [];
-
-  const highPriority = todos.filter((t) => t.priority === "high" && t.status === "pending");
-  if (highPriority.length > 0) {
-    risks.push(`${highPriority.length} high-priority TODO/FIXME items pending`);
-  }
-
-  const untracked = modifiedFiles.filter((f) => f.change_type === "untracked");
-  if (untracked.length > 3) {
-    risks.push(`${untracked.length} untracked files - consider adding to version control`);
-  }
-
-  return risks;
-}
-
-// ── Project Detection ────────────────────────────────────────────────────────
-
 function readProjectInfo() {
   const manifests = [
     { file: "package.json", lang: "typescript/javascript" },
     { file: "Cargo.toml", lang: "rust" },
     { file: "go.mod", lang: "go" },
     { file: "pyproject.toml", lang: "python" },
-    { file: "setup.py", lang: "python" },
-    { file: "pom.xml", lang: "java" },
   ];
-
   for (const { file, lang } of manifests) {
     try {
       const content = readFileSync(file, "utf-8");
-      if (file === "package.json") {
-        const pkg = JSON.parse(content);
-        return { name: pkg.name || "unknown", language: lang };
-      }
-      if (file === "Cargo.toml") {
-        const m = content.match(/name\s*=\s*"([^"]+)"/);
-        return { name: m?.[1] || "unknown", language: lang };
-      }
-      if (file === "go.mod") {
-        const m = content.match(/module\s+(.+)/);
-        return { name: m?.[1]?.split("/").pop() || "unknown", language: lang };
-      }
-      if (file === "pyproject.toml") {
-        const m = content.match(/name\s*=\s*"([^"]+)"/);
-        return { name: m?.[1] || "unknown", language: lang };
-      }
-      if (file === "pom.xml") {
-        const m = content.match(/<artifactId>([^<]+)<\/artifactId>/);
-        return { name: m?.[1] || "unknown", language: lang };
-      }
-    } catch {
-      continue;
-    }
+      if (file === "package.json") return { name: JSON.parse(content).name || "unknown", language: lang };
+      if (file === "Cargo.toml") { const m = content.match(/name\s*=\s*"([^"]+)"/); return { name: m?.[1] || "unknown", language: lang }; }
+      if (file === "go.mod") { const m = content.match(/module\s+(.+)/); return { name: m?.[1]?.split("/").pop() || "unknown", language: lang }; }
+      if (file === "pyproject.toml") { const m = content.match(/name\s*=\s*"([^"]+)"/); return { name: m?.[1] || "unknown", language: lang }; }
+    } catch {}
   }
   return { name: "unknown", language: "unknown" };
 }
 
-// ── Markdown Generation ──────────────────────────────────────────────────────
-
-function generateHandoffMarkdown(ctx) {
-  const completed = ctx.completed.map((item) => `- ${item}`).join("\n");
-  const modified = ctx.modified_files
-    .map((f) => `- \`${f.path}\` [${f.change_type}]`)
-    .join("\n");
-  const todos = ctx.todos.map((t) => `- [ ] **${t.priority}** ${t.task}`).join("\n");
-  const blockers = ctx.blockers.map((b) => `- ${b}`).join("\n");
-  const nextSteps = ctx.next_steps.map((s, i) => `${i + 1}. ${s}`).join("\n");
-  const risks = ctx.risks.map((r) => `- ${r}`).join("\n");
-
-  return `# Project Handoff
-
-**Saved**: ${ctx.timestamp}
-**Agent**: ${ctx.agent}
-**Project**: ${ctx.project}
-**Branch**: ${ctx.git.branch}
-**Commit**: ${ctx.git.latest_commit} - ${ctx.git.commit_message}
-
-## Current Goal
-
-${ctx.current_goal || "No explicit goal set."}
-
-## Current Status
-
-${ctx.status}
-
-## Completed Work
-
-${completed || "No completed work recorded."}
-
-## Modified Files
-
-${modified || "No files modified."}
-
-## Outstanding Issues
-
-${blockers || "No blockers."}
-
-## TODO
-
-${todos || "No pending tasks."}
-
-## Recommended Next Steps
-
-${nextSteps || "No next steps defined."}
-
-## Risks / Notes
-
-${risks || "No risks identified."}
-
----
-
-*Generated by Handoff Protocol v${ctx.version}*
-`;
-}
-
-function generateTasksMarkdown(ctx) {
-  const high = ctx.todos.filter((t) => t.priority === "high");
-  const medium = ctx.todos.filter((t) => t.priority === "medium");
-  const low = ctx.todos.filter((t) => t.priority === "low");
-
-  const fmt = (tasks) => tasks.map((t) => `- [ ] ${t.task}`).join("\n") || "None";
-
-  return `# Pending Tasks
-
-## High Priority
-${fmt(high)}
-
-## Medium Priority
-${fmt(medium)}
-
-## Low Priority
-${fmt(low)}
-`;
-}
-
-function generateDecisionsMarkdown(ctx) {
-  if (ctx.decisions.length === 0) {
-    return "# Architecture Decisions\n\nNo decisions recorded.\n";
-  }
-
-  const decisions = ctx.decisions
-    .map((d) => `## ${d.title}\n\n- **Context**: ${d.context || "N/A"}\n- **Decision**: ${d.decision}\n- **Rationale**: ${d.rationale || "N/A"}`)
-    .join("\n\n");
-
-  return `# Architecture Decisions\n\n${decisions}\n`;
-}
-
-// ── Mode Handling ────────────────────────────────────────────────────────────
-
-function getModeConfig(mode) {
-  switch (mode) {
-    case "compact":
-      return { commitCount: 3, maxTodos: 5, includeDiffStat: false, includeRiskAnalysis: false, includeTodoScan: false };
-    case "full":
-      return { commitCount: 20, maxTodos: 50, includeDiffStat: true, includeRiskAnalysis: true, includeTodoScan: true };
-    case "diff":
-      return { commitCount: 5, maxTodos: 10, includeDiffStat: true, includeRiskAnalysis: false, includeTodoScan: false };
-    default:
-      return { commitCount: 5, maxTodos: 20, includeDiffStat: true, includeRiskAnalysis: true, includeTodoScan: true };
-  }
-}
-
 // ── Main ─────────────────────────────────────────────────────────────────────
 
-function save(mode) {
+async function save(mode) {
   const cwd = process.cwd();
   const handoffDir = join(cwd, ".handoff");
-  const config = getModeConfig(mode);
 
-  const gitAvailable = !!runCommand("git --version");
-  if (!gitAvailable) {
-    console.error("Error: git is not available. Falling back to file-scan mode.");
+  let storageConfig = readStorageConfig(cwd);
+  if (!storageConfig) {
+    storageConfig = await initStorage(cwd);
+    if (!storageConfig) { console.error("Error: Storage initialization failed."); process.exit(1); }
   }
 
-  mkdirSync(handoffDir, { recursive: true });
+  const storageMode = storageConfig.storage.mode;
+
+  if (storageMode === "submodule") {
+    if (!ensureSubmoduleReady(cwd)) process.exit(1);
+  } else {
+    mkdirSync(handoffDir, { recursive: true });
+  }
 
   const { name, language } = readProjectInfo();
-  const git = getGitState();
-  const modifiedFiles = getModifiedFiles();
-  const recentCommits = getRecentCommits(config.commitCount);
+  const gitBranch = runCommand("git branch --show-current") || "unknown";
+  const gitCommit = runCommand("git log -1 --format=%h") || "unknown";
+  const gitMessage = filterSensitive(runCommand("git log -1 --format=%s") || "");
+  const gitDirty = !!runCommand("git status --porcelain");
+  const git = { branch: gitBranch, latest_commit: gitCommit, commit_message: gitMessage, is_dirty: gitDirty };
 
-  const todos = config.includeTodoScan ? scanTodos(cwd) : [];
-  const inferredGoal = inferGoalFromCommits(recentCommits);
-  const completed = inferCompletedFromCommits(recentCommits);
-  const status = inferStatusFromGit(git, modifiedFiles);
-  const risks = config.includeRiskAnalysis ? inferRisksFromState(git, todos, modifiedFiles) : [];
+  const recentCommits = runCommand(`git log --oneline -n 5`) || "";
+  const commits = recentCommits.split("\n").filter((l) => l.trim());
+  const inferredGoal = commits[0]?.replace(/^[a-f0-9]+\s+/, "") || "";
+  const completed = commits.slice(1, 6).map((c) => c.replace(/^[a-f0-9]+\s+/, ""));
 
-  let notes = recentCommits.join("\n");
-  if (config.includeDiffStat) {
-    const diffSummary = getDiffSummary();
-    if (diffSummary) notes = `Diff summary: ${diffSummary}\n\n${notes}`;
-  }
+  const modifiedFiles = (runCommand("git status --porcelain") || "").split("\n").filter((l) => l.trim()).map((line) => {
+    const sc = line.substring(0, 2).trim();
+    const p = line.substring(3).trim();
+    let ct = "modified";
+    if (sc === "A") ct = "added"; else if (sc === "D") ct = "deleted"; else if (sc.startsWith("R")) ct = "renamed"; else if (sc === "??") ct = "untracked";
+    return { path: p, description: "", change_type: ct };
+  });
 
-  /** @type {HandoffContext} */
+  const todos = scanTodos(cwd);
+  const status = modifiedFiles.length === 0 ? "idle - no pending changes" : git.is_dirty ? `in-progress - ${modifiedFiles.length} file(s) modified` : "ready - changes committed";
+
   const ctx = {
-    version: "1.0.0",
-    timestamp: new Date().toISOString(),
-    agent: process.env.AGENT_NAME || "opencode",
-    project: name,
-    current_goal: inferredGoal,
-    status,
-    completed,
-    modified_files: modifiedFiles,
-    todos: todos.slice(0, config.maxTodos),
-    blockers: [],
-    decisions: [],
-    next_steps: [],
-    git,
-    risks,
-    notes,
+    version: "1.1.0", timestamp: new Date().toISOString(), agent: process.env.AGENT_NAME || "opencode",
+    project: name, current_goal: inferredGoal, status, completed, modified_files: modifiedFiles,
+    todos: todos.slice(0, 20), blockers: [], decisions: [], next_steps: [], git, risks: [], notes: commits.join("\n"),
   };
 
-  const handoffMd = generateHandoffMarkdown(ctx);
-  const tasksMd = generateTasksMarkdown(ctx);
-  const decisionsMd = generateDecisionsMarkdown(ctx);
-  const contextJson = JSON.stringify(ctx, null, 2);
+  const handoffMd = `# Project Handoff\n\n**Saved**: ${ctx.timestamp}\n**Agent**: ${ctx.agent}\n**Project**: ${ctx.project}\n**Branch**: ${ctx.git.branch}\n**Commit**: ${ctx.git.latest_commit} - ${ctx.git.commit_message}\n\n## Current Goal\n\n${ctx.current_goal || "No explicit goal set."}\n\n## Current Status\n\n${ctx.status}\n\n## Completed Work\n\n${completed.map((i) => `- ${i}`).join("\n") || "None"}\n\n## Modified Files\n\n${modifiedFiles.map((f) => `- \`${f.path}\` [${f.change_type}]`).join("\n") || "None"}\n\n## TODO\n\n${todos.map((t) => `- [ ] **${t.priority}** ${t.task}`).join("\n") || "None"}\n\n---\n\n*Generated by Handoff Protocol v${ctx.version}*\n`;
+  const tasksMd = `# Pending Tasks\n\n## High Priority\n${todos.filter((t) => t.priority === "high").map((t) => `- [ ] ${t.task}`).join("\n") || "None"}\n\n## Medium Priority\n${todos.filter((t) => t.priority === "medium").map((t) => `- [ ] ${t.task}`).join("\n") || "None"}\n\n## Low Priority\n${todos.filter((t) => t.priority === "low").map((t) => `- [ ] ${t.task}`).join("\n") || "None"}\n`;
+  const decisionsMd = "# Architecture Decisions\n\nNo decisions recorded.\n";
 
   writeFileSync(join(handoffDir, "HANDOFF.md"), filterSensitive(handoffMd));
-  writeFileSync(join(handoffDir, "context.json"), filterSensitive(contextJson));
+  writeFileSync(join(handoffDir, "context.json"), filterSensitive(JSON.stringify(ctx, null, 2)));
   writeFileSync(join(handoffDir, "tasks.md"), filterSensitive(tasksMd));
   writeFileSync(join(handoffDir, "decisions.md"), filterSensitive(decisionsMd));
 
-  console.log(`Handoff saved to ${handoffDir}`);
+  if (storageMode === "submodule") {
+    if (commitAndPushSubmodule(handoffDir)) {
+      console.log("\nHandoff context has been saved and pushed to the .handoff submodule.");
+      console.log("The parent repository now has an updated submodule pointer.");
+      console.log("Commit it in the parent repository only if you want collaborators to use this exact handoff revision.");
+    }
+  }
+
+  console.log(`\nHandoff saved to ${handoffDir}`);
+  console.log(`Storage: ${storageMode}`);
   console.log(`Mode: ${mode}`);
   console.log(`Project: ${name} (${language})`);
-  console.log(`Goal: ${inferredGoal || "(inferred from commits)"}`);
   console.log(`Files: HANDOFF.md, context.json, tasks.md, decisions.md`);
   if (todos.length > 0) console.log(`Scanned: ${todos.length} TODO/FIXME items found`);
 }
 
 // ── Entry Point ──────────────────────────────────────────────────────────────
 
-const mode = process.argv[2] || "default";
-const validModes = ["default", "compact", "full", "diff"];
-if (!validModes.includes(mode)) {
-  console.error(`Error: Unknown mode '${mode}'`);
-  console.error(`Valid modes: ${validModes.join(", ")}`);
-  process.exit(1);
-}
+const arg = process.argv[2] || "save";
 
-try {
-  save(mode);
-} catch (err) {
-  console.error(`Error during save: ${err.message}`);
-  process.exit(1);
+if (arg === "init") {
+  const mode = process.argv[3];
+  initStorage(process.cwd(), mode).catch(console.error);
+} else if (arg === "storage") {
+  const config = readStorageConfig(process.cwd());
+  if (!config) { console.log("Handoff storage is not configured.\nRun `/handoff init` to set up storage."); }
+  else {
+    console.log("Handoff storage:");
+    console.log(`  mode: ${config.storage.mode}`);
+    console.log(`  path: ${config.storage.path}`);
+    if (config.storage.remote) console.log(`  remote: ${config.storage.remote}`);
+  }
+} else {
+  const validModes = ["default", "compact", "full", "diff"];
+  if (!validModes.includes(arg)) { console.error(`Error: Unknown mode '${arg}'\nValid modes: ${validModes.join(", ")}`); process.exit(1); }
+  save(arg).catch((err) => { console.error(`Error: ${err.message}`); process.exit(1); });
 }

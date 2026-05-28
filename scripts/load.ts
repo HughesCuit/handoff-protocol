@@ -68,6 +68,16 @@ interface LoadResult {
   risks: string[];
   pendingTasks: number;
   context: HandoffContext | null;
+  storageMode: string;
+}
+
+interface StorageConfig {
+  version: string;
+  storage: {
+    mode: "direct" | "submodule";
+    path: string;
+    remote?: string;
+  };
 }
 
 // ── Security ─────────────────────────────────────────────────────────────────
@@ -85,6 +95,8 @@ const SENSITIVE_PATTERNS: RegExp[] = [
   /(?:secret|token|credential)\s*[:=]\s*["']?[a-zA-Z0-9\-._]{16,}["']?/gi,
   /eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*/g,
   /(?:mongodb|postgres|mysql|redis):\/\/[^\s"']+:[^\s"']+@[^\s"']+/gi,
+  /(?:OPENAI_API_KEY|AWS_SECRET_ACCESS_KEY|AZURE_CLIENT_SECRET|GCP_KEY)\s*[:=]\s*["']?[^\s"']+["']?/gi,
+  /(?:sk-[a-zA-Z0-9]{20,})/g,
 ];
 
 function filterSensitive(text: string): string {
@@ -97,7 +109,7 @@ function filterSensitive(text: string): string {
 
 // ── Command Execution ────────────────────────────────────────────────────────
 
-async function runCommand(cmd: string[]): Promise<string> {
+async function runCommand(cmd: string[]): Promise<{ stdout: string; code: number }> {
   try {
     const command = new Deno.Command(cmd[0], {
       args: cmd.slice(1),
@@ -105,11 +117,62 @@ async function runCommand(cmd: string[]): Promise<string> {
       stderr: "piped",
     });
     const { code, stdout } = await command.output();
-    if (code !== 0) return "";
-    return new TextDecoder().decode(stdout).trim();
+    return { stdout: new TextDecoder().decode(stdout).trim(), code };
   } catch {
-    return "";
+    return { stdout: "", code: -1 };
   }
+}
+
+async function run(cmd: string[]): Promise<string> {
+  const { stdout } = await runCommand(cmd);
+  return stdout;
+}
+
+// ── Storage Config ───────────────────────────────────────────────────────────
+
+async function readStorageConfig(cwd: string): Promise<StorageConfig | null> {
+  const configPath = join(cwd, ".handoff.config.json");
+  try {
+    const content = await Deno.readTextFile(configPath);
+    const config = JSON.parse(content) as StorageConfig;
+    if (config.storage && config.storage.mode) {
+      return config;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function isSubmoduleInitialized(cwd: string): Promise<boolean> {
+  const gitmodulesPath = join(cwd, ".gitmodules");
+  if (!await exists(gitmodulesPath)) return false;
+
+  try {
+    const content = await Deno.readTextFile(gitmodulesPath);
+    return content.includes('.handoff');
+  } catch {
+    return false;
+  }
+}
+
+async function ensureSubmoduleReady(cwd: string): Promise<boolean> {
+  if (await isSubmoduleInitialized(cwd)) {
+    const { code } = await runCommand(
+      ["git", "submodule", "update", "--init", "--recursive", ".handoff"],
+    );
+    if (code !== 0) {
+      console.error("Unable to initialize .handoff submodule.");
+      console.error("This may be a private repository. Please make sure your SSH key");
+      console.error("or GitHub credentials have access to the remote repository.");
+      return false;
+    }
+    return true;
+  }
+
+  console.error("Error: .handoff is not registered as a submodule.");
+  console.error("Run `/handoff init submodule` first.");
+  return false;
 }
 
 // ── Parsing ──────────────────────────────────────────────────────────────────
@@ -125,7 +188,6 @@ async function loadContextJson(handoffDir: string): Promise<HandoffContext | nul
     const content = await Deno.readTextFile(contextPath);
     const parsed = JSON.parse(content);
 
-    // Validate required fields
     if (!parsed.project || !parsed.timestamp) {
       console.error("Warning: context.json is missing required fields (project, timestamp)");
       return null;
@@ -206,7 +268,6 @@ function parseHandoffMd(content: string): Partial<HandoffContext> {
     }
   }
 
-  // Extract project and branch from header lines
   for (const line of lines.slice(0, 10)) {
     const projectMatch = line.match(/\*\*Project\*\*:\s*(.+)/);
     if (projectMatch) result.project = projectMatch[1].trim();
@@ -269,12 +330,10 @@ function generateUnderstanding(ctx: HandoffContext): string {
 function generateNextActions(ctx: HandoffContext, mode: string): string[] {
   const actions: string[] = [];
 
-  // Always include explicit next steps
   if (ctx.next_steps.length > 0) {
     actions.push(...ctx.next_steps);
   }
 
-  // High-priority todos
   const highPriority = ctx.todos.filter(
     (t) => t.priority === "high" && t.status === "pending"
   );
@@ -282,13 +341,11 @@ function generateNextActions(ctx: HandoffContext, mode: string): string[] {
     actions.push(`[HIGH] ${todo.task}`);
   }
 
-  // Blockers
   if (ctx.blockers.length > 0) {
     actions.push(`Resolve blocker: ${ctx.blockers[0]}`);
   }
 
   if (mode === "auto") {
-    // Infer from modified files
     if (ctx.modified_files.length > 0) {
       const addedFiles = ctx.modified_files.filter((f) => f.change_type === "added");
       const modifiedFiles = ctx.modified_files.filter((f) => f.change_type === "modified");
@@ -301,7 +358,6 @@ function generateNextActions(ctx: HandoffContext, mode: string): string[] {
       }
     }
 
-    // Pending medium-priority todos
     const mediumTodos = ctx.todos.filter(
       (t) => t.priority === "medium" && t.status === "pending"
     );
@@ -309,7 +365,6 @@ function generateNextActions(ctx: HandoffContext, mode: string): string[] {
       actions.push(`Address ${mediumTodos.length} medium-priority TODO items`);
     }
 
-    // Git state
     if (ctx.git.is_dirty) {
       actions.push("Review and commit pending changes");
     }
@@ -340,7 +395,6 @@ function generateRisks(ctx: HandoffContext): string[] {
     risks.push(`${pendingHigh.length} high-priority task(s) pending`);
   }
 
-  // Check for stale handoff
   if (ctx.timestamp) {
     const savedTime = new Date(ctx.timestamp).getTime();
     const hoursSince = (Date.now() - savedTime) / (1000 * 60 * 60);
@@ -360,9 +414,9 @@ async function getCurrentGitState(): Promise<{
   status: string;
 }> {
   const [branch, latestCommit, status] = await Promise.all([
-    runCommand(["git", "branch", "--show-current"]),
-    runCommand(["git", "log", "-1", "--format=%h"]),
-    runCommand(["git", "status", "--porcelain"]),
+    run(["git", "branch", "--show-current"]),
+    run(["git", "log", "-1", "--format=%h"]),
+    run(["git", "status", "--porcelain"]),
   ]);
 
   return {
@@ -384,24 +438,21 @@ async function analyzeMerge(
     return;
   }
 
-  // Branch mismatch
   if (currentState.branch !== ctx.git.branch) {
     risks.push(
       `Branch mismatch: handoff on '${ctx.git.branch}', current on '${currentState.branch}'`
     );
   }
 
-  // New commits since handoff
   if (ctx.git.latest_commit && ctx.git.latest_commit !== "unknown") {
-    const commitsSince = await runCommand([
+    const commitsSince = await run([
       "git", "rev-list", "--count", `${ctx.git.latest_commit}..HEAD`,
     ]);
     const count = parseInt(commitsSince);
     if (!isNaN(count) && count > 0) {
       nextActions.unshift(`Sync with ${count} new commit(s) since handoff`);
 
-      // Show what changed
-      const newCommits = await runCommand([
+      const newCommits = await run([
         "git", "log", "--oneline", `${ctx.git.latest_commit}..HEAD`,
       ]);
       if (newCommits) {
@@ -410,7 +461,6 @@ async function analyzeMerge(
     }
   }
 
-  // Current dirty state
   if (currentState.status) {
     const changedFiles = currentState.status.split("\n").filter((l) => l.trim()).length;
     risks.push(`${changedFiles} file(s) have uncommitted changes`);
@@ -422,6 +472,8 @@ async function analyzeMerge(
 function formatOutput(result: LoadResult, mode: string): string {
   const lines: string[] = [];
 
+  lines.push(`Storage: ${result.storageMode}`);
+  lines.push("");
   lines.push("Current understanding:");
   lines.push(result.understanding);
   lines.push("");
@@ -464,6 +516,28 @@ async function load(mode: string): Promise<LoadResult> {
   const cwd = Deno.cwd();
   const handoffDir = join(cwd, ".handoff");
 
+  // Read storage config
+  const storageConfig = await readStorageConfig(cwd);
+  const storageMode = storageConfig?.storage.mode || "direct";
+
+  // Handle submodule mode
+  if (storageMode === "submodule") {
+    const ready = await ensureSubmoduleReady(cwd);
+    if (!ready) {
+      return {
+        understanding: "Unable to access .handoff submodule.",
+        nextActions: [
+          "Check SSH key or GitHub credentials for the handoff repository",
+          "Run: git submodule update --init --recursive .handoff",
+        ],
+        risks: ["Submodule access failed"],
+        pendingTasks: 0,
+        context: null,
+        storageMode,
+      };
+    }
+  }
+
   // Check .handoff/ exists
   if (!await exists(handoffDir)) {
     console.error("Error: No .handoff/ directory found.");
@@ -477,6 +551,7 @@ async function load(mode: string): Promise<LoadResult> {
       risks: ["No handoff directory"],
       pendingTasks: 0,
       context: null,
+      storageMode,
     };
   }
 
@@ -497,6 +572,7 @@ async function load(mode: string): Promise<LoadResult> {
         risks: ["Invalid handoff state - no readable files"],
         pendingTasks: 0,
         context: null,
+        storageMode,
       };
     }
 
@@ -527,12 +603,10 @@ async function load(mode: string): Promise<LoadResult> {
   const risks = generateRisks(ctx);
   const pendingTasks = ctx.todos.filter((t) => t.status === "pending").length;
 
-  // Merge mode: analyze current git state against handoff
   if (mode === "merge") {
     await analyzeMerge(ctx, risks, nextActions);
   }
 
-  // Sanitize output
   const sanitizedUnderstanding = filterSensitive(understanding);
   const sanitizedActions = nextActions.map((a) => filterSensitive(a));
   const sanitizedRisks = risks.map((r) => filterSensitive(r));
@@ -543,6 +617,7 @@ async function load(mode: string): Promise<LoadResult> {
     risks: sanitizedRisks,
     pendingTasks,
     context: ctx,
+    storageMode,
   };
 }
 

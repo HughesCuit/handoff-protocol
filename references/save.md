@@ -17,6 +17,70 @@ Save current work context to `.handoff/` directory.
 | `full` | Maximum context - all details, extended history |
 | `diff` | Focus on code changes - diff-centric output |
 
+## Pre-Flight Checks
+
+Before saving, the script must:
+
+### 1. Check Storage Configuration
+
+Read `.handoff.config.json` from project root.
+
+**If not found:**
+
+```
+Handoff storage is not configured.
+
+Choose where to store .handoff:
+
+1. direct
+   Store .handoff/ directly in this project.
+   Recommended for private repositories or local-only projects.
+
+2. submodule
+   Store .handoff/ as a Git submodule.
+   Recommended for public repositories where handoff context should not be exposed.
+
+Please choose: direct or submodule.
+```
+
+If user selects `submodule`, prompt for private repo URL:
+
+```
+Please provide the private handoff repository URL.
+Example: git@github.com:USER/PROJECT-handoff.git
+```
+
+### 2. Validate Storage Mode
+
+**direct mode:**
+- Ensure `.handoff/` exists (create if not)
+- Check if `.handoff/` is in `.gitignore`
+- If project has a remote and `.handoff/` is NOT in `.gitignore`, warn:
+
+```
+Warning: .handoff/ may contain private context.
+
+For public repositories, consider adding .handoff/ to .gitignore
+or use submodule mode.
+```
+
+**submodule mode:**
+- Verify `.handoff` is registered as a git submodule (check `.gitmodules`)
+- If not initialized, run:
+
+```bash
+git submodule update --init --recursive .handoff
+```
+
+- If initialization fails (likely private repo access issue):
+
+```
+Unable to initialize .handoff submodule.
+
+This may be a private repository. Please make sure your SSH key
+or GitHub credentials have access to the remote repository.
+```
+
 ## Execution Steps
 
 ### 1. Collect Git State
@@ -36,22 +100,23 @@ If git unavailable, fall back to:
 ### 2. Analyze Current State
 
 Determine:
-- Current goal (what are we working on?)
-- Progress status (what's done? what's pending?)
-- Modified files (what changed?)
-- Blockers (what's blocking progress?)
-- Next steps (what should happen next?)
+- Current goal (inferred from recent commits)
+- Progress status (from git working state)
+- Modified files (from `git status --porcelain`)
+- TODO/FIXME items (scanned from source files)
+- Risk factors (high-priority items, untracked files)
 
 ### 3. Security Filter
 
 **MUST NOT include:**
-- API keys (any pattern: `sk-*`, `key=*`, etc.)
-- Bearer tokens
-- Cookies
-- Passwords
-- Private keys
+- API keys (generic, GitHub `ghp_*`, GitLab `glpat-*`, AWS `AKIA*`)
+- Bearer tokens, JWT tokens
+- Cookies, passwords
+- Private keys (PEM, SSH)
+- Connection strings with credentials
+- Cloud service credentials (GCP, Azure)
+- OAuth tokens, OpenAI API keys
 - `.env` contents
-- Any secret/credential patterns
 
 Filter before writing to any `.handoff/` file.
 
@@ -59,33 +124,33 @@ Filter before writing to any `.handoff/` file.
 
 #### HANDOFF.md (Human-readable)
 
-Follow template: `templates/HANDOFF.template.md`
-
 Structure:
 ```markdown
 # Project Handoff
 
+**Saved**: ISO-8601 timestamp
+**Agent**: agent-name
+**Project**: project-name
+**Branch**: current-branch
+**Commit**: hash - message
+
 ## Current Goal
-[one-line goal]
+[inferred from recent commits]
 
 ## Current Status
-[progress summary]
+[progress summary from git state]
 
 ## Completed Work
-- [item]
-- [item]
+- [item from recent commits]
 
 ## Modified Files
-- `path/to/file` - [what changed]
-
-## Architecture Decisions
-- [decision and rationale]
+- `path/to/file` [change_type]
 
 ## Outstanding Issues
 - [blocker or issue]
 
 ## TODO
-- [ ] [pending task]
+- [ ] **priority** task (file:line)
 
 ## Recommended Next Steps
 1. [actionable step]
@@ -96,23 +161,28 @@ Structure:
 
 #### context.json (Machine-readable)
 
-Follow template: `templates/context.template.json`
-
 ```json
 {
+  "version": "1.1.0",
+  "timestamp": "ISO-8601",
+  "agent": "opencode",
   "project": "project-name",
   "current_goal": "description",
-  "status": "in-progress|blocked|completed",
+  "status": "in-progress",
   "completed": ["item1", "item2"],
-  "modified_files": ["file1", "file2"],
-  "todos": ["task1", "task2"],
-  "blockers": ["blocker1"],
-  "decisions": ["decision1"],
-  "next_steps": ["step1", "step2"],
+  "modified_files": [{"path": "file", "description": "", "change_type": "modified"}],
+  "todos": [{"task": "task", "priority": "high", "status": "pending"}],
+  "blockers": [],
+  "decisions": [],
+  "next_steps": [],
   "git": {
     "branch": "main",
-    "latest_commit": "abc1234"
-  }
+    "latest_commit": "abc1234",
+    "commit_message": "msg",
+    "is_dirty": true
+  },
+  "risks": [],
+  "notes": ""
 }
 ```
 
@@ -137,11 +207,38 @@ Follow template: `templates/context.template.json`
 # Architecture Decisions
 
 ## [Decision Title]
-- **Date**: YYYY-MM-DD
 - **Context**: [why this decision was needed]
 - **Decision**: [what was decided]
 - **Rationale**: [why this approach]
-- **Consequences**: [impact]
+```
+
+### 5. Write Files and Commit
+
+**direct mode:**
+1. Write all 4 files to `.handoff/`
+2. Do NOT auto-commit
+3. Remind user to decide whether to commit `.handoff/`
+
+**submodule mode:**
+1. Ensure submodule is initialized
+2. Write all 4 files to `.handoff/`
+3. Inside `.handoff/`:
+
+```bash
+git add HANDOFF.md context.json tasks.md decisions.md
+git commit -m "Update handoff context"
+git push
+```
+
+4. Return to parent project
+5. Remind user:
+
+```
+Handoff context has been saved and pushed to the .handoff submodule.
+
+The parent repository now has an updated submodule pointer.
+Commit it in the parent repository only if you want collaborators
+to use this exact handoff revision.
 ```
 
 ## Mode-Specific Behavior
@@ -152,31 +249,31 @@ Minimal output:
 - Current goal (1 line)
 - Status (1 line)
 - Next steps (3 items max)
-
-Skip: detailed file lists, full git history, extended analysis.
+- 3 recent commits, no TODO scan
 
 ### full
 
 Extended output:
 - Full git log (last 20 commits)
-- Complete file change list
-- Detailed analysis of each change
+- Up to 50 TODO/FIXME items
 - Extended risk assessment
-- Alternative approaches considered
+- Full diff stats
 
 ### diff
 
 Diff-centric output:
 - Emphasize code changes
-- Include relevant diff snippets
-- Focus on what changed, not why
-- Minimal status/overview content
+- Include diff summary
+- 5 commits, no TODO scan
 
 ## Error Handling
 
 | Condition | Behavior |
 |-----------|----------|
+| No `.handoff.config.json` | Trigger init flow |
 | No `.handoff/` directory | Create it |
+| Submodule not initialized | Run `git submodule update --init` |
+| Submodule access denied | Clear error about SSH/credential access |
 | Git not available | Use file scanning fallback |
 | No changes detected | Save current state anyway |
 | Permission error | Report error, suggest fix |

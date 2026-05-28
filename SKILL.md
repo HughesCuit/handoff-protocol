@@ -4,7 +4,7 @@ description: Cross-agent context handoff protocol. Save and restore work context
 license: MIT
 metadata:
   author: handoff-protocol
-  version: "1.0.0"
+  version: "1.1.0"
 ---
 
 # Handoff Protocol Skill
@@ -17,7 +17,59 @@ The Handoff Protocol provides a standardized way to save, restore, and share wor
 
 When invoked, the skill manages a `.handoff/` directory that serves as the Agent Context Protocol - similar to `.git/` for version control, but for AI agent collaboration.
 
+## Storage Modes
+
+Handoff Protocol supports two storage modes for `.handoff/`:
+
+### direct
+
+Stores `.handoff/` directly in the current project directory.
+
+Best for:
+- Private repositories
+- Local-only projects
+- Personal projects
+- Teams that intentionally version handoff context with the codebase
+
+### submodule
+
+Stores `.handoff/` as a Git submodule pointing to a separate private repository.
+
+Best for:
+- Public repositories
+- Open-source projects
+- Projects where handoff context should remain private
+- Teams that want to separate source code history from agent context history
+
+**For public repositories, submodule mode is recommended** because `.handoff/` may contain private context, implementation notes, local paths, task history, unfinished plans, architecture reasoning, or sensitive operational details.
+
 ## Commands
+
+### /handoff init [mode]
+
+Initialize handoff storage. If no mode is provided, prompts for selection.
+
+**Modes:**
+- `direct` - Store `.handoff/` directly in this project
+- `submodule` - Store `.handoff/` as a Git submodule (requires private repo URL)
+
+**Execution:**
+1. Create `.handoff/` directory
+2. Create `.handoff.config.json` with storage configuration
+3. For submodule mode: `git submodule add <url> .handoff`
+4. Prompt about `.gitignore` for direct mode
+
+### /handoff storage
+
+Display current storage mode and configuration.
+
+Output:
+```
+Handoff storage:
+  mode: submodule
+  path: .handoff
+  remote: git@github.com:USER/PROJECT-handoff.git
+```
 
 ### /handoff save [mode]
 
@@ -29,13 +81,19 @@ Save current work context to `.handoff/`.
 - `full` - Maximum context with all details
 - `diff` - Focus on code changes
 
+**Pre-checks:**
+1. Read `.handoff.config.json` to determine storage mode
+2. If not configured, trigger initialization flow
+3. For submodule mode: verify submodule is initialized
+
 **Execution:**
 1. Run `git status`, `git diff --stat`, `git log --oneline -5`
-2. Analyze current work state
+2. Analyze current work state (TODO/FIXME, commit history, risk factors)
 3. Generate `.handoff/HANDOFF.md` (human-readable)
 4. Generate `.handoff/context.json` (machine-readable)
 5. Generate `.handoff/tasks.md` (pending work)
 6. Generate `.handoff/decisions.md` (architecture decisions)
+7. For submodule mode: commit and push to submodule repo
 
 ### /handoff load [mode]
 
@@ -45,6 +103,10 @@ Read and restore context from `.handoff/`.
 - (default) - Standard read and summarize
 - `auto` - Auto-infer next steps
 - `merge` - Merge with current context
+
+**Pre-checks:**
+1. Read `.handoff.config.json` to determine storage mode
+2. For submodule mode: verify submodule is initialized, run `git submodule update --init --recursive .handoff` if needed
 
 **Execution:**
 1. Read `.handoff/` contents
@@ -70,12 +132,41 @@ Potential risks:
 ## Security
 
 All saves automatically filter:
-- API keys, tokens, secrets
-- Bearer tokens, cookies
-- Passwords, private keys
-- .env contents
+- API keys, tokens, secrets (generic, GitHub, GitLab, AWS)
+- Bearer tokens, JWT tokens, cookies
+- Passwords, private keys (PEM, SSH)
+- Connection strings with credentials
+- Cloud service credentials (GCP, Azure)
+- OAuth tokens, OpenAI API keys
 
-Nothing sensitive is written to `.handoff/`.
+Nothing sensitive is written to `.handoff/`, regardless of storage mode.
+
+## Configuration File
+
+`.handoff.config.json` is stored in the project root.
+
+**direct mode:**
+```json
+{
+  "version": "1.1.0",
+  "storage": {
+    "mode": "direct",
+    "path": ".handoff"
+  }
+}
+```
+
+**submodule mode:**
+```json
+{
+  "version": "1.1.0",
+  "storage": {
+    "mode": "submodule",
+    "path": ".handoff",
+    "remote": "git@github.com:USER/PROJECT-handoff.git"
+  }
+}
+```
 
 ## Directory Structure
 

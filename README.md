@@ -16,16 +16,79 @@ It manages a `.handoff/` directory - the **Agent Context Protocol** equivalent o
 - **Standard**: Unix-style commands, machine-readable formats (JSON Schema)
 - **Secure**: Automatic sensitive data filtering (API keys, tokens, passwords, JWT, cloud credentials)
 - **Smart**: Auto-analyzes codebase for TODO/FIXME, infers goals from git history
+- **Flexible Storage**: Direct mode for private repos, submodule mode for public repos
 - **Simple**: Works via prompt alone, scripts optional (Deno + Node.js)
 
 ## Quick Start
 
 ```bash
+# Initialize storage (first time only)
+/handoff init direct       # for private repos
+/handoff init submodule    # for public repos
+
 # Save current work context
 /handoff save
 
 # Load context and continue
 /handoff load
+```
+
+## Storage Modes
+
+Handoff Protocol supports two storage modes for `.handoff/`:
+
+### direct
+
+Stores `.handoff/` directly in the current project directory.
+
+**Best for:**
+- Private repositories
+- Local-only projects
+- Personal projects
+- Teams that intentionally version handoff context with the codebase
+
+**Config (`.handoff.config.json`):**
+```json
+{
+  "version": "1.1.0",
+  "storage": {
+    "mode": "direct",
+    "path": ".handoff"
+  }
+}
+```
+
+### submodule
+
+Stores `.handoff/` as a Git submodule pointing to a separate private repository.
+
+**Best for:**
+- Public repositories
+- Open-source projects
+- Projects where handoff context should remain private
+- Teams that want to separate source code history from agent context history
+
+**Why submodule for public repos?**
+
+In public repositories, `.handoff/` may contain:
+- Private context and implementation notes
+- Local paths and environment details
+- Task history and unfinished plans
+- Architecture reasoning and design decisions
+- Sensitive operational details
+
+Submodule mode keeps this data in a separate private repository while maintaining a clean reference in the public project.
+
+**Config (`.handoff.config.json`):**
+```json
+{
+  "version": "1.1.0",
+  "storage": {
+    "mode": "submodule",
+    "path": ".handoff",
+    "remote": "git@github.com:USER/PROJECT-handoff.git"
+  }
+}
 ```
 
 ## Installation
@@ -50,37 +113,52 @@ See [Agent Skills Specification](https://agentskills.io/specification) for insta
 
 | Command | Description |
 |---------|-------------|
+| `/handoff init` | Interactive storage mode selection |
+| `/handoff init direct` | Initialize direct storage mode |
+| `/handoff init submodule` | Initialize submodule storage mode |
+| `/handoff storage` | Display current storage configuration |
 | `/handoff save` | Save current context (standard mode) |
-| `/handoff save compact` | Save minimal summary (goal + status + next steps) |
-| `/handoff save full` | Save maximum context (20 commits, 50 TODOs, risk analysis) |
+| `/handoff save compact` | Save minimal summary |
+| `/handoff save full` | Save maximum context |
 | `/handoff save diff` | Save with focus on code changes |
 | `/handoff load` | Load and summarize |
-| `/handoff load auto` | Load with auto-inference (detailed action plan) |
+| `/handoff load auto` | Load with auto-inference |
 | `/handoff load merge` | Load and merge with current git state |
 
 ## How It Works
+
+### First Time Setup
+
+```bash
+# Choose storage mode
+/handoff init
+
+# Or specify directly
+/handoff init direct
+/handoff init submodule   # will prompt for private repo URL
+```
 
 ### Save
 
 When you run `/handoff save`, the skill:
 
-1. Collects git state (status, diff, log)
-2. **Scans codebase for TODO/FIXME comments**
-3. **Infers current goal from recent commits**
-4. **Analyzes risk factors** (high-priority items, untracked files)
-5. Generates `.handoff/HANDOFF.md` (human-readable)
-6. Generates `.handoff/context.json` (machine-readable)
-7. Generates `.handoff/tasks.md` (pending work)
-8. Generates `.handoff/decisions.md` (architecture decisions)
+1. Reads `.handoff.config.json` for storage mode
+2. For submodule: ensures submodule is initialized
+3. Collects git state (status, diff, log)
+4. Scans codebase for TODO/FIXME comments
+5. Infers current goal from recent commits
+6. Generates `.handoff/` files
+7. For submodule: commits and pushes to submodule repo
 
 ### Load
 
 When you run `/handoff load`, the skill:
 
-1. Reads `.handoff/` contents (falls back to HANDOFF.md if context.json missing)
-2. Parses and summarizes current state
-3. Sanitizes output (security filtering)
-4. Generates recommended next actions
+1. Reads storage configuration
+2. For submodule: initializes submodule if needed
+3. Reads `.handoff/` contents (falls back to HANDOFF.md if context.json missing)
+4. Sanitizes output (security filtering)
+5. Generates recommended next actions
 
 ## Scripts
 
@@ -99,6 +177,8 @@ node scripts/node/load.mjs
 ## Output Format
 
 ```
+Storage: direct
+
 Current understanding:
 Project: my-api | Status: in-progress - 3 file(s) modified | Goal: feat: add rate limiting
 
@@ -114,25 +194,18 @@ Potential risks:
 
 See [examples/](examples/) for full sample outputs.
 
-## Auto-Analysis
-
-The save script automatically:
-
-- **Extracts TODO/FIXME** from source files (with file:line references)
-- **Infers current goal** from recent git commits
-- **Determines status** from git working state
-- **Identifies risks** (high-priority items, untracked files, stale handoffs)
-- **Filters sensitive data** (API keys, tokens, JWT, AWS keys, connection strings)
-
 ## Security
 
 All outputs are automatically filtered for:
 - API keys and tokens (generic, GitHub `ghp_*`, GitLab `glpat-*`)
 - AWS access keys (`AKIA*`)
 - Bearer tokens and JWT tokens
-- Passwords and private keys (PEM format)
+- Passwords and private keys (PEM, SSH)
 - Connection strings with credentials
-- Cookie headers
+- Cloud service credentials (GCP, Azure, OpenAI)
+- OAuth tokens
+
+**Security filtering applies regardless of storage mode.** Submodule mode reduces public exposure risk but does not permit saving secrets.
 
 ## Multi-Agent Collaboration
 
