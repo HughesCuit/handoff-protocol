@@ -1,0 +1,25 @@
+{
+  "name": "handoff-protocol",
+  "version": "1.0.0",
+  "description": "Cross-agent context handoff protocol for AI coding agents",
+  "keywords": [
+    "ai",
+    "agent",
+    "handoff",
+    "context",
+    "protocol",
+    "opencode",
+    "claude",
+    "codex"
+  ],
+  "author": "Handoff Protocol Contributors",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/handoff-protocol/handoff-protocol.git"
+  },
+  "bugs": {
+    "url": "https://github.com/handoff-protocol/handoff-protocol/issues"
+  },
+  "homepage": "https://github.com/handoff-protocol/handoff-protocol#readme"
+}

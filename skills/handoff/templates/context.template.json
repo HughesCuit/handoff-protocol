@@ -1,0 +1,128 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Handoff Context",
+  "description": "Machine-readable work context for cross-agent handoff",
+  "type": "object",
+  "required": ["project", "current_goal", "status", "timestamp"],
+  "properties": {
+    "version": {
+      "type": "string",
+      "default": "1.0.0"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp of save"
+    },
+    "agent": {
+      "type": "string",
+      "description": "Agent that created this handoff"
+    },
+    "project": {
+      "type": "string",
+      "description": "Project name or identifier"
+    },
+    "current_goal": {
+      "type": "string",
+      "description": "Primary objective"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["in-progress", "blocked", "completed", "paused"],
+      "description": "Current work status"
+    },
+    "completed": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "List of completed tasks"
+    },
+    "modified_files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "description": { "type": "string" },
+          "change_type": {
+            "type": "string",
+            "enum": ["added", "modified", "deleted", "renamed"]
+          }
+        },
+        "required": ["path"]
+      },
+      "description": "Files modified during work"
+    },
+    "todos": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "task": { "type": "string" },
+          "priority": {
+            "type": "string",
+            "enum": ["high", "medium", "low"]
+          },
+          "status": {
+            "type": "string",
+            "enum": ["pending", "in-progress"]
+          }
+        },
+        "required": ["task"]
+      },
+      "description": "Pending tasks"
+    },
+    "blockers": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Current blockers or issues"
+    },
+    "decisions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "title": { "type": "string" },
+          "context": { "type": "string" },
+          "decision": { "type": "string" },
+          "rationale": { "type": "string" }
+        },
+        "required": ["title", "decision"]
+      },
+      "description": "Architecture decisions made"
+    },
+    "next_steps": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Recommended next actions"
+    },
+    "git": {
+      "type": "object",
+      "properties": {
+        "branch": { "type": "string" },
+        "latest_commit": { "type": "string" },
+        "commit_message": { "type": "string" },
+        "remote_url": { "type": "string" },
+        "is_dirty": { "type": "boolean" }
+      },
+      "description": "Git repository state"
+    },
+    "environment": {
+      "type": "object",
+      "properties": {
+        "language": { "type": "string" },
+        "framework": { "type": "string" },
+        "runtime": { "type": "string" }
+      },
+      "description": "Project environment info"
+    },
+    "risks": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Known risks or concerns"
+    },
+    "notes": {
+      "type": "string",
+      "description": "Additional notes"
+    }
+  }
+}
