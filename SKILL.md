@@ -17,25 +17,6 @@ The Handoff Protocol provides a standardized way to save, restore, and share wor
 
 When invoked, the skill manages a `.handoff/` directory that serves as the Agent Context Protocol - similar to `.git/` for version control, but for AI agent collaboration.
 
-## Installation
-
-### Codex
-
-```bash
-python3 ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github.py \
-  --repo HughesCuit/handoff-protocol --path . --name handoff-protocol
-```
-
-### Claude Code / OpenCode
-
-```bash
-git clone https://github.com/HughesCuit/handoff-protocol.git ~/.claude/skills/handoff-protocol
-```
-
-### Other Agents
-
-Clone to the agent's skill directory. See [README.md](README.md) for details.
-
 ## Storage Modes
 
 Handoff Protocol supports two storage modes for `.handoff/`:
