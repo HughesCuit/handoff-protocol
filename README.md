@@ -96,9 +96,7 @@ Submodule mode keeps this data in a separate private repository while maintainin
 
 ## Installation
 
-### For Codex / MimoCode (Recommended)
-
-Codex and MimoCode share the same skills directory (`~/.codex/skills/`).
+### For Codex
 
 ```bash
 # One-click install (run from the repo, or download and run)
@@ -113,6 +111,19 @@ python3 ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-githu
 ```
 
 > **Note:** The Codex skill-installer expects a GitHub tree URL (e.g., `https://github.com/owner/repo/tree/main`), not a release URL. Use the command above or provide the repo root URL.
+
+### For MimoCode
+
+MimoCode reads skills from `~/.config/mimocode/skills/`. You can also read from the Codex skills directory.
+
+```bash
+# Install to MimoCode's own skills directory
+git clone https://github.com/HughesCuit/handoff-protocol.git ~/.config/mimocode/skills/handoff
+
+# Or install to Codex directory (also readable by MimoCode)
+python3 ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github.py \
+  --repo HughesCuit/handoff-protocol --path . --name handoff
+```
 
 ### For OpenCode
 
