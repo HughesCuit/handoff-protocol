@@ -107,7 +107,7 @@ Or install directly via Codex's skill-installer:
 
 ```bash
 python3 ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github.py \
-  --repo HughesCuit/handoff-protocol --path .
+  --repo HughesCuit/handoff-protocol --path . --name handoff-protocol
 ```
 
 > **Note:** The Codex skill-installer expects a GitHub tree URL (e.g., `https://github.com/owner/repo/tree/main`), not a release URL. Use the command above or provide the repo root URL.

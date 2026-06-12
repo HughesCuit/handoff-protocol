@@ -23,7 +23,7 @@ When invoked, the skill manages a `.handoff/` directory that serves as the Agent
 
 ```bash
 python3 ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github.py \
-  --repo HughesCuit/handoff-protocol --path .
+  --repo HughesCuit/handoff-protocol --path . --name handoff-protocol
 ```
 
 ### Claude Code / OpenCode
