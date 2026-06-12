@@ -96,6 +96,22 @@ Submodule mode keeps this data in a separate private repository while maintainin
 
 ## Installation
 
+### For Codex (Recommended)
+
+```bash
+# One-click install (run from the repo, or download and run)
+bash install-codex.sh
+```
+
+Or install directly via Codex's skill-installer:
+
+```bash
+python3 ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github.py \
+  --repo HughesCuit/handoff-protocol --path .
+```
+
+> **Note:** The Codex skill-installer expects a GitHub tree URL (e.g., `https://github.com/owner/repo/tree/main`), not a release URL. Use the command above or provide the repo root URL.
+
 ### For OpenCode
 
 ```bash
@@ -108,9 +124,16 @@ git clone https://github.com/HughesCuit/handoff-protocol.git ~/.opencode/skills/
 git clone https://github.com/HughesCuit/handoff-protocol.git ~/.claude/skills/handoff-protocol
 ```
 
-### For Other Agents
+### For Other Agents (Hermes, Cursor, OpenHands, etc.)
 
-See [Agent Skills Specification](https://agentskills.io/specification) for installation paths.
+Clone the repo to the agent's skill directory:
+
+```bash
+# Generic: clone to any agent's skills directory
+git clone https://github.com/HughesCuit/handoff-protocol.git <agent-skills-dir>/handoff-protocol
+```
+
+See [Agent Skills Specification](https://agentskills.io/specification) for agent-specific paths.
 
 ## Commands
 
