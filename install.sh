@@ -6,7 +6,6 @@
 #   .opencode/skills/handoff -> (repo root)
 #   .claude/skills/handoff   -> (repo root)
 #   .mimocode/skills/handoff -> (repo root)
-#   .agents/skills/handoff   -> (repo root)  (Codex project convention)
 #
 # Run this from inside your target project, or pass --project.
 set -euo pipefail
@@ -61,9 +60,6 @@ install_link ".claude" "Claude Code"
 
 # MimoCode (project-local convention)
 install_link ".mimocode" "MimoCode"
-
-# Codex / generic agents (.agents/)
-install_link ".agents" "Codex/generic"
 
 echo ""
 if [ "$installed" -gt 0 ]; then

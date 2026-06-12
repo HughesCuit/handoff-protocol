@@ -113,7 +113,6 @@ your-project/
   .opencode/skills/handoff -> handoff-protocol/   (OpenCode)
   .claude/skills/handoff   -> handoff-protocol/   (Claude Code)
   .mimocode/skills/handoff -> handoff-protocol/   (MimoCode)
-  .agents/skills/handoff   -> handoff-protocol/   (Codex/generic)
 ```
 
 To uninstall: `bash handoff-protocol/uninstall.sh`

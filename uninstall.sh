@@ -32,7 +32,6 @@ remove_link() {
 remove_link ".opencode"
 remove_link ".claude"
 remove_link ".mimocode"
-remove_link ".agents"
 
 if [ "$removed" -gt 0 ]; then
   echo ""
