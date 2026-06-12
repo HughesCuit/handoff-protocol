@@ -13,7 +13,7 @@ if [ ! -f "$INSTALLER" ]; then
 fi
 
 echo "Installing handoff-protocol skill for Codex..."
-python3 "$INSTALLER" --repo HughesCuit/handoff-protocol --path . --name handoff-protocol
+python3 "$INSTALLER" --repo HughesCuit/handoff-protocol --path . --name handoff
 
 echo ""
 echo "Done! Restart Codex to pick up the new skill."
