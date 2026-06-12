@@ -96,7 +96,9 @@ Submodule mode keeps this data in a separate private repository while maintainin
 
 ## Installation
 
-### For Codex (Recommended)
+### For Codex / MimoCode (Recommended)
+
+Codex and MimoCode share the same skills directory (`~/.codex/skills/`).
 
 ```bash
 # One-click install (run from the repo, or download and run)
