@@ -29,6 +29,9 @@ It manages a `.handoff/` directory - the **Agent Context Protocol** equivalent o
 # Save current work context
 /handoff save
 
+# Save in specific language with verbosity
+/handoff save --lang zh --verbosity high
+
 # Load context and continue
 /handoff load
 ```
@@ -50,7 +53,7 @@ Stores `.handoff/` directly in the current project directory.
 **Config (`.handoff.config.json`):**
 ```json
 {
-  "version": "1.1.0",
+  "version": "1.2.0",
   "storage": {
     "mode": "direct",
     "path": ".handoff"
@@ -82,7 +85,7 @@ Submodule mode keeps this data in a separate private repository while maintainin
 **Config (`.handoff.config.json`):**
 ```json
 {
-  "version": "1.1.0",
+  "version": "1.2.0",
   "storage": {
     "mode": "submodule",
     "path": ".handoff",
@@ -121,6 +124,8 @@ See [Agent Skills Specification](https://agentskills.io/specification) for insta
 | `/handoff save compact` | Save minimal summary |
 | `/handoff save full` | Save maximum context |
 | `/handoff save diff` | Save with focus on code changes |
+| `/handoff save --lang CODE` | Save with specific language (zh, en, ja, etc.) |
+| `/handoff save --verbosity LEVEL` | Save with detail level (low, med, high) |
 | `/handoff load` | Load and summarize |
 | `/handoff load auto` | Load with auto-inference |
 | `/handoff load merge` | Load and merge with current git state |
@@ -149,6 +154,21 @@ When you run `/handoff save`, the skill:
 5. Infers current goal from recent commits
 6. Generates `.handoff/` files
 7. For submodule: commits and pushes to submodule repo
+
+### Language & Verbosity
+
+The save command supports two additional options:
+
+- **`--lang CODE`**: Controls the language of generated content (e.g., `zh` for Chinese, `en` for English). When omitted, follows the conversation language automatically.
+- **`--verbosity LEVEL`**: Controls detail level — `low` (minimal), `med` (standard, default), `high` (maximum detail with extended analysis).
+
+```bash
+# Chinese output with minimal detail
+/handoff save --lang zh --verbosity low
+
+# English output with maximum detail
+/handoff save full --lang en --verbosity high
+```
 
 ### Load
 

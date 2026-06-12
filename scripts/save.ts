@@ -14,6 +14,10 @@
  *   full      - Maximum context (extended history, full diff stats)
  *   diff      - Focus on code changes
  *
+ * Additional flags:
+ *   --lang <code>        Language for output (e.g. en, zh, ja). Default: auto-detect
+ *   --verbosity <level>  Detail level: low, med, high. Overrides mode defaults
+ *
  * Storage modes (configured via .handoff.config.json):
  *   direct    - .handoff/ as local directory
  *   submodule - .handoff/ as git submodule
@@ -65,6 +69,8 @@ interface HandoffContext {
   };
   risks: string[];
   notes: string;
+  lang?: string;
+  verbosity?: string;
 }
 
 interface StorageConfig {
@@ -650,9 +656,32 @@ interface ModeConfig {
   includeDiffStat: boolean;
   includeRiskAnalysis: boolean;
   includeTodoScan: boolean;
+  includeExtendedAnalysis: boolean;
 }
 
-function getModeConfig(mode: string): ModeConfig {
+function getModeConfig(mode: string, verbosity?: string): ModeConfig {
+  // --verbosity overrides mode defaults
+  if (verbosity === "low") {
+    return {
+      commitCount: 3,
+      maxTodos: 5,
+      includeDiffStat: false,
+      includeRiskAnalysis: false,
+      includeTodoScan: false,
+      includeExtendedAnalysis: false,
+    };
+  }
+  if (verbosity === "high") {
+    return {
+      commitCount: 20,
+      maxTodos: 50,
+      includeDiffStat: true,
+      includeRiskAnalysis: true,
+      includeTodoScan: true,
+      includeExtendedAnalysis: true,
+    };
+  }
+  // verbosity === "med" or undefined: use mode defaults
   switch (mode) {
     case "compact":
       return {
@@ -661,6 +690,7 @@ function getModeConfig(mode: string): ModeConfig {
         includeDiffStat: false,
         includeRiskAnalysis: false,
         includeTodoScan: false,
+        includeExtendedAnalysis: false,
       };
     case "full":
       return {
@@ -669,6 +699,7 @@ function getModeConfig(mode: string): ModeConfig {
         includeDiffStat: true,
         includeRiskAnalysis: true,
         includeTodoScan: true,
+        includeExtendedAnalysis: true,
       };
     case "diff":
       return {
@@ -677,6 +708,7 @@ function getModeConfig(mode: string): ModeConfig {
         includeDiffStat: true,
         includeRiskAnalysis: false,
         includeTodoScan: false,
+        includeExtendedAnalysis: false,
       };
     default: // standard
       return {
@@ -685,16 +717,17 @@ function getModeConfig(mode: string): ModeConfig {
         includeDiffStat: true,
         includeRiskAnalysis: true,
         includeTodoScan: true,
+        includeExtendedAnalysis: false,
       };
   }
 }
 
 // ── Main Save Logic ──────────────────────────────────────────────────────────
 
-async function save(mode: string): Promise<void> {
+async function save(mode: string, lang?: string, verbosity?: string): Promise<void> {
   const cwd = Deno.cwd();
   const handoffDir = join(cwd, ".handoff");
-  const config = getModeConfig(mode);
+  const config = getModeConfig(mode, verbosity);
 
   // Check git availability
   const gitAvailable = (await run(["git", "--version"])).length > 0;
@@ -749,7 +782,7 @@ async function save(mode: string): Promise<void> {
   }
 
   const ctx: HandoffContext = {
-    version: "1.1.0",
+    version: "1.2.0",
     timestamp: new Date().toISOString(),
     agent: Deno.env.get("AGENT_NAME") || "opencode",
     project: name,
@@ -764,19 +797,31 @@ async function save(mode: string): Promise<void> {
     git,
     risks,
     notes,
+    lang,
+    verbosity,
   };
 
   const handoffMd = generateHandoffMarkdown(ctx);
-  const tasksMd = generateTasksMarkdown(ctx);
-  const decisionsMd = generateDecisionsMarkdown(ctx);
   const contextJson = JSON.stringify(ctx, null, 2);
 
-  await Promise.all([
+  const writeOps: Promise<void>[] = [
     Deno.writeTextFile(join(handoffDir, "HANDOFF.md"), filterSensitive(handoffMd)),
     Deno.writeTextFile(join(handoffDir, "context.json"), filterSensitive(contextJson)),
-    Deno.writeTextFile(join(handoffDir, "tasks.md"), filterSensitive(tasksMd)),
-    Deno.writeTextFile(join(handoffDir, "decisions.md"), filterSensitive(decisionsMd)),
-  ]);
+  ];
+
+  let fileSummary = "HANDOFF.md, context.json";
+
+  if (verbosity !== "low") {
+    const tasksMd = generateTasksMarkdown(ctx);
+    const decisionsMd = generateDecisionsMarkdown(ctx);
+    writeOps.push(
+      Deno.writeTextFile(join(handoffDir, "tasks.md"), filterSensitive(tasksMd)),
+      Deno.writeTextFile(join(handoffDir, "decisions.md"), filterSensitive(decisionsMd)),
+    );
+    fileSummary += ", tasks.md, decisions.md";
+  }
+
+  await Promise.all(writeOps);
 
   // Post-save actions based on storage mode
   if (storageMode === "submodule") {
@@ -795,9 +840,11 @@ async function save(mode: string): Promise<void> {
   console.log(`Handoff saved to ${handoffDir}`);
   console.log(`Storage: ${storageMode}`);
   console.log(`Mode: ${mode}`);
+  console.log(`Lang: ${lang || "(auto-detect)"}`);
+  console.log(`Verbosity: ${verbosity || "med (default)"}`);
   console.log(`Project: ${name} (${language})`);
   console.log(`Goal: ${inferredGoal || "(inferred from commits)"}`);
-  console.log(`Files: HANDOFF.md, context.json, tasks.md, decisions.md`);
+  console.log(`Files: ${fileSummary}`);
   if (todos.length > 0) {
     console.log(`Scanned: ${todos.length} TODO/FIXME items found`);
   }
@@ -809,6 +856,9 @@ async function main() {
   const args = parse(Deno.args, {
     default: { _: ["save"] },
   });
+
+  const lang = args.lang as string | undefined;
+  const verbosity = args.verbosity as string | undefined;
 
   const subcommand = args._[0]?.toString() || "save";
 
@@ -848,7 +898,7 @@ async function main() {
   }
 
   try {
-    await save(mode);
+    await save(mode, lang, verbosity);
   } catch (err) {
     console.error(`Error during save: ${err instanceof Error ? err.message : err}`);
     Deno.exit(1);

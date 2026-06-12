@@ -1,6 +1,6 @@
 {
   "name": "handoff-protocol",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "Cross-agent context handoff protocol for AI coding agents",
   "keywords": [
     "ai",

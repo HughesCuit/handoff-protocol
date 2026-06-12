@@ -4,7 +4,7 @@ description: Cross-agent context handoff protocol. Save and restore work context
 license: MIT
 metadata:
   author: handoff-protocol
-  version: "1.1.0"
+  version: "1.2.0"
 ---
 
 # Handoff Protocol Skill
@@ -71,7 +71,7 @@ Handoff storage:
   remote: git@github.com:USER/PROJECT-handoff.git
 ```
 
-### /handoff save [mode]
+### /handoff save [mode] [--lang CODE] [--verbosity LEVEL]
 
 Save current work context to `.handoff/`.
 
@@ -80,6 +80,13 @@ Save current work context to `.handoff/`.
 - `compact` - Minimal summary only
 - `full` - Maximum context with all details
 - `diff` - Focus on code changes
+
+**Options:**
+- `--lang CODE` - Language for generated handoff content (e.g. `zh`, `en`, `ja`, `ko`). If omitted, follows the language used in the current conversation session.
+- `--verbosity LEVEL` - Detail level: `low`, `med`, `high`. Default: `med`.
+  - `low` - Minimal output: goal, status, next steps only (similar to compact but respects lang)
+  - `med` - Standard output: balanced detail with TODO scan, risk analysis
+  - `high` - Maximum output: extended git history, full diff stats, all TODOs, detailed risk assessment
 
 **Pre-checks:**
 1. Read `.handoff.config.json` to determine storage mode
@@ -148,7 +155,7 @@ Nothing sensitive is written to `.handoff/`, regardless of storage mode.
 **direct mode:**
 ```json
 {
-  "version": "1.1.0",
+  "version": "1.2.0",
   "storage": {
     "mode": "direct",
     "path": ".handoff"
@@ -159,7 +166,7 @@ Nothing sensitive is written to `.handoff/`, regardless of storage mode.
 **submodule mode:**
 ```json
 {
-  "version": "1.1.0",
+  "version": "1.2.0",
   "storage": {
     "mode": "submodule",
     "path": ".handoff",

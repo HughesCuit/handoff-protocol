@@ -123,6 +123,16 @@
     "notes": {
       "type": "string",
       "description": "Additional notes"
+    },
+    "lang": {
+      "type": "string",
+      "description": "Language code used for human-readable content (e.g. zh, en, ja)"
+    },
+    "verbosity": {
+      "type": "string",
+      "enum": ["low", "med", "high"],
+      "default": "med",
+      "description": "Detail level of the handoff content"
     }
   }
 }
