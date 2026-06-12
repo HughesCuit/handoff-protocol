@@ -96,58 +96,47 @@ Submodule mode keeps this data in a separate private repository while maintainin
 
 ## Installation
 
-### For Codex
+### Project-Level Install (Recommended)
+
+Clone the repo into your project, then run the install script. It creates symlinks so all supported agents share the same skill — no per-agent duplication.
 
 ```bash
-# One-click install (run from the repo, or download and run)
-bash install-codex.sh
+# From your project root:
+git clone https://github.com/HughesCuit/handoff-protocol.git
+bash handoff-protocol/install.sh
 ```
 
-Or install directly via Codex's skill-installer:
+This creates symlinks in your project directory:
+
+```
+your-project/
+  .opencode/skills/handoff -> handoff-protocol/   (OpenCode)
+  .claude/skills/handoff   -> handoff-protocol/   (Claude Code)
+  .mimocode/skills/handoff -> handoff-protocol/   (MimoCode)
+  .agents/skills/handoff   -> handoff-protocol/   (Codex/generic)
+```
+
+To uninstall: `bash handoff-protocol/uninstall.sh`
+
+> **Tip:** Add `handoff-protocol/` as a git submodule if you want to pin a specific version across your team.
+
+### Global Install (All Projects)
+
+If you prefer a one-time global install instead of per-project:
+
+#### Codex
 
 ```bash
 python3 ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github.py \
   --repo HughesCuit/handoff-protocol --path . --name handoff
 ```
 
-> **Note:** The Codex skill-installer expects a GitHub tree URL (e.g., `https://github.com/owner/repo/tree/main`), not a release URL. Use the command above or provide the repo root URL.
-
-### For MimoCode
-
-MimoCode reads skills from `~/.config/mimocode/skills/`. You can also read from the Codex skills directory.
+#### OpenCode / Claude Code
 
 ```bash
-# Install to MimoCode's own skills directory
-git clone https://github.com/HughesCuit/handoff-protocol.git ~/.config/mimocode/skills/handoff
-
-# Or install to Codex directory (also readable by MimoCode)
-python3 ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github.py \
-  --repo HughesCuit/handoff-protocol --path . --name handoff
+git clone https://github.com/HughesCuit/handoff-protocol.git ~/.opencode/skills/handoff
+git clone https://github.com/HughesCuit/handoff-protocol.git ~/.claude/skills/handoff
 ```
-
-### For OpenCode
-
-```bash
-git clone https://github.com/HughesCuit/handoff-protocol.git ~/.opencode/skills/handoff-protocol
-```
-
-### For Claude Code
-
-```bash
-git clone https://github.com/HughesCuit/handoff-protocol.git ~/.claude/skills/handoff-protocol
-```
-
-### For Other Agents (Hermes, Cursor, OpenHands, etc.)
-
-Clone the repo to the agent's skill directory:
-
-```bash
-# Generic: clone to any agent's skills directory
-git clone https://github.com/HughesCuit/handoff-protocol.git <agent-skills-dir>/handoff-protocol
-```
-
-See [Agent Skills Specification](https://agentskills.io/specification) for agent-specific paths.
-
 ## Commands
 
 | Command | Description |
