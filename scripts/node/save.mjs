@@ -25,7 +25,7 @@
  */
 
 import { execSync } from "node:child_process";
-import { mkdirSync, writeFileSync, readFileSync, readdirSync, statSync, existsSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, statSync, existsSync, renameSync, rmSync } from "node:fs";
 import { join, extname, relative } from "node:path";
 import { createInterface } from "node:readline";
 import {
@@ -49,7 +49,8 @@ import {
   SCAN_EXCLUDED_DIRS,
   SOURCE_EXTENSIONS,
 } from "../source-comments.mjs";
-import { validateProjectConfig } from "../config.mjs";
+import { CONFIG_FILENAME, validateProjectConfig } from "../config.mjs";
+import { applyMigration, planMigration } from "../migrate.mjs";
 
 // ── Security ─────────────────────────────────────────────────────────────────
 // SENSITIVE_PATTERNS and filterSensitive live in ./context-map.mjs (shared with
@@ -317,6 +318,55 @@ function readProjectInfo() {
   return { name: "unknown", language: "unknown" };
 }
 
+// ── Legacy migration ─────────────────────────────────────────────────────────
+
+// Filesystem adapter for the shared, runtime-agnostic migration core.
+const migrationIo = {
+  readFile: async (p) => readFileSync(p, "utf-8"),
+  writeFile: async (p, content) => writeFileSync(p, content),
+  rename: async (from, to) => renameSync(from, to),
+  mkdir: async (p) => mkdirSync(p, { recursive: true }),
+  exists: async (p) => existsSync(p),
+  remove: async (p) => rmSync(p, { force: true }),
+};
+
+/**
+ * Migrate a legacy (pre-v2) handoff into the canonical model before the save
+ * proceeds. The migration is atomic: originals are backed up under
+ * .handoff/history/migrations/<UTC-timestamp>/ and only replaced after every
+ * temporary output validates. Migrated nodes enter the map as user-owned
+ * content, so they always win over this save's fresh inference. Returns the
+ * migration diagnostics (recorded in context.json), or null when the handoff
+ * is already v2.
+ */
+async function migrateLegacyHandoff(cwd, handoffDir) {
+  const readIfExists = (p) => {
+    try {
+      return readFileSync(p, "utf-8");
+    } catch {
+      return undefined;
+    }
+  };
+  const plan = planMigration({
+    config: readIfExists(join(cwd, CONFIG_FILENAME)),
+    contextJson: readIfExists(join(handoffDir, "context.json")),
+    handoffMd: readIfExists(join(handoffDir, "HANDOFF.md")),
+    tasksMd: readIfExists(join(handoffDir, "tasks.md")),
+    decisionsMd: readIfExists(join(handoffDir, "decisions.md")),
+    contextMapMd: readIfExists(join(handoffDir, MAP_FILENAME)),
+  });
+  if (!plan.needed) return null;
+
+  const result = await applyMigration(plan, { handoffDir, configPath: join(cwd, CONFIG_FILENAME) }, migrationIo);
+  console.log(`Legacy handoff detected — migrated to Handoff Protocol v${PROTOCOL_VERSION}.`);
+  console.log(`Backup: ${result.backupDir}`);
+  for (const entry of plan.diagnostics.migration) console.log(`  - ${entry}`);
+  if (plan.diagnostics.conflicts.length > 0) {
+    console.log(`  - ${plan.diagnostics.conflicts.length} conflict(s) preserved under Open Questions > Migration conflict`);
+  }
+  return plan.diagnostics;
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 async function save(mode, lang, verbosity) {
@@ -338,6 +388,10 @@ async function save(mode, lang, verbosity) {
   } else {
     mkdirSync(handoffDir, { recursive: true });
   }
+
+  // Legacy (pre-v2) handoffs migrate atomically into the canonical model
+  // before inference reconciles into the map below.
+  const migrationDiagnostics = await migrateLegacyHandoff(cwd, handoffDir);
 
   const { name, language } = readProjectInfo();
   const gitBranch = runCommand("git branch --show-current") || "unknown";
@@ -447,7 +501,7 @@ async function save(mode, lang, verbosity) {
       viewHashes[name] = hash;
     }
   }
-  const contextJson = buildContextJson(metadata, viewHashes);
+  const contextJson = buildContextJson(metadata, viewHashes, migrationDiagnostics || undefined);
   writeFileSync(join(handoffDir, "context.json"), filterSensitive(JSON.stringify(contextJson, null, 2)));
 
   if (storageMode === "submodule") {

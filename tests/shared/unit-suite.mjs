@@ -30,6 +30,12 @@ import {
 } from "../../scripts/views.mjs";
 import { extractTodoComments } from "../../scripts/source-comments.mjs";
 import { validateProjectConfig } from "../../scripts/config.mjs";
+import {
+  MIGRATION_CONFLICT_LABEL,
+  applyMigration,
+  isMigrationNeeded,
+  planMigration,
+} from "../../scripts/migrate.mjs";
 
 // ── Minimal assertions (runtime-agnostic) ────────────────────────────────────
 
@@ -53,6 +59,15 @@ export function assertNotIncludes(haystack, needle, msg) {
   if (haystack.includes(needle)) {
     throw new Error(`${msg || "unexpected substring"}: expected output NOT to include ${JSON.stringify(needle)}\n--- output ---\n${haystack}`);
   }
+}
+
+export async function assertRejects(fn, msg) {
+  try {
+    await fn();
+  } catch {
+    return;
+  }
+  throw new Error(msg || "expected the promise to reject, but it resolved");
 }
 
 // ── Suite ────────────────────────────────────────────────────────────────────
@@ -524,5 +539,351 @@ export function defineUnitTests(test, readFixture) {
     // Missing views are regenerated silently; only mismatches warn.
     assertEqual(viewTamperWarnings(stored, { "tasks.md": "tasks" }).length, 0);
     assertEqual(viewTamperWarnings(null, { "HANDOFF.md": "anything" }).length, 0);
+  });
+
+  // ── Legacy migration (v2) ───────────────────────────────────────────────
+
+  async function readHandoffInputs(name) {
+    const read = async (rel) => {
+      try {
+        return await readFixture(`handoffs/${name}/${rel}`);
+      } catch {
+        return undefined;
+      }
+    };
+    return {
+      config: await read(".handoff.config.json"),
+      contextJson: await read(".handoff/context.json"),
+      handoffMd: await read(".handoff/HANDOFF.md"),
+      tasksMd: await read(".handoff/tasks.md"),
+      decisionsMd: await read(".handoff/decisions.md"),
+      contextMapMd: await read(".handoff/context-map.md"),
+    };
+  }
+
+  function makeFakeIo(seed, failOn) {
+    const store = new Map(Object.entries(seed));
+    const ops = [];
+    return {
+      store,
+      ops,
+      readFile: async (p) => {
+        if (!store.has(p)) throw new Error(`ENOENT: ${p}`);
+        return store.get(p);
+      },
+      writeFile: async (p, content) => {
+        ops.push(["write", p]);
+        if (failOn && failOn(p)) throw new Error("injected write failure");
+        store.set(p, content);
+      },
+      rename: async (from, to) => {
+        ops.push(["rename", from, to]);
+        if (!store.has(from)) throw new Error(`ENOENT: ${from}`);
+        store.set(to, store.get(from));
+        store.delete(from);
+      },
+      mkdir: async (p) => {
+        ops.push(["mkdir", p]);
+      },
+      exists: async (p) => store.has(p),
+      remove: async (p) => {
+        ops.push(["remove", p]);
+        store.delete(p);
+      },
+    };
+  }
+
+  const MIGRATE_HANDOFF_DIR = "/proj/.handoff";
+  const MIGRATE_CONFIG_PATH = "/proj/.handoff.config.json";
+
+  function seedFromInputs(inputs) {
+    const seed = {};
+    if (inputs.config != null) seed[MIGRATE_CONFIG_PATH] = inputs.config;
+    if (inputs.contextJson != null) seed[`${MIGRATE_HANDOFF_DIR}/context.json`] = inputs.contextJson;
+    if (inputs.handoffMd != null) seed[`${MIGRATE_HANDOFF_DIR}/HANDOFF.md`] = inputs.handoffMd;
+    if (inputs.tasksMd != null) seed[`${MIGRATE_HANDOFF_DIR}/tasks.md`] = inputs.tasksMd;
+    if (inputs.decisionsMd != null) seed[`${MIGRATE_HANDOFF_DIR}/decisions.md`] = inputs.decisionsMd;
+    if (inputs.contextMapMd != null) seed[`${MIGRATE_HANDOFF_DIR}/context-map.md`] = inputs.contextMapMd;
+    return seed;
+  }
+
+  function conflictChildren(map) {
+    const questions = map.sections.questions;
+    const idx = questions.findIndex((n) => n.text === MIGRATION_CONFLICT_LABEL);
+    if (idx < 0) return null;
+    return questions.slice(idx + 1).filter((n) => n.depth > 0).map((n) => n.text);
+  }
+
+  test("migrate: isMigrationNeeded classifies legacy, mixed, and v2 handoffs", () => {
+    assertEqual(isMigrationNeeded({ mapPresent: false, contextVersion: "1.2.0" }), true, "legacy 1.x");
+    assertEqual(isMigrationNeeded({ mapPresent: true, contextVersion: "1.5.0" }), true, "mixed pre-v2");
+    assertEqual(isMigrationNeeded({ mapPresent: true, configVersion: "1.5.0" }), true, "map-only pre-v2");
+    assertEqual(isMigrationNeeded({ mapPresent: true, contextVersion: "2.0.0" }), false, "already v2");
+    assertEqual(isMigrationNeeded({ mapPresent: true, configVersion: "2.0.0" }), false, "map-only v2");
+    assertEqual(isMigrationNeeded({}), false, "no data means nothing to migrate");
+  });
+
+  test("migrate: legacy-only handoff preserves task state, decision rationale, and risks", async () => {
+    const plan = planMigration(await readHandoffInputs("legacy-1x"));
+    assert(plan.needed, "legacy-1x should need migration");
+
+    assertEqual(plan.map.sections.goal[0].text, "feat: add rate limiting middleware");
+    assertEqual(plan.map.sections.tasks.length, 3, "legacy tasks lost or duplicated");
+    assertEqual(
+      plan.map.sections.tasks[0].text,
+      "**high** Add Redis backend for distributed rate limiting (src/middleware/rate-limiter.ts:45)"
+    );
+    assert(plan.map.sections.tasks.every((n) => !n.checked), "pending task state not preserved");
+
+    const decisions = plan.map.sections.decisions.map((n) => n.text);
+    assertEqual(decisions.length, 1, "decision from decisions.md not migrated");
+    assertIncludes(decisions[0], "Token bucket over leaky bucket");
+    assertIncludes(decisions[0], "Use token bucket");
+    assertIncludes(decisions[0], "Simpler to reason about bursty traffic", "decision rationale lost");
+
+    const risks = plan.map.sections.risks.map((n) => n.text);
+    assert(risks.includes("1 high-priority TODO/FIXME items pending"), "legacy risk lost");
+
+    assertEqual(plan.metadata.project, "my-api");
+    assertEqual(plan.metadata.git.branch, "feature/rate-limiting");
+    assertEqual(plan.metadata.completed.length, 3, "completed work not carried into metadata");
+    for (const f of ["context.json", "HANDOFF.md", "tasks.md", "decisions.md"]) {
+      assert(plan.sourceFiles.includes(f), `sourceFiles missing '${f}'`);
+    }
+    assertEqual(plan.config.version, PROTOCOL_VERSION, "config version not upgraded in plan");
+  });
+
+  test("migrate: map-only handoff keeps map semantics and upgrades structure", async () => {
+    const plan = planMigration(await readHandoffInputs("map-only"));
+    assert(plan.needed, "map-only pre-v2 handoff should need a structural upgrade");
+    assertEqual(plan.map.sections.goal[0].text, "Ship the v1.5 context map release");
+    assertEqual(plan.map.sections.tasks.length, 2);
+    assertEqual(plan.map.sections.tasks[1].checked, true, "completed task state lost");
+    assertEqual(plan.map.sections.questions[0].text, "How should v3 rank branches?");
+    assertEqual(plan.map.sections.excluded[0].text, "No vector database in v3");
+    assertEqual(plan.diagnostics.conflicts.length, 0, "single-source handoff should have no conflicts");
+  });
+
+  test("migrate: map wins over legacy sources; conflicts stay visible with source labels", async () => {
+    const plan = planMigration(await readHandoffInputs("conflicting"));
+    assert(plan.needed, "conflicting pre-v2 handoff should need migration");
+
+    assertEqual(plan.map.sections.goal.length, 1, "singleton goal duplicated");
+    assertEqual(plan.map.sections.goal[0].text, "Ship the map-approved compiler release", "map goal must win");
+    assertEqual(plan.map.sections.status[0].text, "Map status: compiler green", "map status must win");
+
+    // Losing values stay visible below a Migration conflict node, source-labeled.
+    const children = conflictChildren(plan.map);
+    assert(children, "Migration conflict node missing from Open Questions");
+    assertEqual(children.length, 4, `expected 4 conflict children, got: ${JSON.stringify(children)}`);
+    assert(children.includes("goal: JSON draft goal superseded by the map (source: context.json)"));
+    assert(children.includes("goal: HANDOFF view goal superseded by the map (source: HANDOFF.md)"));
+    assert(children.includes("status: json status superseded by the map (source: context.json)"));
+    assert(children.includes("status: handoff view status superseded by the map (source: HANDOFF.md)"));
+    assertEqual(plan.diagnostics.conflicts.length, 4, "conflict diagnostics incomplete");
+
+    // Map questions/exclusions preserved; unique legacy tasks merged without duplication.
+    assert(plan.map.sections.questions.some((n) => n.text === "How should v3 rank branches?"), "map question lost");
+    assertEqual(plan.map.sections.excluded[0].text, "No vector database in v3");
+    const tasks = plan.map.sections.tasks;
+    const shared = tasks.filter((n) => n.text.includes("Wire the context compiler into load"));
+    assertEqual(shared.length, 1, "overlapping task not deduplicated");
+    assertEqual(shared[0].checked, false, "map task state lost to the legacy duplicate");
+    assert(tasks.some((n) => n.text === "**medium** Legacy-only task from context.json"), "unique context.json task lost");
+    assert(tasks.some((n) => n.text === "**medium** Legacy-only task from HANDOFF.md"), "unique HANDOFF.md task lost");
+    const risks = plan.map.sections.risks.map((n) => n.text);
+    assert(risks.includes("JSON-only risk"), "context.json risk lost");
+    assert(risks.includes("HANDOFF-only risk"), "HANDOFF.md risk lost");
+  });
+
+  test("migrate: malformed context.json falls back to human-readable files with a diagnostic", async () => {
+    const plan = planMigration(await readHandoffInputs("malformed"));
+    assert(plan.needed, "malformed handoff should need migration");
+    assert(
+      plan.diagnostics.migration.some((d) => /context\.json/.test(d) && /malformed|invalid|unreadable/i.test(d)),
+      `missing malformed-context.json diagnostic: ${JSON.stringify(plan.diagnostics.migration)}`
+    );
+    assert(!plan.sourceFiles.includes("context.json"), "malformed context.json must not count as a source");
+
+    assertEqual(plan.map.sections.goal[0].text, "fix: repair flaky integration tests");
+    const tasks = plan.map.sections.tasks;
+    assertEqual(tasks.length, 2, `expected 2 tasks, got: ${JSON.stringify(tasks.map((n) => n.text))}`);
+    const stabilize = tasks.find((n) => n.text.includes("Stabilize the flaky checkout test"));
+    const reproduce = tasks.find((n) => n.text.includes("Reproduce the flake locally"));
+    assert(stabilize && !stabilize.checked, "pending task state lost");
+    assert(reproduce && reproduce.checked, "completed task state lost");
+    assert(
+      plan.map.sections.decisions.some((n) => n.text.includes("Real checkout behavior must stay covered")),
+      "decision rationale lost"
+    );
+    assertEqual(plan.metadata.project, "malformed-fixture", "metadata not recovered from HANDOFF.md header");
+  });
+
+  test("migrate: partially missing handoff migrates from HANDOFF.md alone", async () => {
+    const plan = planMigration(await readHandoffInputs("partial"));
+    assert(plan.needed, "partial handoff should need migration");
+    assertEqual(JSON.stringify(plan.sourceFiles), JSON.stringify(["HANDOFF.md"]));
+    assertEqual(plan.map.sections.goal[0].text, "docs: refresh readme");
+    assertEqual(plan.map.sections.tasks.length, 1);
+    assertEqual(plan.map.sections.tasks[0].text, "**low** Proofread the new readme section");
+    assertEqual(plan.map.sections.tasks[0].checked, false);
+    assertEqual(plan.metadata.project, "partial-fixture");
+    assertEqual(plan.metadata.agent, "claude-code");
+  });
+
+  test("migrate: already-migrated v2 handoff needs no migration", async () => {
+    const plan = planMigration(await readHandoffInputs("migrated"));
+    assert(!plan.needed, "v2 handoff must not be re-migrated");
+    assert(/already/i.test(plan.reason), `unexpected reason: ${plan.reason}`);
+  });
+
+  test("migrate: proposed map validates against the production parser", async () => {
+    for (const name of ["legacy-1x", "map-only", "mixed", "malformed", "conflicting", "partial"]) {
+      const plan = planMigration(await readHandoffInputs(name));
+      assert(plan.needed, `${name} should need migration`);
+      assert(plan.valid, `${name}: proposed map failed production-parser validation`);
+      const reparsed = parseContextMap(plan.outputs["context-map.md"]);
+      assert(reparsed, `${name}: rendered map does not reparse`);
+      for (const key of SECTION_KEYS) {
+        assertEqual(
+          reparsed.sections[key].length,
+          plan.map.sections[key].length,
+          `${name}: section '${key}' drifted through render/parse`
+        );
+      }
+    }
+  });
+
+  test("migrate: explicit user instructions take highest precedence", async () => {
+    const inputs = await readHandoffInputs("conflicting");
+    const plan = planMigration(inputs, { goal: "Explicit user goal" });
+    assertEqual(plan.map.sections.goal.length, 1);
+    assertEqual(plan.map.sections.goal[0].text, "Explicit user goal", "user instruction must beat the map");
+
+    const noted = planMigration(inputs, "Remember to rotate the deploy key");
+    assert(
+      noted.map.sections.knowledge.some((n) => n.text === "Remember to rotate the deploy key"),
+      "instruction note not recorded"
+    );
+  });
+
+  test("migrate: planMigration is pure and deterministic", async () => {
+    const inputs = await readHandoffInputs("legacy-1x");
+    const before = JSON.stringify(inputs);
+    const first = planMigration(inputs);
+    const second = planMigration(inputs);
+    assertEqual(JSON.stringify(first), JSON.stringify(second), "planMigration is not deterministic");
+    assertEqual(JSON.stringify(inputs), before, "planMigration mutated its inputs");
+  });
+
+  test("migrate: applyMigration backs up originals, writes via temp files, upgrades version last", async () => {
+    const inputs = await readHandoffInputs("legacy-1x");
+    const plan = planMigration(inputs);
+    const seed = seedFromInputs(inputs);
+    const io = makeFakeIo(seed);
+
+    const result = await applyMigration(
+      plan,
+      { handoffDir: MIGRATE_HANDOFF_DIR, configPath: MIGRATE_CONFIG_PATH },
+      io,
+      { timestamp: "2026-07-26T00:00:00.000Z" }
+    );
+    assert(result.migrated, "applyMigration should report migrated");
+
+    const backupDir = `${MIGRATE_HANDOFF_DIR}/history/migrations/2026-07-26T00-00-00-000Z`;
+    assertEqual(result.backupDir, backupDir, "unexpected backup directory");
+    // Originals backed up (the fixture carries no secrets, so backup is verbatim).
+    assertEqual(io.store.get(`${backupDir}/HANDOFF.md`), inputs.handoffMd);
+    assertEqual(io.store.get(`${backupDir}/context.json`), inputs.contextJson);
+    assertEqual(io.store.get(`${backupDir}/tasks.md`), inputs.tasksMd);
+    assertEqual(io.store.get(`${backupDir}/decisions.md`), inputs.decisionsMd);
+    assertEqual(io.store.get(`${backupDir}/.handoff.config.json`), inputs.config);
+
+    // Finals replaced with v2 content.
+    const map = parseContextMap(io.store.get(`${MIGRATE_HANDOFF_DIR}/context-map.md`));
+    assert(map, "migrated map does not parse");
+    assertEqual(map.sections.tasks.length, 3);
+    const json = JSON.parse(io.store.get(`${MIGRATE_HANDOFF_DIR}/context.json`));
+    assertEqual(json.version, PROTOCOL_VERSION);
+    assert(json.diagnostics.migration.length > 0, "migration diagnostics missing");
+    assertEqual(
+      json.views["HANDOFF.md"],
+      sha256Hex(io.store.get(`${MIGRATE_HANDOFF_DIR}/HANDOFF.md`)),
+      "stored view hash does not match the written view"
+    );
+    const config = JSON.parse(io.store.get(MIGRATE_CONFIG_PATH));
+    assertEqual(config.version, PROTOCOL_VERSION, "config version not upgraded");
+
+    // Version upgrade is the final rename: the config temp renames last.
+    const renames = io.ops.filter((op) => op[0] === "rename");
+    assert(renames.length >= 5, `expected temp-file renames, got: ${JSON.stringify(renames)}`);
+    assertEqual(renames[renames.length - 1][2], MIGRATE_CONFIG_PATH, "config must be renamed after the final data rename");
+
+    // No temp files left behind.
+    for (const key of io.store.keys()) {
+      assert(!key.includes("migration-tmp"), `temp file left behind: ${key}`);
+    }
+  });
+
+  test("migrate: applyMigration validates the plan before touching the filesystem", async () => {
+    const inputs = await readHandoffInputs("legacy-1x");
+    const plan = planMigration(inputs);
+    plan.outputs["context-map.md"] = "garbage that is not a context map";
+    const io = makeFakeIo(seedFromInputs(inputs));
+
+    await assertRejects(
+      () => applyMigration(plan, { handoffDir: MIGRATE_HANDOFF_DIR, configPath: MIGRATE_CONFIG_PATH }, io),
+      "corrupted plan output must be rejected"
+    );
+    assertEqual(io.ops.length, 0, "an invalid plan must not cause any filesystem operation");
+  });
+
+  test("migrate: injected write failure leaves original files and configuration unchanged", async () => {
+    const inputs = await readHandoffInputs("legacy-1x");
+    const plan = planMigration(inputs);
+    const seed = seedFromInputs(inputs);
+    const io = makeFakeIo(seed, (p) => p.endsWith("tasks.md.migration-tmp"));
+
+    await assertRejects(
+      () =>
+        applyMigration(
+          plan,
+          { handoffDir: MIGRATE_HANDOFF_DIR, configPath: MIGRATE_CONFIG_PATH },
+          io,
+          { timestamp: "2026-07-26T00:00:00.000Z" }
+        ),
+      "injected write failure should abort the migration"
+    );
+
+    for (const [key, value] of Object.entries(seed)) {
+      assertEqual(io.store.get(key), value, `original file changed despite failure: ${key}`);
+    }
+    assert(!io.store.has(`${MIGRATE_HANDOFF_DIR}/context-map.md`), "partial output left behind");
+    for (const key of io.store.keys()) {
+      assert(!key.includes("migration-tmp"), `temp file left behind: ${key}`);
+    }
+  });
+
+  test("migrate: repeated migration is idempotent", async () => {
+    const inputs = await readHandoffInputs("legacy-1x");
+    const io = makeFakeIo(seedFromInputs(inputs));
+    const paths = { handoffDir: MIGRATE_HANDOFF_DIR, configPath: MIGRATE_CONFIG_PATH };
+
+    const first = await applyMigration(planMigration(inputs), paths, io, { timestamp: "2026-07-26T00:00:00.000Z" });
+    assert(first.migrated, "first migration should write");
+    const snapshot = JSON.stringify([...io.store.entries()].sort());
+
+    const secondPlan = planMigration({
+      config: io.store.get(MIGRATE_CONFIG_PATH),
+      contextJson: io.store.get(`${MIGRATE_HANDOFF_DIR}/context.json`),
+      handoffMd: io.store.get(`${MIGRATE_HANDOFF_DIR}/HANDOFF.md`),
+      tasksMd: io.store.get(`${MIGRATE_HANDOFF_DIR}/tasks.md`),
+      decisionsMd: io.store.get(`${MIGRATE_HANDOFF_DIR}/decisions.md`),
+      contextMapMd: io.store.get(`${MIGRATE_HANDOFF_DIR}/context-map.md`),
+    });
+    assert(!secondPlan.needed, `second plan should be a no-op, got: ${secondPlan.reason}`);
+    const second = await applyMigration(secondPlan, paths, io, { timestamp: "2026-07-26T01:00:00.000Z" });
+    assert(!second.migrated, "second migration must not write");
+    assertEqual(JSON.stringify([...io.store.entries()].sort()), snapshot, "second migration changed files");
   });
 }

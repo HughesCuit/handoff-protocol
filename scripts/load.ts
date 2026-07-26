@@ -27,6 +27,7 @@ import {
 } from "./context-map.ts";
 import { viewTamperWarnings } from "./views.mjs";
 import { validateProjectConfig } from "./config.mjs";
+import { isMigrationNeeded } from "./migrate.mjs";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -580,6 +581,7 @@ async function load(mode: string): Promise<LoadResult> {
   // maps fall back to the legacy path unchanged.
   const map = await loadContextMap(handoffDir);
   let ctx = await loadContextJson(handoffDir);
+  const legacyJsonVersion = ctx ? ctx.version : undefined;
 
   // Generated views are never a semantic source. Warn when an on-disk view
   // no longer matches the hash stored by the last save (manual edit); the
@@ -649,6 +651,18 @@ async function load(mode: string): Promise<LoadResult> {
     };
 
     console.error("Successfully parsed HANDOFF.md as fallback.");
+  }
+
+  // Legacy (pre-v2) handoffs still load through the paths above; point at the
+  // atomic migration without changing read-only load behavior.
+  if (
+    isMigrationNeeded({
+      mapPresent: !!map,
+      contextVersion: legacyJsonVersion || (map ? undefined : ctx && ctx.version),
+      configVersion: storageConfig?.version,
+    })
+  ) {
+    console.error("Note: legacy handoff format (pre-v2) detected. Run `/handoff save` to migrate to v2; originals are backed up under .handoff/history/migrations/ automatically.");
   }
 
   const understanding = generateUnderstanding(ctx);

@@ -48,6 +48,7 @@ import {
   SOURCE_EXTENSIONS,
 } from "./source-comments.mjs";
 import { validateProjectConfig } from "./config.mjs";
+import { applyMigration, planMigration } from "./migrate.mjs";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -631,6 +632,70 @@ function getModeConfig(mode: string, verbosity?: string): ModeConfig {
 
 // ── Main Save Logic ──────────────────────────────────────────────────────────
 
+// Filesystem adapter for the shared, runtime-agnostic migration core.
+const migrationIo = {
+  readFile: (p: string) => Deno.readTextFile(p),
+  writeFile: async (p: string, content: string) => {
+    await Deno.writeTextFile(p, content);
+  },
+  rename: (from: string, to: string) => Deno.rename(from, to),
+  mkdir: async (p: string) => {
+    await Deno.mkdir(p, { recursive: true });
+  },
+  exists: (p: string) => exists(p),
+  remove: async (p: string) => {
+    try {
+      await Deno.remove(p);
+    } catch {
+      // Already renamed or never written: nothing to clean.
+    }
+  },
+};
+
+/**
+ * Migrate a legacy (pre-v2) handoff into the canonical model before the save
+ * proceeds. The migration is atomic: originals are backed up under
+ * .handoff/history/migrations/<UTC-timestamp>/ and only replaced after every
+ * temporary output validates. Migrated nodes enter the map as user-owned
+ * content, so they always win over this save's fresh inference. Returns the
+ * migration diagnostics (recorded in context.json), or null when the handoff
+ * is already v2.
+ */
+async function migrateLegacyHandoff(
+  cwd: string,
+  handoffDir: string,
+): Promise<{ migration: string[]; conflicts: unknown[] } | null> {
+  const readIfExists = async (p: string): Promise<string | undefined> => {
+    try {
+      return await Deno.readTextFile(p);
+    } catch {
+      return undefined;
+    }
+  };
+  const plan = planMigration({
+    config: await readIfExists(join(cwd, ".handoff.config.json")),
+    contextJson: await readIfExists(join(handoffDir, "context.json")),
+    handoffMd: await readIfExists(join(handoffDir, "HANDOFF.md")),
+    tasksMd: await readIfExists(join(handoffDir, "tasks.md")),
+    decisionsMd: await readIfExists(join(handoffDir, "decisions.md")),
+    contextMapMd: await readIfExists(join(handoffDir, CONTEXT_MAP_FILE)),
+  });
+  if (!plan.needed) return null;
+
+  const result = await applyMigration(
+    plan,
+    { handoffDir, configPath: join(cwd, ".handoff.config.json") },
+    migrationIo,
+  );
+  console.log(`Legacy handoff detected — migrated to Handoff Protocol v${PROTOCOL_VERSION}.`);
+  console.log(`Backup: ${result.backupDir}`);
+  for (const entry of plan.diagnostics.migration) console.log(`  - ${entry}`);
+  if (plan.diagnostics.conflicts.length > 0) {
+    console.log(`  - ${plan.diagnostics.conflicts.length} conflict(s) preserved under Open Questions > Migration conflict`);
+  }
+  return plan.diagnostics;
+}
+
 async function save(mode: string, lang?: string, verbosity?: string): Promise<void> {
   const cwd = Deno.cwd();
   const handoffDir = join(cwd, ".handoff");
@@ -666,6 +731,10 @@ async function save(mode: string, lang?: string, verbosity?: string): Promise<vo
   } else {
     await ensureDir(handoffDir);
   }
+
+  // Legacy (pre-v2) handoffs migrate atomically into the canonical model
+  // before inference reconciles into the map below.
+  const migrationDiagnostics = await migrateLegacyHandoff(cwd, handoffDir);
 
   const { name, language } = await readProjectInfo();
   const git = await getGitState();
@@ -788,7 +857,7 @@ async function save(mode: string, lang?: string, verbosity?: string): Promise<vo
       viewHashes[name] = hash;
     }
   }
-  const contextJson = buildContextJson(metadata, viewHashes);
+  const contextJson = buildContextJson(metadata, viewHashes, migrationDiagnostics || undefined);
   await Deno.writeTextFile(
     join(handoffDir, "context.json"),
     filterSensitive(JSON.stringify(contextJson, null, 2))

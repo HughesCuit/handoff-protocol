@@ -1,0 +1,24 @@
+{
+  "version": "2.0.0",
+  "timestamp": "2026-07-25T12:00:00.000Z",
+  "agent": "opencode",
+  "project": "migrated-fixture",
+  "lang": "en",
+  "git": {
+    "branch": "main",
+    "latest_commit": "ddd4444",
+    "commit_message": "chore: migrate to v2",
+    "is_dirty": false
+  },
+  "views": {
+    "HANDOFF.md": "2977783da9c8bd40bbf78e85f9b2f26e73a730aba7e8ac7aa9a16cbd3e8ef62c",
+    "tasks.md": "191ad83f52881b61224ffacc058734f23f29c126a0b854ae0e3efd75dae8a6d1",
+    "decisions.md": "3691c03af611c78fd401049334911529fbdc4d9ed76574848455d0d3c835b50c"
+  },
+  "diagnostics": {
+    "migration": [
+      "migrated from legacy handoff (context.json v1.2.0)"
+    ],
+    "conflicts": []
+  }
+}

@@ -15,7 +15,7 @@ import {
   assertEqual,
   assertIncludes,
 } from "../shared/unit-suite.mjs";
-import { parseContextMap, SECTION_LABELS, SECTION_KEYS } from "../../scripts/context-map.mjs";
+import { parseContextMap, PROTOCOL_VERSION, SECTION_LABELS, SECTION_KEYS } from "../../scripts/context-map.mjs";
 import { GENERATED_MARKER, sha256Hex } from "../../scripts/views.mjs";
 
 const fixturesDir = new URL("../fixtures/", import.meta.url);
@@ -332,6 +332,115 @@ Deno.test("save: low-verbosity saves preserve view hashes and tamper detection f
   res = await runSave(dir, ["--verbosity", "low"]);
   assertEqual(res.code, 0, `save failed: ${res.stderr}`);
   assertIncludes(res.stderr, "tasks.md");
+});
+
+// ── Legacy migration (v2) ─────────────────────────────────────────────────
+
+async function copyHandoffFixture(name: string): Promise<string> {
+  const dir = await Deno.makeTempDir({ prefix: `handoff-migrate-${name}-` });
+  const res = await run("cp", ["-r", `${fixturePath(name)}/.`, dir], dir);
+  assertEqual(res.code, 0, `fixture copy failed: ${res.stderr}`);
+  return dir;
+}
+
+async function dirNames(path: string): Promise<string[]> {
+  const names: string[] = [];
+  for await (const entry of Deno.readDir(path)) names.push(entry.name);
+  return names;
+}
+
+Deno.test("migrate: save migrates a legacy 1.x handoff with backup and stays idempotent", async () => {
+  const dir = await copyHandoffFixture("legacy-1x");
+  let res = await runSave(dir);
+  assertEqual(res.code, 0, res.stderr);
+  assertIncludes(res.stdout, "migrat");
+
+  const map = parseContextMap(await Deno.readTextFile(`${dir}/.handoff/context-map.md`));
+  assert(map, "migration did not produce a readable context map");
+  assertEqual(map.sections.goal[0].text, "feat: add rate limiting middleware");
+  const taskTexts = map.sections.tasks.map((n) => n.text);
+  assert(taskTexts.some((t) => t.includes("Add Redis backend for distributed rate limiting")), "legacy task lost");
+  assert(map.sections.tasks.every((n) => !n.checked), "legacy tasks should stay pending");
+  assert(
+    map.sections.decisions.some((n) => n.text.includes("Simpler to reason about bursty traffic")),
+    "decision rationale lost"
+  );
+  assert(
+    map.sections.risks.some((n) => n.text.includes("1 high-priority TODO/FIXME items pending")),
+    "legacy risk lost"
+  );
+
+  // Originals are backed up under .handoff/history/migrations/<UTC-timestamp>/.
+  const migrationsRoot = `${dir}/.handoff/history/migrations`;
+  assertEqual((await dirNames(migrationsRoot)).length, 1, "expected exactly one backup directory");
+  const backupDir = `${migrationsRoot}/${(await dirNames(migrationsRoot))[0]}`;
+  assertIncludes(await Deno.readTextFile(`${backupDir}/HANDOFF.md`), "v1.2.0", "backup must hold the original HANDOFF.md");
+  assertIncludes(await Deno.readTextFile(`${backupDir}/context.json`), "my-api", "backup must hold the original context.json");
+  assert(await pathExists(`${backupDir}/.handoff.config.json`), "config not backed up");
+
+  // Versions upgrade to v2.
+  const config = JSON.parse(await Deno.readTextFile(`${dir}/.handoff.config.json`));
+  assertEqual(config.version, PROTOCOL_VERSION, "config version not upgraded");
+  const json = JSON.parse(await Deno.readTextFile(`${dir}/.handoff/context.json`));
+  assertEqual(json.version, PROTOCOL_VERSION, "context.json version not upgraded");
+  assert(json.diagnostics.migration.length > 0, "migration diagnostics missing from context.json");
+
+  // Repeated save: already migrated, no second backup.
+  res = await runSave(dir);
+  assertEqual(res.code, 0, res.stderr);
+  assertEqual((await dirNames(migrationsRoot)).length, 1, "repeated save created a second migration backup");
+
+  // The migrated handoff loads with its legacy semantics intact.
+  const loadRes = await runLoad(dir);
+  assertEqual(loadRes.code, 0, loadRes.stderr);
+  assertIncludes(loadRes.stdout, "feat: add rate limiting middleware");
+  assertIncludes(loadRes.stdout, "Pending tasks: 3");
+});
+
+Deno.test("migrate: conflicting handoff keeps map semantics and records labeled conflicts", async () => {
+  const dir = await copyHandoffFixture("conflicting");
+  const res = await runSave(dir);
+  assertEqual(res.code, 0, res.stderr);
+
+  const map = parseContextMap(await Deno.readTextFile(`${dir}/.handoff/context-map.md`));
+  assertEqual(map.sections.goal.length, 1, "singleton goal duplicated");
+  assertEqual(map.sections.goal[0].text, "Ship the map-approved compiler release", "map goal must win");
+
+  const questions = map.sections.questions;
+  assert(questions.some((n) => n.text === "How should v3 rank branches?"), "map question lost");
+  const conflictIdx = questions.findIndex((n) => n.text === "Migration conflict");
+  assert(conflictIdx >= 0, "Migration conflict node missing from Open Questions");
+  const children = questions.slice(conflictIdx + 1).filter((n) => n.depth > 0).map((n) => n.text);
+  assert(
+    children.some((t) => t.includes("JSON draft goal superseded by the map") && t.includes("(source: context.json)")),
+    `context.json conflict not labeled: ${JSON.stringify(children)}`
+  );
+  assert(
+    children.some((t) => t.includes("HANDOFF view goal superseded by the map") && t.includes("(source: HANDOFF.md)")),
+    `HANDOFF.md conflict not labeled: ${JSON.stringify(children)}`
+  );
+
+  assertEqual(map.sections.excluded[0].text, "No vector database in v3", "exclusion lost");
+  const tasks = map.sections.tasks;
+  const shared = tasks.filter((n) => n.text.includes("Wire the context compiler into load"));
+  assertEqual(shared.length, 1, "overlapping task not deduplicated");
+  assertEqual(shared[0].checked, false, "map task state lost to the legacy duplicate");
+  assert(tasks.some((n) => n.text.includes("Legacy-only task from context.json")), "unique context.json task lost");
+  assert(tasks.some((n) => n.text.includes("Legacy-only task from HANDOFF.md")), "unique HANDOFF.md task lost");
+});
+
+Deno.test("load: legacy handoffs warn that migration is available (read-only)", async () => {
+  const res = await runLoad(fixturePath("legacy-1x"));
+  assertEqual(res.code, 0, res.stderr);
+  assertIncludes(res.stderr, "migrat");
+  assertIncludes(res.stdout, "feat: add rate limiting middleware");
+});
+
+Deno.test("load: already-migrated v2 handoff does not warn about migration", async () => {
+  const res = await runLoad(fixturePath("migrated"));
+  assertEqual(res.code, 0, res.stderr);
+  assert(!res.stderr.includes("migrat"), `v2 handoff should not trigger a migration warning: ${res.stderr}`);
+  assertIncludes(res.stdout, "Already migrated v2 goal");
 });
 
 // ── Config validation integration ────────────────────────────────────────────

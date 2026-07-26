@@ -24,6 +24,7 @@ import {
 } from "./context-map.mjs";
 import { viewTamperWarnings } from "../views.mjs";
 import { validateProjectConfig } from "../config.mjs";
+import { isMigrationNeeded } from "../migrate.mjs";
 
 // ── Security ─────────────────────────────────────────────────────────────────
 // SENSITIVE_PATTERNS and filterSensitive live in ./context-map.mjs (shared with
@@ -154,6 +155,7 @@ function load(mode) {
   // maps fall back to the legacy path unchanged.
   const map = loadContextMap(handoffDir);
   let ctx = loadContextJson(handoffDir);
+  const legacyJsonVersion = ctx ? ctx.version : undefined;
 
   // Generated views are never a semantic source. Warn when an on-disk view
   // no longer matches the hash stored by the last save (manual edit); the
@@ -190,6 +192,16 @@ function load(mode) {
     if (!existsSync(mdPath)) return { understanding: "No readable context.", nextActions: ["Run `/handoff save`"], risks: ["Invalid state"], pendingTasks: 0, context: null, storageMode };
     const parsed = parseHandoffMd(readFileSync(mdPath, "utf-8"));
     ctx = { version: "1.0.0", timestamp: new Date().toISOString(), agent: "unknown", project: parsed.project || "unknown", current_goal: parsed.current_goal || "", status: parsed.status || "unknown", completed: parsed.completed || [], modified_files: parsed.modified_files || [], todos: parsed.todos || [], blockers: parsed.blockers || [], decisions: [], next_steps: parsed.next_steps || [], git: parsed.git || { branch: "unknown", latest_commit: "", commit_message: "", is_dirty: false }, risks: parsed.risks || [], notes: "(parsed from HANDOFF.md)" };
+  }
+
+  // Legacy (pre-v2) handoffs still load through the paths above; point at the
+  // atomic migration without changing read-only load behavior.
+  if (isMigrationNeeded({
+    mapPresent: !!map,
+    contextVersion: legacyJsonVersion || (map ? undefined : ctx && ctx.version),
+    configVersion: storageConfig && storageConfig.version,
+  })) {
+    console.error("Note: legacy handoff format (pre-v2) detected. Run `/handoff save` to migrate to v2; originals are backed up under .handoff/history/migrations/ automatically.");
   }
 
   const parts = [`Project: ${ctx.project}`, `Status: ${ctx.status}`];

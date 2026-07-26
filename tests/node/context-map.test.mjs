@@ -9,7 +9,7 @@
  */
 
 import { test } from "node:test";
-import { readFile, mkdtemp, writeFile, mkdir, rm } from "node:fs/promises";
+import { readFile, mkdtemp, writeFile, mkdir, rm, cp, readdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,7 +23,7 @@ import {
   assertIncludes,
   assertNotIncludes,
 } from "../shared/unit-suite.mjs";
-import { parseContextMap, SECTION_LABELS, SECTION_KEYS } from "../../scripts/context-map.mjs";
+import { parseContextMap, PROTOCOL_VERSION, SECTION_LABELS, SECTION_KEYS } from "../../scripts/context-map.mjs";
 import { GENERATED_MARKER, sha256Hex } from "../../scripts/views.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -305,6 +305,110 @@ test("save: low-verbosity saves preserve view hashes and tamper detection for sk
   const saveRes = spawnSync(process.execPath, [join(root, "scripts", "node", "save.mjs"), "--verbosity", "low"], { cwd: dir, encoding: "utf-8" });
   assertEqual(saveRes.status, 0, `save failed: ${saveRes.stderr}`);
   assertIncludes(saveRes.stderr, "tasks.md");
+});
+
+// ── Legacy migration (v2) ─────────────────────────────────────────────────
+
+async function copyHandoffFixture(name) {
+  const dir = await mkdtemp(join(tmpdir(), `handoff-migrate-${name}-`));
+  await cp(join(fixturesDir, "handoffs", name), dir, { recursive: true });
+  return dir;
+}
+
+test("migrate: save migrates a legacy 1.x handoff with backup and stays idempotent", async () => {
+  const dir = await copyHandoffFixture("legacy-1x");
+  const out = runSave(dir);
+  assertIncludes(out, "migrat", "save should announce the migration");
+
+  const map = parseContextMap(await readFile(join(dir, ".handoff", "context-map.md"), "utf-8"));
+  assert(map, "migration did not produce a readable context map");
+  assertEqual(map.sections.goal[0].text, "feat: add rate limiting middleware");
+  const taskTexts = map.sections.tasks.map((n) => n.text);
+  assert(taskTexts.some((t) => t.includes("Add Redis backend for distributed rate limiting")), "legacy task lost");
+  assert(map.sections.tasks.every((n) => !n.checked), "legacy tasks should stay pending");
+  assert(
+    map.sections.decisions.some((n) => n.text.includes("Simpler to reason about bursty traffic")),
+    "decision rationale lost"
+  );
+  assert(
+    map.sections.risks.some((n) => n.text.includes("1 high-priority TODO/FIXME items pending")),
+    "legacy risk lost"
+  );
+
+  // Originals are backed up under .handoff/history/migrations/<UTC-timestamp>/.
+  const migrationsRoot = join(dir, ".handoff", "history", "migrations");
+  assertEqual((await readdir(migrationsRoot)).length, 1, "expected exactly one backup directory");
+  const backupDir = join(migrationsRoot, (await readdir(migrationsRoot))[0]);
+  assertIncludes(await readFile(join(backupDir, "HANDOFF.md"), "utf-8"), "v1.2.0", "backup must hold the original HANDOFF.md");
+  assertIncludes(await readFile(join(backupDir, "context.json"), "utf-8"), "my-api", "backup must hold the original context.json");
+  assert(existsSync(join(backupDir, ".handoff.config.json")), "config not backed up");
+
+  // Versions upgrade to v2.
+  const config = JSON.parse(await readFile(join(dir, ".handoff.config.json"), "utf-8"));
+  assertEqual(config.version, PROTOCOL_VERSION, "config version not upgraded");
+  const json = JSON.parse(await readFile(join(dir, ".handoff", "context.json"), "utf-8"));
+  assertEqual(json.version, PROTOCOL_VERSION, "context.json version not upgraded");
+  assert(json.diagnostics.migration.length > 0, "migration diagnostics missing from context.json");
+
+  // Repeated save: already migrated, no second backup.
+  runSave(dir);
+  assertEqual((await readdir(migrationsRoot)).length, 1, "repeated save created a second migration backup");
+
+  // The migrated handoff loads with its legacy semantics intact.
+  const loadOut = runLoad(dir);
+  assertIncludes(loadOut, "feat: add rate limiting middleware");
+  assertIncludes(loadOut, "Pending tasks: 3");
+});
+
+test("migrate: conflicting handoff keeps map semantics and records labeled conflicts", async () => {
+  const dir = await copyHandoffFixture("conflicting");
+  runSave(dir);
+
+  const map = parseContextMap(await readFile(join(dir, ".handoff", "context-map.md"), "utf-8"));
+  assertEqual(map.sections.goal.length, 1, "singleton goal duplicated");
+  assertEqual(map.sections.goal[0].text, "Ship the map-approved compiler release", "map goal must win");
+
+  const questions = map.sections.questions;
+  assert(questions.some((n) => n.text === "How should v3 rank branches?"), "map question lost");
+  const conflictIdx = questions.findIndex((n) => n.text === "Migration conflict");
+  assert(conflictIdx >= 0, "Migration conflict node missing from Open Questions");
+  const children = questions.slice(conflictIdx + 1).filter((n) => n.depth > 0).map((n) => n.text);
+  assert(
+    children.some((t) => t.includes("JSON draft goal superseded by the map") && t.includes("(source: context.json)")),
+    `context.json conflict not labeled: ${JSON.stringify(children)}`
+  );
+  assert(
+    children.some((t) => t.includes("HANDOFF view goal superseded by the map") && t.includes("(source: HANDOFF.md)")),
+    `HANDOFF.md conflict not labeled: ${JSON.stringify(children)}`
+  );
+
+  assertEqual(map.sections.excluded[0].text, "No vector database in v3", "exclusion lost");
+  const tasks = map.sections.tasks;
+  const shared = tasks.filter((n) => n.text.includes("Wire the context compiler into load"));
+  assertEqual(shared.length, 1, "overlapping task not deduplicated");
+  assertEqual(shared[0].checked, false, "map task state lost to the legacy duplicate");
+  assert(tasks.some((n) => n.text.includes("Legacy-only task from context.json")), "unique context.json task lost");
+  assert(tasks.some((n) => n.text.includes("Legacy-only task from HANDOFF.md")), "unique HANDOFF.md task lost");
+});
+
+test("load: legacy handoffs warn that migration is available (read-only)", () => {
+  const res = spawnSync(process.execPath, [join(root, "scripts", "node", "load.mjs")], {
+    cwd: join(fixturesDir, "handoffs", "legacy-1x"),
+    encoding: "utf-8",
+  });
+  assertEqual(res.status, 0, `load failed: ${res.stderr}`);
+  assertIncludes(res.stderr, "migrat", "load should point at migration for legacy handoffs");
+  assertIncludes(res.stdout, "feat: add rate limiting middleware", "legacy load behavior changed");
+});
+
+test("load: already-migrated v2 handoff does not warn about migration", () => {
+  const res = spawnSync(process.execPath, [join(root, "scripts", "node", "load.mjs")], {
+    cwd: join(fixturesDir, "handoffs", "migrated"),
+    encoding: "utf-8",
+  });
+  assertEqual(res.status, 0, `load failed: ${res.stderr}`);
+  assertNotIncludes(res.stderr, "migrat", "v2 handoff should not trigger a migration warning");
+  assertIncludes(res.stdout, "Already migrated v2 goal");
 });
 
 // ── Config validation integration ────────────────────────────────────────────
