@@ -309,6 +309,31 @@ Deno.test("load: v2 handoff with a missing map falls back to the HANDOFF.md view
   assertIncludes(res.stdout, "Project: fixture-app");
 });
 
+Deno.test("save: low-verbosity saves preserve view hashes and tamper detection for skipped views", async () => {
+  const dir = await initTempRepo();
+  let res = await runSave(dir);
+  assertEqual(res.code, 0, res.stderr);
+  res = await runSave(dir, ["--verbosity", "low"]);
+  assertEqual(res.code, 0, res.stderr);
+
+  // The skipped views keep their hash entries in context.json.
+  const json = JSON.parse(await Deno.readTextFile(`${dir}/.handoff/context.json`));
+  for (const name of ["HANDOFF.md", "tasks.md", "decisions.md"]) {
+    const content = await Deno.readTextFile(`${dir}/.handoff/${name}`);
+    assertEqual(json.views[name], sha256Hex(content), `low save dropped the ${name} hash entry`);
+  }
+
+  // Tampering with a skipped view still warns on load (and on the next save).
+  const tasksPath = `${dir}/.handoff/tasks.md`;
+  await Deno.writeTextFile(tasksPath, (await Deno.readTextFile(tasksPath)) + "\n- [ ] manual injected task\n");
+  const loadRes = await runLoad(dir);
+  assertEqual(loadRes.code, 0, `load failed: ${loadRes.stderr}`);
+  assertIncludes(loadRes.stderr, "tasks.md");
+  res = await runSave(dir, ["--verbosity", "low"]);
+  assertEqual(res.code, 0, `save failed: ${res.stderr}`);
+  assertIncludes(res.stderr, "tasks.md");
+});
+
 // ── Config validation integration ────────────────────────────────────────────
 
 Deno.test("save: rejects a non-portable .handoff.config.json before writing", async () => {

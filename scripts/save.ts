@@ -755,8 +755,8 @@ async function save(mode: string, lang?: string, verbosity?: string): Promise<vo
   } catch {
     // No readable previous context.json: nothing to compare against.
   }
+  const currentContents: Record<string, string> = {};
   if (previousViews) {
-    const currentContents: Record<string, string> = {};
     for (const name of Object.keys(previousViews)) {
       try {
         currentContents[name] = await Deno.readTextFile(join(handoffDir, name));
@@ -779,6 +779,14 @@ async function save(mode: string, lang?: string, verbosity?: string): Promise<vo
   const viewHashes: Record<string, string> = {};
   for (const [name, content] of Object.entries(views)) {
     viewHashes[name] = sha256Hex(content);
+  }
+  // Low-verbosity saves do not rewrite tasks.md/decisions.md; carry their
+  // stored hashes forward so tamper detection keeps covering them. Views
+  // deleted on disk are dropped instead of haunting future saves.
+  for (const [name, hash] of Object.entries(previousViews || {})) {
+    if (!(name in viewHashes) && currentContents[name] != null) {
+      viewHashes[name] = hash;
+    }
   }
   const contextJson = buildContextJson(metadata, viewHashes);
   await Deno.writeTextFile(

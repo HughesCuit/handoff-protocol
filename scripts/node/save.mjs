@@ -416,8 +416,8 @@ async function save(mode, lang, verbosity) {
   } catch {
     // No readable previous context.json: nothing to compare against.
   }
+  const currentContents = {};
   if (previousViews) {
-    const currentContents = {};
     for (const name of Object.keys(previousViews)) {
       try {
         currentContents[name] = readFileSync(join(handoffDir, name), "utf-8");
@@ -438,6 +438,14 @@ async function save(mode, lang, verbosity) {
   const viewHashes = {};
   for (const [name, content] of Object.entries(views)) {
     viewHashes[name] = sha256Hex(content);
+  }
+  // Low-verbosity saves do not rewrite tasks.md/decisions.md; carry their
+  // stored hashes forward so tamper detection keeps covering them. Views
+  // deleted on disk are dropped instead of haunting future saves.
+  for (const [name, hash] of Object.entries(previousViews || {})) {
+    if (!(name in viewHashes) && currentContents[name] != null) {
+      viewHashes[name] = hash;
+    }
   }
   const contextJson = buildContextJson(metadata, viewHashes);
   writeFileSync(join(handoffDir, "context.json"), filterSensitive(JSON.stringify(contextJson, null, 2)));

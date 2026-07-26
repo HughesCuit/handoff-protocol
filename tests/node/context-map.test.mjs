@@ -284,6 +284,29 @@ test("load: v2 handoff with a missing map falls back to the HANDOFF.md view", as
   assertIncludes(res.stdout, "Project: fixture-app");
 });
 
+test("save: low-verbosity saves preserve view hashes and tamper detection for skipped views", async () => {
+  const dir = await initTempRepo();
+  runSave(dir);
+  runSave(dir, ["--verbosity", "low"]);
+
+  // The skipped views keep their hash entries in context.json.
+  const json = JSON.parse(await readFile(join(dir, ".handoff", "context.json"), "utf-8"));
+  for (const name of ["HANDOFF.md", "tasks.md", "decisions.md"]) {
+    const content = await readFile(join(dir, ".handoff", name), "utf-8");
+    assertEqual(json.views[name], sha256Hex(content), `low save dropped the ${name} hash entry`);
+  }
+
+  // Tampering with a skipped view still warns on load (and on the next save).
+  const tasksPath = join(dir, ".handoff", "tasks.md");
+  await writeFile(tasksPath, (await readFile(tasksPath, "utf-8")) + "\n- [ ] manual injected task\n");
+  const loadRes = spawnSync(process.execPath, [join(root, "scripts", "node", "load.mjs")], { cwd: dir, encoding: "utf-8" });
+  assertEqual(loadRes.status, 0, `load failed: ${loadRes.stderr}`);
+  assertIncludes(loadRes.stderr, "tasks.md");
+  const saveRes = spawnSync(process.execPath, [join(root, "scripts", "node", "save.mjs"), "--verbosity", "low"], { cwd: dir, encoding: "utf-8" });
+  assertEqual(saveRes.status, 0, `save failed: ${saveRes.stderr}`);
+  assertIncludes(saveRes.stderr, "tasks.md");
+});
+
 // ── Config validation integration ────────────────────────────────────────────
 
 async function writeInvalidConfig(dir, config) {
