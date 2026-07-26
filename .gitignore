@@ -31,4 +31,9 @@ yarn-error.log*
 .env.*.local
 
 # Handoff output (user-generated, not part of skill)
-.handoff/
+# Anchored to the repo root so test fixtures under tests/fixtures/**/.handoff
+# remain trackable.
+/.handoff/
+
+# Local tooling (Deno for tests)
+.tools/

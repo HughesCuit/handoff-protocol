@@ -10,10 +10,15 @@ Handoff Protocol is a standardized way to save, restore, and share work context 
 
 It manages a `.handoff/` directory - the **Agent Context Protocol** equivalent of `.git/` for AI agent collaboration.
 
+The v1.5 Context Map preserves nested Markdown list indentation as parent-child
+relationships. Agent-generated nodes carry a content fingerprint, so direct
+text or checkbox edits automatically become user-owned and survive later saves.
+
 ## Features
 
 - **Universal**: Works across OpenCode, Codex, Claude Code, OpenHands, Cursor Agent
 - **Standard**: Unix-style commands, machine-readable formats (JSON Schema)
+- **Context Map** (v1.5): Human-editable `context-map.md` indexes goal, status, tasks, decisions, open questions, risks, notes, and exclusions — your edits win over agent inference
 - **Secure**: Automatic sensitive data filtering (API keys, tokens, passwords, JWT, cloud credentials)
 - **Smart**: Auto-analyzes codebase for TODO/FIXME, infers goals from git history
 - **Flexible Storage**: Direct mode for private repos, submodule mode for public repos
@@ -53,7 +58,7 @@ Stores `.handoff/` directly in the current project directory.
 **Config (`.handoff.config.json`):**
 ```json
 {
-  "version": "1.2.0",
+  "version": "1.5.0",
   "storage": {
     "mode": "direct",
     "path": ".handoff"
@@ -85,7 +90,7 @@ Submodule mode keeps this data in a separate private repository while maintainin
 **Config (`.handoff.config.json`):**
 ```json
 {
-  "version": "1.2.0",
+  "version": "1.5.0",
   "storage": {
     "mode": "submodule",
     "path": ".handoff",
@@ -176,7 +181,7 @@ When you run `/handoff save`, the skill:
 3. Collects git state (status, diff, log)
 4. Scans codebase for TODO/FIXME comments
 5. Infers current goal from recent commits
-6. Generates `.handoff/` files
+6. Generates `.handoff/` files, including the `context-map.md` Context Map (reconciled with your edits, at every verbosity)
 7. For submodule: commits and pushes to submodule repo
 
 ### Language & Verbosity
@@ -200,7 +205,7 @@ When you run `/handoff load`, the skill:
 
 1. Reads storage configuration
 2. For submodule: initializes submodule if needed
-3. Reads `.handoff/` contents (falls back to HANDOFF.md if context.json missing)
+3. Reads `.handoff/context-map.md` first, supplemented by machine state from `context.json` (falls back to `context.json`, then `HANDOFF.md` for legacy 1.x handoffs)
 4. Sanitizes output (security filtering)
 5. Generates recommended next actions
 
@@ -216,6 +221,20 @@ deno run --allow-read --allow-run scripts/load.ts
 # Node.js
 node scripts/node/save.mjs
 node scripts/node/load.mjs
+```
+
+Both runtimes share `scripts/context-map.mjs` (Context Map parse/reconcile/render/sanitize) so behavior is identical.
+
+## Tests
+
+Fixture-based tests verify both runtimes against the same fixtures (`tests/fixtures/`):
+
+```bash
+# Deno
+deno test --allow-read --allow-write --allow-run --allow-env tests/deno/
+
+# Node.js
+node --test "tests/node/**/*.test.mjs"
 ```
 
 ## Output Format

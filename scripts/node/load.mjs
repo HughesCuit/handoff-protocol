@@ -15,30 +15,17 @@
 import { execSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import {
+  contextMapHasContent,
+  filterSensitive,
+  MAP_FILENAME,
+  mergeContextMapWithJson,
+  parseContextMap,
+} from "./context-map.mjs";
 
 // ── Security ─────────────────────────────────────────────────────────────────
-
-const SENSITIVE_PATTERNS = [
-  /api[_-]?key\s*[:=]\s*["']?[a-zA-Z0-9\-]{16,}["']?/gi,
-  /bearer\s+[a-zA-Z0-9\-._~+/]{20,}=*/gi,
-  /cookie\s*:\s*[^\n]+/gi,
-  /password\s*[:=]\s*["']?[^\s"']+["']?/gi,
-  /private[_-]?key\s*[:=]\s*-----BEGIN/gi,
-  /-----BEGIN\s+(RSA\s+|EC\s+|OPENSSH\s+)?PRIVATE\s+KEY-----/gi,
-  /gh[pousr]_[a-zA-Z0-9]{36,}/g,
-  /glpat-[a-zA-Z0-9\-]{20,}/g,
-  /AKIA[0-9A-Z]{16}/g,
-  /(?:secret|token|credential)\s*[:=]\s*["']?[a-zA-Z0-9\-._]{16,}["']?/gi,
-  /eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*/g,
-  /(?:mongodb|postgres|mysql|redis):\/\/[^\s"']+:[^\s"']+@[^\s"']+/gi,
-  /(?:sk-[a-zA-Z0-9]{20,})/g,
-];
-
-function filterSensitive(text) {
-  let filtered = text;
-  for (const pattern of SENSITIVE_PATTERNS) filtered = filtered.replace(pattern, "[REDACTED]");
-  return filtered;
-}
+// SENSITIVE_PATTERNS and filterSensitive live in ./context-map.mjs (shared with
+// the Deno runtime and the test suites).
 
 function runCommand(cmd, opts) {
   try { return execSync(cmd, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"], ...opts }).trim(); }
@@ -115,6 +102,24 @@ function parseHandoffMd(content) {
   return result;
 }
 
+/**
+ * Read `.handoff/context-map.md`. Returns null when the map is absent, empty,
+ * or malformed (no recognizable semantic sections) so callers can fall back
+ * to the legacy context.json / HANDOFF.md path.
+ */
+function loadContextMap(handoffDir) {
+  const mapPath = join(handoffDir, MAP_FILENAME);
+  if (!existsSync(mapPath)) return null;
+  try {
+    const content = readFileSync(mapPath, "utf-8");
+    if (!content.trim()) return null;
+    const parsed = parseContextMap(content);
+    return contextMapHasContent(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 function load(mode) {
@@ -131,7 +136,21 @@ function load(mode) {
     return { understanding: "No handoff context found.", nextActions: ["Run `/handoff save` to create context"], risks: ["No handoff directory"], pendingTasks: 0, context: null, storageMode };
   }
 
+  // The Context Map is the semantic source; context.json supplements it with
+  // machine state (git, timestamps, modified files). Absent/empty/malformed
+  // maps fall back to the legacy path unchanged.
+  const map = loadContextMap(handoffDir);
   let ctx = loadContextJson(handoffDir);
+
+  if (map) {
+    // Map semantics win; context.json (when present) supplies machine state
+    // and any semantic field the map leaves empty. Works for map-only,
+    // mixed-format, and (map absent) legacy handoffs.
+    ctx = mergeContextMapWithJson(map, ctx);
+  }
+
+  // Fallback: parse HANDOFF.md if the map is unusable and context.json is
+  // missing/invalid (legacy 1.x handoff).
   if (!ctx) {
     const mdPath = join(handoffDir, "HANDOFF.md");
     if (!existsSync(mdPath)) return { understanding: "No readable context.", nextActions: ["Run `/handoff save`"], risks: ["Invalid state"], pendingTasks: 0, context: null, storageMode };

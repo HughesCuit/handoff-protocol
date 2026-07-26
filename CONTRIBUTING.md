@@ -30,7 +30,8 @@ Thank you for your interest in contributing to Handoff Protocol!
 ```
 handoff-protocol/
 ├── SKILL.md              # Main skill definition
-├── scripts/              # Executable scripts
+├── scripts/              # Executable scripts (+ shared context-map.mjs core)
+├── tests/                # Fixture-based tests (Deno + Node, shared fixtures)
 ├── references/           # Documentation
 ├── assets/               # Templates and resources
 ├── README.md
@@ -47,6 +48,12 @@ Before submitting, ensure:
 2. SKILL.md has valid YAML frontmatter
 3. Scripts are executable and documented
 4. No sensitive data is included
+5. Both test suites pass (they share fixtures, so both must stay green):
+
+```bash
+deno test --allow-read --allow-write --allow-run --allow-env tests/deno/
+node --test "tests/node/**/*.test.mjs"
+```
 
 ## Code of Conduct
 

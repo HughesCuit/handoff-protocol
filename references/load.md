@@ -68,6 +68,7 @@ to retry initialization.
 ### 1. Read .handoff/ Contents
 
 Check for:
+- `.handoff/context-map.md` (v1.5, semantic source)
 - `.handoff/HANDOFF.md`
 - `.handoff/context.json`
 - `.handoff/tasks.md`
@@ -75,8 +76,31 @@ Check for:
 
 ### 2. Parse Files
 
-#### Parse HANDOFF.md
-Extract sections:
+#### Parse context-map.md (first, when present)
+
+The Context Map is the semantic source of the handoff. Extract:
+- Current Goal, Current Status
+- Tasks (checkbox state → pending/completed, `**priority**` markers)
+- Decisions, Risks, Knowledge and Notes
+- Open Questions, Excluded (retained in the map; not shown in the summary)
+
+Section headings may be localized; an internal label mapping resolves them to the fixed semantic keys.
+
+If the map is **absent, empty, or malformed** (no recognized semantic section), fall back to the legacy path below unchanged — old 1.x four-file handoffs load without migration.
+
+#### Parse context.json
+
+Supplements the map with machine state:
+- project, agent, timestamp
+- git branch and latest commit
+- completed, modified_files, next_steps
+- Any semantic field the map leaves empty (current_goal, status, todos, decisions, risks, notes)
+
+For map-only handoffs (no valid `context.json`), the map alone drives the summary. For mixed-format handoffs, map semantics win over `context.json` semantics.
+
+#### Parse HANDOFF.md (legacy fallback)
+
+Only used when neither the map nor `context.json` is readable. Extract sections:
 - Current Goal
 - Current Status
 - Completed Work
@@ -84,13 +108,6 @@ Extract sections:
 - Outstanding Issues
 - TODO
 - Recommended Next Steps
-
-#### Parse context.json
-Extract structured data:
-- project, current_goal, status
-- completed, modified_files, todos
-- blockers, decisions, next_steps
-- git branch and latest commit
 
 #### Parse tasks.md
 Categorize pending tasks:
@@ -223,7 +240,8 @@ Updated actions:
 | Submodule not initialized | Run `git submodule update --init` |
 | Submodule access denied | Clear error about SSH/credential access |
 | Empty files | Warn, skip empty sections |
-| Invalid JSON | Warn, use HANDOFF.md only |
+| context-map.md absent/empty/malformed | Fall back to context.json, then HANDOFF.md |
+| Invalid JSON | Warn, use context-map.md or HANDOFF.md |
 | Missing sections | Skip, note in output |
 
 ## Security

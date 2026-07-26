@@ -1,6 +1,6 @@
 {
   "name": "handoff-protocol",
-  "version": "1.2.0",
+  "version": "1.5.0",
   "description": "Cross-agent context handoff protocol for AI coding agents",
   "keywords": [
     "ai",
@@ -21,5 +21,9 @@
   "bugs": {
     "url": "https://github.com/handoff-protocol/handoff-protocol/issues"
   },
-  "homepage": "https://github.com/handoff-protocol/handoff-protocol#readme"
+  "homepage": "https://github.com/handoff-protocol/handoff-protocol#readme",
+  "scripts": {
+    "test": "node --test \"tests/node/**/*.test.mjs\"",
+    "test:deno": "deno test --allow-read --allow-write --allow-run --allow-env tests/deno/"
+  }
 }

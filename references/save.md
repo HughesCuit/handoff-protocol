@@ -60,7 +60,7 @@ Control the detail level of generated handoff content.
 - No TODO/FIXME scan
 - No risk analysis
 - No diff stats
-- Generated files: HANDOFF.md + context.json only (skip tasks.md, decisions.md)
+- Generated files: HANDOFF.md + context.json + context-map.md (skip tasks.md, decisions.md)
 
 #### `med` (default)
 - Full goal description
@@ -70,7 +70,7 @@ Control the detail level of generated handoff content.
 - TODO/FIXME scan (up to 20 items)
 - Risk analysis enabled
 - Diff stats included
-- Generated files: all 4 (HANDOFF.md, context.json, tasks.md, decisions.md)
+- Generated files: all 4 (HANDOFF.md, context.json, tasks.md, decisions.md) + context-map.md
 
 #### `high`
 - Full goal description with context
@@ -81,7 +81,7 @@ Control the detail level of generated handoff content.
 - Full risk analysis with severity levels
 - Full diff stats with per-file breakdown
 - Extended architecture notes
-- Generated files: all 4 + optional `analysis.md` (detailed codebase analysis)
+- Generated files: all 4 + context-map.md + optional `analysis.md` (detailed codebase analysis)
 
 ## Pre-Flight Checks
 
@@ -317,7 +317,7 @@ Structure varies by `--verbosity`:
 
 ```json
 {
-  "version": "1.2.0",
+  "version": "1.5.0",
   "timestamp": "ISO-8601",
   "agent": "opencode",
   "project": "project-name",
@@ -345,6 +345,8 @@ Structure varies by `--verbosity`:
 New fields in v1.2.0:
 - `lang` (string): The language code used for this handoff's human-readable content.
 - `verbosity` (string): The verbosity level used (`low`, `med`, `high`).
+
+Since v1.5.0 the semantic content of a handoff is also indexed in `context-map.md`; `context.json` remains the machine-state supplement (git, timestamps, modified files).
 
 #### tasks.md (Pending Work)
 
@@ -376,6 +378,21 @@ Only generated when `verbosity` is `med` or `high`.
 - **Rationale**: [why this approach]
 ```
 
+#### context-map.md (Context Map, v1.5)
+
+Generated or reconciled on **every** save, at every mode and verbosity level (including `low`).
+
+The map has eight semantic sections: Current Goal, Current Status, Tasks, Decisions, Open Questions, Risks, Knowledge and Notes, Excluded. With `--lang`, section headings are localized; parsing maps them back to the fixed semantic keys.
+
+**Reconciliation rules:**
+- Existing user nodes are preserved verbatim, in order, and are never overwritten or removed. Direct user edits take priority over agent inference.
+- Nodes ending with `<!-- agent -->` are agent-managed: they are replaced by fresh inference for that section, but only when the new inference is non-empty (so a low-verbosity save never degrades the map).
+- Current Goal and Current Status are single-value sections: if the user wrote a value, inference is suppressed for that section.
+- An inferred node that is a semantic duplicate of an existing node (compared case-insensitively, ignoring checkbox state, priority markers, and punctuation) is not appended, so repeated saves are idempotent.
+- The sensitive-data filter (step 4) is applied before any map content is written.
+
+See `assets/context-map.template.md` for the full layout.
+
 ### 6. Write Files and Commit
 
 **direct mode:**
@@ -389,7 +406,7 @@ Only generated when `verbosity` is `med` or `high`.
 3. Inside `.handoff/`:
 
 ```bash
-git add HANDOFF.md context.json tasks.md decisions.md
+git add HANDOFF.md context.json tasks.md decisions.md context-map.md
 git commit -m "Update handoff context"
 git push
 ```
@@ -416,6 +433,7 @@ to use this exact handoff revision.
 | Next steps limit | 3 | 8 | 15 |
 | tasks.md | ✗ | ✓ | ✓ |
 | decisions.md | ✗ | ✓ | ✓ |
+| context-map.md | ✓ | ✓ | ✓ |
 | analysis.md | ✗ | ✗ | ✓ |
 | File descriptions | ✗ | ✗ | ✓ |
 

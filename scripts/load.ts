@@ -17,6 +17,14 @@
 import { parse } from "https://deno.land/std@0.224.0/flags/mod.ts";
 import { exists } from "https://deno.land/std@0.224.0/fs/mod.ts";
 import { join } from "https://deno.land/std@0.224.0/path/mod.ts";
+import {
+  contextMapHasContent,
+  filterSensitive,
+  MAP_FILENAME,
+  mergeContextMapWithJson,
+  parseContextMap,
+  type ParsedMap,
+} from "./context-map.ts";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -81,31 +89,8 @@ interface StorageConfig {
 }
 
 // ── Security ─────────────────────────────────────────────────────────────────
-
-const SENSITIVE_PATTERNS: RegExp[] = [
-  /api[_-]?key\s*[:=]\s*["']?[a-zA-Z0-9\-]{16,}["']?/gi,
-  /bearer\s+[a-zA-Z0-9\-._~+/]{20,}=*/gi,
-  /cookie\s*:\s*[^\n]+/gi,
-  /password\s*[:=]\s*["']?[^\s"']+["']?/gi,
-  /private[_-]?key\s*[:=]\s*-----BEGIN/gi,
-  /-----BEGIN\s+(RSA\s+|EC\s+|OPENSSH\s+)?PRIVATE\s+KEY-----/gi,
-  /gh[pousr]_[a-zA-Z0-9]{36,}/g,
-  /glpat-[a-zA-Z0-9\-]{20,}/g,
-  /AKIA[0-9A-Z]{16}/g,
-  /(?:secret|token|credential)\s*[:=]\s*["']?[a-zA-Z0-9\-._]{16,}["']?/gi,
-  /eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*/g,
-  /(?:mongodb|postgres|mysql|redis):\/\/[^\s"']+:[^\s"']+@[^\s"']+/gi,
-  /(?:OPENAI_API_KEY|AWS_SECRET_ACCESS_KEY|AZURE_CLIENT_SECRET|GCP_KEY)\s*[:=]\s*["']?[^\s"']+["']?/gi,
-  /(?:sk-[a-zA-Z0-9]{20,})/g,
-];
-
-function filterSensitive(text: string): string {
-  let filtered = text;
-  for (const pattern of SENSITIVE_PATTERNS) {
-    filtered = filtered.replace(pattern, "[REDACTED]");
-  }
-  return filtered;
-}
+// SENSITIVE_PATTERNS and filterSensitive live in ./context-map.ts (shared with
+// the Node runtime and the test suites).
 
 // ── Command Execution ────────────────────────────────────────────────────────
 
@@ -287,6 +272,28 @@ function parseHandoffMd(content: string): Partial<HandoffContext> {
   }
 
   return result;
+}
+
+/**
+ * Read `.handoff/context-map.md`. Returns null when the map is absent, empty,
+ * or malformed (no recognizable semantic sections) so callers can fall back
+ * to the legacy context.json / HANDOFF.md path.
+ */
+async function loadContextMap(handoffDir: string): Promise<ParsedMap | null> {
+  const mapPath = join(handoffDir, MAP_FILENAME);
+
+  if (!await exists(mapPath)) {
+    return null;
+  }
+
+  try {
+    const content = await Deno.readTextFile(mapPath);
+    if (!content.trim()) return null;
+    const parsed = parseContextMap(content) as ParsedMap | null;
+    return contextMapHasContent(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 async function loadHandoffMd(handoffDir: string): Promise<string> {
@@ -555,17 +562,28 @@ async function load(mode: string): Promise<LoadResult> {
     };
   }
 
-  // Try loading context.json first
+  // The Context Map is the semantic source; context.json supplements it with
+  // machine state (git, timestamps, modified files). Absent/empty/malformed
+  // maps fall back to the legacy path unchanged.
+  const map = await loadContextMap(handoffDir);
   let ctx = await loadContextJson(handoffDir);
 
-  // Fallback: parse HANDOFF.md if context.json is missing/invalid
+  if (map) {
+    // Map semantics win; context.json (when present) supplies machine state
+    // and any semantic field the map leaves empty. Works for map-only,
+    // mixed-format, and (map absent) legacy handoffs.
+    ctx = mergeContextMapWithJson(map, ctx);
+  }
+
+  // Fallback: parse HANDOFF.md if the map is unusable and context.json is
+  // missing/invalid (legacy 1.x handoff).
   if (!ctx) {
-    console.error("Warning: context.json missing or invalid. Falling back to HANDOFF.md parsing.");
+    console.error("Warning: context-map.md and context.json missing or invalid. Falling back to HANDOFF.md parsing.");
 
     const handoffMd = await loadHandoffMd(handoffDir);
     if (!handoffMd) {
-      console.error("Error: Neither context.json nor HANDOFF.md found in .handoff/");
-      console.error("Run `/handoff save` to regenerate both files.");
+      console.error("Error: No readable context found in .handoff/ (checked context-map.md, context.json, HANDOFF.md)");
+      console.error("Run `/handoff save` to regenerate the handoff files.");
       return {
         understanding: "Handoff directory exists but contains no readable context.",
         nextActions: ["Run `/handoff save` to regenerate context"],

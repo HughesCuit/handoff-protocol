@@ -26,6 +26,16 @@
 import { parse } from "https://deno.land/std@0.224.0/flags/mod.ts";
 import { ensureDir, walk, exists } from "https://deno.land/std@0.224.0/fs/mod.ts";
 import { join, extname } from "https://deno.land/std@0.224.0/path/mod.ts";
+import {
+  filterSensitive,
+  HANDOFF_FILES,
+  PROTOCOL_VERSION,
+  CONTEXT_MAP_FILE,
+  buildInferredSections,
+  parseContextMap,
+  reconcileContextMap,
+  renderContextMap,
+} from "./context-map.ts";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -83,33 +93,8 @@ interface StorageConfig {
 }
 
 // ── Security ─────────────────────────────────────────────────────────────────
-
-const SENSITIVE_PATTERNS: RegExp[] = [
-  /api[_-]?key\s*[:=]\s*["']?[a-zA-Z0-9\-]{16,}["']?/gi,
-  /bearer\s+[a-zA-Z0-9\-._~+/]{20,}=*/gi,
-  /cookie\s*:\s*[^\n]+/gi,
-  /password\s*[:=]\s*["']?[^\s"']+["']?/gi,
-  /private[_-]?key\s*[:=]\s*-----BEGIN/gi,
-  /-----BEGIN\s+(RSA\s+|EC\s+|OPENSSH\s+)?PRIVATE\s+KEY-----[\s\S]*?-----END\s+(RSA\s+|EC\s+|OPENSSH\s+)?PRIVATE\s+KEY-----/g,
-  /gh[pousr]_[a-zA-Z0-9]{36,}/g,
-  /glpat-[a-zA-Z0-9\-]{20,}/g,
-  /AKIA[0-9A-Z]{16}/g,
-  /(?:secret|token|credential)\s*[:=]\s*["']?[a-zA-Z0-9\-._]{16,}["']?/gi,
-  /eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*/g,
-  /-----BEGIN\s+OPENSSH\s+PRIVATE\s+KEY-----/g,
-  /(?:mongodb|postgres|mysql|redis):\/\/[^\s"']+:[^\s"']+@[^\s"']+["']?/gi,
-  /(?:OPENAI_API_KEY|AWS_SECRET_ACCESS_KEY|AZURE_CLIENT_SECRET|GCP_KEY)\s*[:=]\s*["']?[^\s"']+["']?/gi,
-  /(?:xox[bpsa]-[a-zA-Z0-9-]+)/g,
-  /(?:sk-[a-zA-Z0-9]{20,})/g,
-];
-
-function filterSensitive(text: string): string {
-  let filtered = text;
-  for (const pattern of SENSITIVE_PATTERNS) {
-    filtered = filtered.replace(pattern, "[REDACTED]");
-  }
-  return filtered;
-}
+// SENSITIVE_PATTERNS and filterSensitive live in ./context-map.ts (shared with
+// the Node runtime and the test suites).
 
 // ── Command Execution ────────────────────────────────────────────────────────
 
@@ -229,9 +214,7 @@ async function ensureSubmoduleReady(cwd: string): Promise<boolean> {
 }
 
 async function commitAndPushSubmodule(handoffDir: string): Promise<boolean> {
-  const files = ["HANDOFF.md", "context.json", "tasks.md", "decisions.md"];
-
-  for (const file of files) {
+  for (const file of HANDOFF_FILES) {
     await run(["git", "add", file], { cwd: handoffDir });
   }
 
@@ -299,7 +282,7 @@ async function initStorage(cwd: string, mode?: string): Promise<StorageConfig | 
     await ensureDir(join(cwd, ".handoff"));
 
     const config: StorageConfig = {
-      version: "1.1.0",
+      version: PROTOCOL_VERSION,
       storage: { mode: "direct", path: ".handoff" },
     };
     await writeStorageConfig(cwd, config);
@@ -367,7 +350,7 @@ async function initStorage(cwd: string, mode?: string): Promise<StorageConfig | 
     }
 
     const config: StorageConfig = {
-      version: "1.1.0",
+      version: PROTOCOL_VERSION,
       storage: { mode: "submodule", path: ".handoff", remote: remoteUrl },
     };
     await writeStorageConfig(cwd, config);
@@ -782,7 +765,7 @@ async function save(mode: string, lang?: string, verbosity?: string): Promise<vo
   }
 
   const ctx: HandoffContext = {
-    version: "1.2.0",
+    version: PROTOCOL_VERSION,
     timestamp: new Date().toISOString(),
     agent: Deno.env.get("AGENT_NAME") || "opencode",
     project: name,
@@ -804,12 +787,28 @@ async function save(mode: string, lang?: string, verbosity?: string): Promise<vo
   const handoffMd = generateHandoffMarkdown(ctx);
   const contextJson = JSON.stringify(ctx, null, 2);
 
+  // Context Map: generated or reconciled on every save, at every mode and
+  // verbosity level. User-edited nodes always win over agent inference;
+  // agent-managed nodes are refreshed only by non-empty inference, so a
+  // low-verbosity save never degrades the map. The sensitive-data filter is
+  // applied before any map content is written.
+  const inferred = buildInferredSections(ctx);
+  const mapPath = join(handoffDir, CONTEXT_MAP_FILE);
+  let existingMap = null;
+  try {
+    existingMap = parseContextMap(await Deno.readTextFile(mapPath));
+  } catch {
+    // Absent or unreadable: start from a fresh map.
+  }
+  const contextMap = renderContextMap(reconcileContextMap(existingMap, inferred), { lang });
+
   const writeOps: Promise<void>[] = [
     Deno.writeTextFile(join(handoffDir, "HANDOFF.md"), filterSensitive(handoffMd)),
     Deno.writeTextFile(join(handoffDir, "context.json"), filterSensitive(contextJson)),
+    Deno.writeTextFile(mapPath, filterSensitive(contextMap)),
   ];
 
-  let fileSummary = "HANDOFF.md, context.json";
+  let fileSummary = "HANDOFF.md, context.json, context-map.md";
 
   if (verbosity !== "low") {
     const tasksMd = generateTasksMarkdown(ctx);
@@ -888,8 +887,8 @@ async function main() {
     return;
   }
 
-  // Handle save with mode
-  const mode = subcommand;
+  // Handle save with mode ("save" with no mode arg means the default mode)
+  const mode = subcommand === "save" ? "default" : subcommand;
   const validModes = ["default", "compact", "full", "diff"];
   if (!validModes.includes(mode)) {
     console.error(`Error: Unknown mode '${mode}'`);

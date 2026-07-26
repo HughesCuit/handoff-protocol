@@ -14,6 +14,8 @@ node scripts/node/load.mjs
 
 ## Default Mode Output
 
+Since v1.5, load reads `.handoff/context-map.md` first (goal, status, tasks, decisions, risks) and supplements it with machine state from `context.json` (git, timestamps, modified files). Map-only and mixed-format handoffs load successfully; legacy 1.x handoffs without a map use the original fallback unchanged.
+
 ```
 Current understanding:
 Project: my-api | Status: in-progress - 3 file(s) modified | Goal: feat: add rate limiting middleware | Completed: 3 items | Branch: feature/rate-limiting | Pending tasks: 3
@@ -84,7 +86,7 @@ Recommended next actions:
 
 ## Fallback: HANDOFF.md Parsing
 
-If `context.json` is missing or corrupted, the script falls back to parsing `HANDOFF.md`:
+If `context-map.md` and `context.json` are missing or corrupted, the script falls back to parsing `HANDOFF.md`:
 
 ```
 Warning: context.json missing or invalid. Falling back to HANDOFF.md parsing.
@@ -115,8 +117,8 @@ Recommended next actions:
 ### Empty .handoff/ directory
 
 ```
-Error: Neither context.json nor HANDOFF.md found in .handoff/
-Run `/handoff save` to regenerate both files.
+Error: No readable context found in .handoff/ (checked context-map.md, context.json, HANDOFF.md)
+Run `/handoff save` to regenerate the handoff files.
 
 Current understanding:
 Handoff directory exists but contains no readable context.

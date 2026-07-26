@@ -1,0 +1,36 @@
+{
+  "version": "1.2.0",
+  "timestamp": "2026-07-25T10:30:00.000Z",
+  "agent": "opencode",
+  "project": "my-api",
+  "current_goal": "feat: add rate limiting middleware",
+  "status": "in-progress - 3 file(s) modified",
+  "completed": [
+    "fix: resolve connection pool leak",
+    "feat: add health check endpoint",
+    "refactor: extract auth middleware"
+  ],
+  "modified_files": [
+    { "path": "src/middleware/rate-limiter.ts", "description": "", "change_type": "added" },
+    { "path": "src/middleware/rate-limiter.test.ts", "description": "", "change_type": "added" },
+    { "path": "src/app.ts", "description": "", "change_type": "modified" }
+  ],
+  "todos": [
+    { "task": "Add Redis backend for distributed rate limiting (src/middleware/rate-limiter.ts:45)", "priority": "high", "status": "pending" },
+    { "task": "Add sliding window algorithm (src/middleware/rate-limiter.ts:78)", "priority": "medium", "status": "pending" },
+    { "task": "Update API documentation (docs/api.md:12)", "priority": "medium", "status": "pending" }
+  ],
+  "blockers": [],
+  "decisions": [],
+  "next_steps": [],
+  "git": {
+    "branch": "feature/rate-limiting",
+    "latest_commit": "abc1234",
+    "commit_message": "feat: add rate limiting middleware",
+    "is_dirty": true
+  },
+  "risks": ["1 high-priority TODO/FIXME items pending"],
+  "notes": "abc1234 feat: add rate limiting middleware\ndef5678 fix: resolve connection pool leak",
+  "lang": "en",
+  "verbosity": "med"
+}

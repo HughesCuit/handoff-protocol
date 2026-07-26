@@ -1,0 +1,26 @@
+{
+  "version": "1.5.0",
+  "timestamp": "2026-07-25T10:30:00.000Z",
+  "agent": "opencode",
+  "project": "mixed-fixture",
+  "current_goal": "Legacy JSON goal",
+  "status": "legacy json status",
+  "completed": [],
+  "modified_files": [
+    { "path": "scripts/load.ts", "description": "", "change_type": "modified" }
+  ],
+  "todos": [],
+  "blockers": [],
+  "decisions": [],
+  "next_steps": [],
+  "git": {
+    "branch": "feature/map",
+    "latest_commit": "def5678",
+    "commit_message": "feat: add context map",
+    "is_dirty": true
+  },
+  "risks": [],
+  "notes": "",
+  "lang": "en",
+  "verbosity": "med"
+}

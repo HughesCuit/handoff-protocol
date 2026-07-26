@@ -28,33 +28,20 @@ import { execSync } from "node:child_process";
 import { mkdirSync, writeFileSync, readFileSync, readdirSync, statSync, existsSync } from "node:fs";
 import { join, extname, relative } from "node:path";
 import { createInterface } from "node:readline";
+import {
+  buildInferredSections,
+  filterSensitive,
+  HANDOFF_FILES,
+  MAP_FILENAME,
+  parseContextMap,
+  PROTOCOL_VERSION,
+  reconcileContextMap,
+  renderContextMap,
+} from "./context-map.mjs";
 
 // ── Security ─────────────────────────────────────────────────────────────────
-
-const SENSITIVE_PATTERNS = [
-  /api[_-]?key\s*[:=]\s*["']?[a-zA-Z0-9\-]{16,}["']?/gi,
-  /bearer\s+[a-zA-Z0-9\-._~+/]{20,}=*/gi,
-  /cookie\s*:\s*[^\n]+/gi,
-  /password\s*[:=]\s*["']?[^\s"']+["']?/gi,
-  /private[_-]?key\s*[:=]\s*-----BEGIN/gi,
-  /-----BEGIN\s+(RSA\s+|EC\s+|OPENSSH\s+)?PRIVATE\s+KEY-----[\s\S]*?-----END\s+(RSA\s+|EC\s+|OPENSSH\s+)?PRIVATE\s+KEY-----/g,
-  /gh[pousr]_[a-zA-Z0-9]{36,}/g,
-  /glpat-[a-zA-Z0-9\-]{20,}/g,
-  /AKIA[0-9A-Z]{16}/g,
-  /(?:secret|token|credential)\s*[:=]\s*["']?[a-zA-Z0-9\-._]{16,}["']?/gi,
-  /eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*/g,
-  /(?:mongodb|postgres|mysql|redis):\/\/[^\s"']+:[^\s"']+@[^\s"']+/gi,
-  /(?:OPENAI_API_KEY|AWS_SECRET_ACCESS_KEY|AZURE_CLIENT_SECRET|GCP_KEY)\s*[:=]\s*["']?[^\s"']+["']?/gi,
-  /(?:sk-[a-zA-Z0-9]{20,})/g,
-];
-
-function filterSensitive(text) {
-  let filtered = text;
-  for (const pattern of SENSITIVE_PATTERNS) {
-    filtered = filtered.replace(pattern, "[REDACTED]");
-  }
-  return filtered;
-}
+// SENSITIVE_PATTERNS and filterSensitive live in ./context-map.mjs (shared with
+// the Deno runtime and the test suites).
 
 // ── Command Execution ────────────────────────────────────────────────────────
 
@@ -121,8 +108,7 @@ function ensureSubmoduleReady(cwd) {
 }
 
 function commitAndPushSubmodule(handoffDir) {
-  const files = ["HANDOFF.md", "context.json", "tasks.md", "decisions.md"];
-  for (const file of files) {
+  for (const file of HANDOFF_FILES) {
     runCommand(`git add ${file}`, { cwd: handoffDir });
   }
 
@@ -184,7 +170,7 @@ async function initStorage(cwd, mode) {
     mkdirSync(join(cwd, ".handoff"), { recursive: true });
 
     const config = {
-      version: "1.2.0",
+      version: PROTOCOL_VERSION,
       storage: { mode: "direct", path: ".handoff" },
     };
     writeStorageConfig(cwd, config);
@@ -240,7 +226,7 @@ async function initStorage(cwd, mode) {
     }
 
     const config = {
-      version: "1.1.0",
+      version: PROTOCOL_VERSION,
       storage: { mode: "submodule", path: ".handoff", remote: remoteUrl },
     };
     writeStorageConfig(cwd, config);
@@ -365,7 +351,7 @@ async function save(mode, lang, verbosity) {
   const status = modifiedFiles.length === 0 ? "idle - no pending changes" : git.is_dirty ? `in-progress - ${modifiedFiles.length} file(s) modified` : "ready - changes committed";
 
   const ctx = {
-    version: "1.2.0", timestamp: new Date().toISOString(), agent: process.env.AGENT_NAME || "opencode",
+    version: PROTOCOL_VERSION, timestamp: new Date().toISOString(), agent: process.env.AGENT_NAME || "opencode",
     project: name, current_goal: inferredGoal, status, completed, modified_files: modifiedFiles,
     todos: todos.slice(0, maxTodos), blockers: [], decisions: [], next_steps: [], git, risks: [], notes: commits.join("\n"),
     lang: lang || language, verbosity,
@@ -375,8 +361,24 @@ async function save(mode, lang, verbosity) {
   const tasksMd = `# Pending Tasks\n\n## High Priority\n${todos.filter((t) => t.priority === "high").map((t) => `- [ ] ${t.task}`).join("\n") || "None"}\n\n## Medium Priority\n${todos.filter((t) => t.priority === "medium").map((t) => `- [ ] ${t.task}`).join("\n") || "None"}\n\n## Low Priority\n${todos.filter((t) => t.priority === "low").map((t) => `- [ ] ${t.task}`).join("\n") || "None"}\n`;
   const decisionsMd = "# Architecture Decisions\n\nNo decisions recorded.\n";
 
+  // Context Map: generated or reconciled on every save, at every mode and
+  // verbosity level. User-edited nodes always win over agent inference;
+  // agent-managed nodes are refreshed only by non-empty inference, so a
+  // low-verbosity save never degrades the map. The sensitive-data filter is
+  // applied before any map content is written.
+  const inferred = buildInferredSections(ctx);
+  const mapPath = join(handoffDir, MAP_FILENAME);
+  let existingMap = null;
+  try {
+    existingMap = parseContextMap(readFileSync(mapPath, "utf-8"));
+  } catch {
+    // Absent or unreadable: start from a fresh map.
+  }
+  const contextMap = renderContextMap(reconcileContextMap(existingMap, inferred), { lang: lang || undefined });
+
   writeFileSync(join(handoffDir, "HANDOFF.md"), filterSensitive(handoffMd));
   writeFileSync(join(handoffDir, "context.json"), filterSensitive(JSON.stringify(ctx, null, 2)));
+  writeFileSync(mapPath, filterSensitive(contextMap));
   if (verbosity !== "low") {
     writeFileSync(join(handoffDir, "tasks.md"), filterSensitive(tasksMd));
     writeFileSync(join(handoffDir, "decisions.md"), filterSensitive(decisionsMd));
@@ -396,7 +398,7 @@ async function save(mode, lang, verbosity) {
   console.log(`Language: ${lang || language}`);
   console.log(`Verbosity: ${verbosity}`);
   console.log(`Project: ${name} (${language})`);
-  const savedFiles = verbosity === "low" ? "HANDOFF.md, context.json" : "HANDOFF.md, context.json, tasks.md, decisions.md";
+  const savedFiles = verbosity === "low" ? "HANDOFF.md, context.json, context-map.md" : "HANDOFF.md, context.json, tasks.md, decisions.md, context-map.md";
   console.log(`Files: ${savedFiles}`);
   if (todos.length > 0) console.log(`Scanned: ${todos.length} TODO/FIXME items found`);
 }
@@ -429,7 +431,9 @@ if (arg === "init") {
     if (config.storage.remote) console.log(`  remote: ${config.storage.remote}`);
   }
 } else {
+  // "save" with no mode arg means the default mode
+  const mode = arg === "save" ? "default" : arg;
   const validModes = ["default", "compact", "full", "diff"];
-  if (!validModes.includes(arg)) { console.error(`Error: Unknown mode '${arg}'\nValid modes: ${validModes.join(", ")}`); process.exit(1); }
-  save(arg, lang, verbosity).catch((err) => { console.error(`Error: ${err.message}`); process.exit(1); });
+  if (!validModes.includes(mode)) { console.error(`Error: Unknown mode '${arg}'\nValid modes: ${validModes.join(", ")}`); process.exit(1); }
+  save(mode, lang, verbosity).catch((err) => { console.error(`Error: ${err.message}`); process.exit(1); });
 }
