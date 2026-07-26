@@ -21,6 +21,7 @@ import {
   filterSensitive,
 } from "../../scripts/context-map.mjs";
 import { extractTodoComments } from "../../scripts/source-comments.mjs";
+import { validateProjectConfig } from "../../scripts/config.mjs";
 
 // ── Minimal assertions (runtime-agnostic) ────────────────────────────────────
 
@@ -299,5 +300,107 @@ export function defineUnitTests(test, readFixture) {
     ]));
 
     assertEqual(extractTodoComments("// TODO: not a scanned extension", ".md").length, 0);
+  });
+
+  // ── Configuration validation (v1.5.1) ─────────────────────────────────────
+
+  test("config: valid portable direct and submodule fixtures pass validation", async () => {
+    for (const name of ["config/direct-valid.json", "config/submodule-valid.json"]) {
+      const config = JSON.parse(await readFixture(name));
+      const result = validateProjectConfig(config);
+      assert(result.valid, `${name} should be valid, errors: ${result.errors.join("; ")}`);
+      assertEqual(result.errors.length, 0, `${name} should have no errors`);
+      assertEqual(result.config, config, `${name} should echo the input config`);
+    }
+  });
+
+  test("config: submodule remote keeps existing URL behavior (exempt from path/secret rules)", () => {
+    for (const remote of [
+      "git@github.com:USER/PROJECT-handoff.git",
+      "https://github.com/USER/PROJECT-handoff.git",
+      "https://user:secret-token@example.com/USER/PROJECT-handoff.git",
+      "ssh://git@192.168.1.10/srv/handoff.git",
+    ]) {
+      const config = { version: "1.5.1", storage: { mode: "submodule", path: ".handoff", remote } };
+      const result = validateProjectConfig(config);
+      assert(result.valid, `remote '${remote}' should stay supported, errors: ${result.errors.join("; ")}`);
+    }
+  });
+
+  test("config: home paths, Vault paths, and credentials in fixtures are rejected", async () => {
+    const cases = [
+      ["config/home-path.json", "storage.path"],
+      ["config/vault-path.json", "adapters.obsidian.vaultPath"],
+      ["config/credentials.json", "token"],
+    ];
+    for (const [name, field] of cases) {
+      const config = JSON.parse(await readFixture(name));
+      const result = validateProjectConfig(config);
+      assert(!result.valid, `${name} should be invalid`);
+      assert(
+        result.errors.some((e) => e.includes(field)),
+        `${name} errors should name '${field}', got: ${JSON.stringify(result.errors)}`
+      );
+    }
+  });
+
+  test("config: malformed storage modes are rejected", async () => {
+    const fixture = JSON.parse(await readFixture("config/mode-invalid.json"));
+    const result = validateProjectConfig(fixture);
+    assert(!result.valid, "mode-invalid.json should be invalid");
+    assert(result.errors.some((e) => e.includes("storage.mode")), "error should name storage.mode");
+
+    for (const bad of [
+      ["missing storage", { version: "1.5.1" }],
+      ["non-object storage", { version: "1.5.1", storage: "direct" }],
+      ["missing mode", { version: "1.5.1", storage: { path: ".handoff" } }],
+      ["non-string mode", { version: "1.5.1", storage: { mode: 42, path: ".handoff" } }],
+      ["empty mode", { version: "1.5.1", storage: { mode: "", path: ".handoff" } }],
+      ["missing path", { version: "1.5.1", storage: { mode: "direct" } }],
+      ["non-string path", { version: "1.5.1", storage: { mode: "direct", path: 7 } }],
+      ["non-object config", "direct"],
+      ["null config", null],
+    ]) {
+      const [label, config] = bad;
+      const r = validateProjectConfig(config);
+      assert(!r.valid, `${label} should be invalid`);
+      assert(r.errors.length > 0, `${label} should report at least one error`);
+    }
+  });
+
+  test("config: absolute, home, and parent-traversal paths are rejected wherever they appear", () => {
+    const cases = [
+      ["posix absolute", { version: "1.5.1", storage: { mode: "direct", path: "/var/lib/handoff" } }],
+      ["macOS home absolute", { version: "1.5.1", storage: { mode: "direct", path: "/Users/alice/proj/.handoff" } }],
+      ["linux home absolute", { version: "1.5.1", storage: { mode: "direct", path: "/home/alice/.handoff" } }],
+      ["windows absolute", { version: "1.5.1", storage: { mode: "direct", path: "C:\\handoff" } }],
+      ["tilde home", { version: "1.5.1", storage: { mode: "direct", path: "~/handoff" } }],
+      ["env home", { version: "1.5.1", storage: { mode: "direct", path: "$HOME/handoff" } }],
+      ["parent traversal", { version: "1.5.1", storage: { mode: "direct", path: "../shared-handoff" } }],
+      ["nested absolute", { version: "1.5.1", storage: { mode: "direct", path: ".handoff" }, extra: { cacheDir: "/tmp/handoff-cache" } }],
+    ];
+    for (const [label, config] of cases) {
+      const r = validateProjectConfig(config);
+      assert(!r.valid, `${label} should be invalid`);
+    }
+  });
+
+  test("config: credential-like values are rejected outside storage.remote", () => {
+    const cases = [
+      ["github token", { version: "1.5.1", storage: { mode: "direct", path: ".handoff" }, auth: "ghp_0123456789abcdef0123456789abcdef0123" }],
+      ["aws key", { version: "1.5.1", storage: { mode: "direct", path: ".handoff" }, note: "AKIAIOSFODNN7EXAMPLE" }],
+      ["password field", { version: "1.5.1", storage: { mode: "direct", path: ".handoff" }, db: "password=hunter2" }],
+      ["nested secret", { version: "1.5.1", storage: { mode: "direct", path: ".handoff" }, adapters: { x: { credentials: "api_key=abcdef0123456789abcdef" } } }],
+    ];
+    for (const [label, config] of cases) {
+      const r = validateProjectConfig(config);
+      assert(!r.valid, `${label} should be invalid`);
+      assert(r.errors.some((e) => /sensitive|credential|secret/i.test(e)), `${label} error should mention sensitive data, got: ${JSON.stringify(r.errors)}`);
+    }
+  });
+
+  test("config: non-string version and non-string remote are rejected", () => {
+    assert(!validateProjectConfig({ version: 151, storage: { mode: "direct", path: ".handoff" } }).valid);
+    assert(!validateProjectConfig({ version: "1.5.1", storage: { mode: "submodule", path: ".handoff", remote: 42 } }).valid);
   });
 }

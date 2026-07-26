@@ -213,6 +213,49 @@ test("save: TODO scan only picks up comment tags and skips excluded directories"
   assertNotIncludes(tasks, "fixture dir must be excluded");
 });
 
+// ── Config validation integration ────────────────────────────────────────────
+
+async function writeInvalidConfig(dir, config) {
+  await writeFile(join(dir, ".handoff.config.json"), JSON.stringify(config, null, 2) + "\n");
+}
+
+test("save: rejects a non-portable .handoff.config.json before writing", async () => {
+  const dir = await initTempRepo();
+  await writeInvalidConfig(dir, { version: "1.5.1", storage: { mode: "direct", path: "/Users/alice/.handoff" } });
+  const res = spawnSync(process.execPath, [join(root, "scripts", "node", "save.mjs")], { cwd: dir, encoding: "utf-8" });
+  assertEqual(res.status, 1, `expected exit 1, got ${res.status}: ${res.stdout}${res.stderr}`);
+  assertIncludes(res.stderr, "invalid .handoff.config.json");
+  assertIncludes(res.stderr, "storage.path");
+  assert(!existsSync(join(dir, ".handoff", "HANDOFF.md")), "save wrote output despite invalid config");
+});
+
+test("save: rejects a malformed storage mode", async () => {
+  const dir = await initTempRepo();
+  await writeInvalidConfig(dir, { version: "1.5.1", storage: { mode: "network-drive", path: ".handoff" } });
+  const res = spawnSync(process.execPath, [join(root, "scripts", "node", "save.mjs")], { cwd: dir, encoding: "utf-8" });
+  assertEqual(res.status, 1, `expected exit 1, got ${res.status}: ${res.stdout}${res.stderr}`);
+  assertIncludes(res.stderr, "invalid .handoff.config.json");
+  assertIncludes(res.stderr, "storage.mode");
+});
+
+test("load: rejects a non-portable .handoff.config.json", async () => {
+  const dir = await initTempRepo();
+  await writeInvalidConfig(dir, { version: "1.5.1", storage: { mode: "direct", path: "~/handoff-data" } });
+  const res = spawnSync(process.execPath, [join(root, "scripts", "node", "load.mjs")], { cwd: dir, encoding: "utf-8" });
+  assertEqual(res.status, 1, `expected exit 1, got ${res.status}: ${res.stdout}${res.stderr}`);
+  assertIncludes(res.stderr, "invalid .handoff.config.json");
+  assertIncludes(res.stderr, "storage.path");
+});
+
+test("storage: reports an invalid configuration instead of displaying it", async () => {
+  const dir = await initTempRepo();
+  await writeInvalidConfig(dir, { version: "1.5.1", storage: { mode: "direct", path: ".handoff" }, token: "ghp_0123456789abcdef0123456789abcdef0123" });
+  const res = spawnSync(process.execPath, [join(root, "scripts", "node", "save.mjs"), "storage"], { cwd: dir, encoding: "utf-8" });
+  assertEqual(res.status, 1, `expected exit 1, got ${res.status}: ${res.stdout}${res.stderr}`);
+  assertIncludes(res.stderr, "invalid .handoff.config.json");
+  assertNotIncludes(res.stderr + res.stdout, "ghp_0123456789abcdef0123456789abcdef0123", "secret value was echoed back");
+});
+
 // ── Cross-runtime parity ─────────────────────────────────────────────────────
 
 function denoAvailable() {

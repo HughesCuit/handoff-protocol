@@ -4,7 +4,7 @@ description: Cross-agent context handoff protocol. Save and restore work context
 license: MIT
 metadata:
   author: handoff-protocol
-  version: "1.5.0"
+  version: "1.5.1"
 ---
 
 # Handoff Protocol Skill
@@ -187,12 +187,14 @@ Nothing sensitive is written to `.handoff/`, regardless of storage mode.
 
 ## Configuration File
 
-`.handoff.config.json` is stored in the project root.
+`.handoff.config.json` is stored in the project root. It is portable project configuration: since v1.5.1 it is validated before every `init`, `save`, and `load`, and validation rejects absolute paths, home-relative paths (`~`, `$HOME`, `%USERPROFILE%`), parent traversal (`..`), and credential-like values anywhere in the file. The only exception is `storage.remote`, where existing submodule remote URLs remain supported.
+
+A config that passes validation holds no machine-specific paths and no secrets, so it is safe — and recommended — to commit with the project. Never hand-write secrets, home paths, Vault paths, or machine-specific absolute paths into it.
 
 **direct mode:**
 ```json
 {
-  "version": "1.5.0",
+  "version": "1.5.1",
   "storage": {
     "mode": "direct",
     "path": ".handoff"
@@ -203,7 +205,7 @@ Nothing sensitive is written to `.handoff/`, regardless of storage mode.
 **submodule mode:**
 ```json
 {
-  "version": "1.5.0",
+  "version": "1.5.1",
   "storage": {
     "mode": "submodule",
     "path": ".handoff",

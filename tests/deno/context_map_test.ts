@@ -229,6 +229,57 @@ Deno.test("save: TODO scan only picks up comment tags and skips excluded directo
   assert(!tasks.includes("fixture dir must be excluded"), "tests/fixtures was scanned");
 });
 
+// ── Config validation integration ────────────────────────────────────────────
+
+Deno.test("save: rejects a non-portable .handoff.config.json before writing", async () => {
+  const dir = await initTempRepo();
+  await Deno.writeTextFile(
+    `${dir}/.handoff.config.json`,
+    JSON.stringify({ version: "1.5.1", storage: { mode: "direct", path: "/Users/alice/.handoff" } }, null, 2) + "\n"
+  );
+  const res = await runSave(dir);
+  assertEqual(res.code, 1, `expected exit 1, got ${res.code}: ${res.stdout}${res.stderr}`);
+  assertIncludes(res.stderr, "invalid .handoff.config.json");
+  assertIncludes(res.stderr, "storage.path");
+  assert(!(await pathExists(`${dir}/.handoff/HANDOFF.md`)), "save wrote output despite invalid config");
+});
+
+Deno.test("save: rejects a malformed storage mode", async () => {
+  const dir = await initTempRepo();
+  await Deno.writeTextFile(
+    `${dir}/.handoff.config.json`,
+    JSON.stringify({ version: "1.5.1", storage: { mode: "network-drive", path: ".handoff" } }, null, 2) + "\n"
+  );
+  const res = await runSave(dir);
+  assertEqual(res.code, 1, `expected exit 1, got ${res.code}: ${res.stdout}${res.stderr}`);
+  assertIncludes(res.stderr, "invalid .handoff.config.json");
+  assertIncludes(res.stderr, "storage.mode");
+});
+
+Deno.test("load: rejects a non-portable .handoff.config.json", async () => {
+  const dir = await initTempRepo();
+  await Deno.writeTextFile(
+    `${dir}/.handoff.config.json`,
+    JSON.stringify({ version: "1.5.1", storage: { mode: "direct", path: "~/handoff-data" } }, null, 2) + "\n"
+  );
+  const res = await runLoad(dir);
+  assertEqual(res.code, 1, `expected exit 1, got ${res.code}: ${res.stdout}${res.stderr}`);
+  assertIncludes(res.stderr, "invalid .handoff.config.json");
+  assertIncludes(res.stderr, "storage.path");
+});
+
+Deno.test("storage: reports an invalid configuration instead of displaying it", async () => {
+  const dir = await initTempRepo();
+  await Deno.writeTextFile(
+    `${dir}/.handoff.config.json`,
+    JSON.stringify({ version: "1.5.1", storage: { mode: "direct", path: ".handoff" }, token: "ghp_0123456789abcdef0123456789abcdef0123" }, null, 2) + "\n"
+  );
+  const res = await runSave(dir, ["storage"]);
+  assertEqual(res.code, 1, `expected exit 1, got ${res.code}: ${res.stdout}${res.stderr}`);
+  assertIncludes(res.stderr, "invalid .handoff.config.json");
+  assert(!(res.stderr + res.stdout).includes("ghp_0123456789abcdef0123456789abcdef0123"), "secret value was echoed back");
+});
+
 // ── Cross-runtime parity ─────────────────────────────────────────────────────
 
 async function nodeAvailable() {

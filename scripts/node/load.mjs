@@ -22,6 +22,7 @@ import {
   mergeContextMapWithJson,
   parseContextMap,
 } from "./context-map.mjs";
+import { validateProjectConfig } from "../config.mjs";
 
 // ── Security ─────────────────────────────────────────────────────────────────
 // SENSITIVE_PATTERNS and filterSensitive live in ./context-map.mjs (shared with
@@ -126,6 +127,17 @@ function load(mode) {
   const cwd = process.cwd();
   const handoffDir = join(cwd, ".handoff");
   const storageConfig = readStorageConfig(cwd);
+  if (storageConfig) {
+    // .handoff.config.json is portable project configuration; refuse to load
+    // from a config that carries non-portable paths or sensitive values.
+    const result = validateProjectConfig(storageConfig);
+    if (!result.valid) {
+      console.error("Error: invalid .handoff.config.json:");
+      for (const err of result.errors) console.error(`  - ${err}`);
+      console.error("Fix the file, or remove it and run `/handoff init` to reconfigure storage.");
+      process.exit(1);
+    }
+  }
   const storageMode = storageConfig?.storage.mode || "direct";
 
   if (storageMode === "submodule" && !ensureSubmoduleReady(cwd)) {

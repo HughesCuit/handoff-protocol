@@ -91,6 +91,16 @@ Before saving, the script must:
 
 Read `.handoff.config.json` from project root.
 
+**If found:** validate it before doing anything else (v1.5.1). The file is portable project configuration: `storage.mode` must be `direct` or `submodule`, `storage.path` must be a non-empty relative path, and no value outside `storage.remote` may be an absolute path, a home-relative path (`~`, `$HOME`, `%USERPROFILE%`), a parent-traversal path (`..`), or a credential-like value. If validation fails, report each error and stop:
+
+```
+Error: invalid .handoff.config.json:
+  - storage.path: absolute paths are not portable; keep .handoff.config.json machine-independent
+Fix the file, or remove it and run `/handoff init` to reconfigure storage.
+```
+
+A config that passes validation is safe and recommended to commit with the project.
+
 **If not found:**
 
 ```
@@ -317,7 +327,7 @@ Structure varies by `--verbosity`:
 
 ```json
 {
-  "version": "1.5.0",
+  "version": "1.5.1",
   "timestamp": "ISO-8601",
   "agent": "opencode",
   "project": "project-name",
@@ -455,6 +465,7 @@ Rule: `--verbosity` sets the detail floor. `mode` adds behavior on top.
 | Condition | Behavior |
 |-----------|----------|
 | No `.handoff.config.json` | Trigger init flow |
+| Invalid `.handoff.config.json` | Report each validation error and stop |
 | No `.handoff/` directory | Create it |
 | Submodule not initialized | Run `git submodule update --init` |
 | Submodule access denied | Clear error about SSH/credential access |

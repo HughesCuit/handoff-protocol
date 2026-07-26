@@ -41,6 +41,7 @@ import {
   SCAN_EXCLUDED_DIRS,
   SOURCE_EXTENSIONS,
 } from "./source-comments.mjs";
+import { validateProjectConfig } from "./config.mjs";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -145,6 +146,19 @@ async function readStorageConfig(cwd: string): Promise<StorageConfig | null> {
 async function writeStorageConfig(cwd: string, config: StorageConfig): Promise<void> {
   const configPath = join(cwd, ".handoff.config.json");
   await Deno.writeTextFile(configPath, JSON.stringify(config, null, 2) + "\n");
+}
+
+// Every operation that reads or writes .handoff.config.json goes through the
+// shared validator: the file is portable project configuration, so absolute
+// paths, home paths, Vault paths, and credential-like values are rejected
+// (storage.remote submodule URLs excepted).
+function validateConfigOrExit(config: StorageConfig): StorageConfig {
+  const result = validateProjectConfig(config);
+  if (result.valid) return config;
+  console.error("Error: invalid .handoff.config.json:");
+  for (const err of result.errors) console.error(`  - ${err}`);
+  console.error("Fix the file, or remove it and run `/handoff init` to reconfigure storage.");
+  Deno.exit(1);
 }
 
 async function isGitRepo(cwd: string): Promise<boolean> {
@@ -290,6 +304,7 @@ async function initStorage(cwd: string, mode?: string): Promise<StorageConfig | 
       version: PROTOCOL_VERSION,
       storage: { mode: "direct", path: ".handoff" },
     };
+    validateConfigOrExit(config);
     await writeStorageConfig(cwd, config);
 
     // Check if public repo and warn
@@ -358,6 +373,7 @@ async function initStorage(cwd: string, mode?: string): Promise<StorageConfig | 
       version: PROTOCOL_VERSION,
       storage: { mode: "submodule", path: ".handoff", remote: remoteUrl },
     };
+    validateConfigOrExit(config);
     await writeStorageConfig(cwd, config);
 
     console.log(`Initialized submodule storage mode.`);
@@ -726,6 +742,8 @@ async function save(mode: string, lang?: string, verbosity?: string): Promise<vo
       console.error("Error: Storage initialization failed. Cannot save.");
       Deno.exit(1);
     }
+  } else {
+    validateConfigOrExit(storageConfig);
   }
 
   const storageMode = storageConfig.storage.mode;
@@ -875,6 +893,7 @@ async function main() {
       console.log("Run `/handoff init` to set up storage.");
       return;
     }
+    validateConfigOrExit(config);
     console.log("Handoff storage:");
     console.log(`  mode: ${config.storage.mode}`);
     console.log(`  path: ${config.storage.path}`);

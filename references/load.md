@@ -24,6 +24,8 @@ Before loading, the script must:
 
 Read `.handoff.config.json` from project root.
 
+**If found:** validate it before loading (v1.5.1). The file is portable project configuration: absolute paths, home-relative paths, parent traversal, and credential-like values are rejected everywhere except `storage.remote` (existing submodule URLs stay supported). If validation fails, report each error and stop instead of loading.
+
 **If not found:** Fall back to direct mode behavior (assume `.handoff/` is a local directory).
 
 ### 2. Validate Storage Mode
@@ -236,6 +238,7 @@ Updated actions:
 | Condition | Behavior |
 |-----------|----------|
 | No `.handoff.config.json` | Fall back to direct mode |
+| Invalid `.handoff.config.json` | Report each validation error and stop |
 | No `.handoff/` | "No handoff context found" |
 | Submodule not initialized | Run `git submodule update --init` |
 | Submodule access denied | Clear error about SSH/credential access |

@@ -43,6 +43,7 @@ import {
   SCAN_EXCLUDED_DIRS,
   SOURCE_EXTENSIONS,
 } from "../source-comments.mjs";
+import { validateProjectConfig } from "../config.mjs";
 
 // ── Security ─────────────────────────────────────────────────────────────────
 // SENSITIVE_PATTERNS and filterSensitive live in ./context-map.mjs (shared with
@@ -74,6 +75,19 @@ function readStorageConfig(cwd) {
 
 function writeStorageConfig(cwd, config) {
   writeFileSync(join(cwd, ".handoff.config.json"), JSON.stringify(config, null, 2) + "\n");
+}
+
+// Every operation that reads or writes .handoff.config.json goes through the
+// shared validator: the file is portable project configuration, so absolute
+// paths, home paths, Vault paths, and credential-like values are rejected
+// (storage.remote submodule URLs excepted).
+function validateConfigOrExit(config) {
+  const result = validateProjectConfig(config);
+  if (result.valid) return result.config;
+  console.error("Error: invalid .handoff.config.json:");
+  for (const err of result.errors) console.error(`  - ${err}`);
+  console.error("Fix the file, or remove it and run `/handoff init` to reconfigure storage.");
+  process.exit(1);
 }
 
 function isSubmoduleInitialized(cwd) {
@@ -178,6 +192,7 @@ async function initStorage(cwd, mode) {
       version: PROTOCOL_VERSION,
       storage: { mode: "direct", path: ".handoff" },
     };
+    validateConfigOrExit(config);
     writeStorageConfig(cwd, config);
 
     if (hasRemote(cwd)) {
@@ -234,6 +249,7 @@ async function initStorage(cwd, mode) {
       version: PROTOCOL_VERSION,
       storage: { mode: "submodule", path: ".handoff", remote: remoteUrl },
     };
+    validateConfigOrExit(config);
     writeStorageConfig(cwd, config);
 
     console.log(`Initialized submodule storage mode.`);
@@ -305,6 +321,8 @@ async function save(mode, lang, verbosity) {
   if (!storageConfig) {
     storageConfig = await initStorage(cwd);
     if (!storageConfig) { console.error("Error: Storage initialization failed."); process.exit(1); }
+  } else {
+    validateConfigOrExit(storageConfig);
   }
 
   const storageMode = storageConfig.storage.mode;
@@ -415,6 +433,7 @@ if (arg === "init") {
   const config = readStorageConfig(process.cwd());
   if (!config) { console.log("Handoff storage is not configured.\nRun `/handoff init` to set up storage."); }
   else {
+    validateConfigOrExit(config);
     console.log("Handoff storage:");
     console.log(`  mode: ${config.storage.mode}`);
     console.log(`  path: ${config.storage.path}`);

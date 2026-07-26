@@ -58,7 +58,7 @@ Stores `.handoff/` directly in the current project directory.
 **Config (`.handoff.config.json`):**
 ```json
 {
-  "version": "1.5.0",
+  "version": "1.5.1",
   "storage": {
     "mode": "direct",
     "path": ".handoff"
@@ -90,7 +90,7 @@ Submodule mode keeps this data in a separate private repository while maintainin
 **Config (`.handoff.config.json`):**
 ```json
 {
-  "version": "1.5.0",
+  "version": "1.5.1",
   "storage": {
     "mode": "submodule",
     "path": ".handoff",
@@ -98,6 +98,18 @@ Submodule mode keeps this data in a separate private repository while maintainin
   }
 }
 ```
+
+### Configuration Validation
+
+Since v1.5.1, `.handoff.config.json` is validated before every `init`, `save`, and `load`. The file is **portable project configuration**, so validation rejects:
+
+- Absolute paths (`/Users/...`, `C:\...`)
+- Home-relative paths (`~/...`, `$HOME/...`, `%USERPROFILE%\...`) and parent traversal (`../...`)
+- Credential-like values (tokens, keys, passwords) anywhere in the file
+
+The only exception is `storage.remote`, where existing submodule remote URLs (SSH or HTTPS) remain supported.
+
+A config that passes validation contains no machine-specific paths and no secrets, so it is **safe and recommended to commit** alongside your project. If validation fails, fix the file or remove it and run `/handoff init` to reconfigure storage.
 
 ## Installation
 

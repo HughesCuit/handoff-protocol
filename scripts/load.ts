@@ -25,6 +25,7 @@ import {
   parseContextMap,
   type ParsedMap,
 } from "./context-map.ts";
+import { validateProjectConfig } from "./config.mjs";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -525,6 +526,17 @@ async function load(mode: string): Promise<LoadResult> {
 
   // Read storage config
   const storageConfig = await readStorageConfig(cwd);
+  if (storageConfig) {
+    // .handoff.config.json is portable project configuration; refuse to load
+    // from a config that carries non-portable paths or sensitive values.
+    const result = validateProjectConfig(storageConfig);
+    if (!result.valid) {
+      console.error("Error: invalid .handoff.config.json:");
+      for (const err of result.errors) console.error(`  - ${err}`);
+      console.error("Fix the file, or remove it and run `/handoff init` to reconfigure storage.");
+      Deno.exit(1);
+    }
+  }
   const storageMode = storageConfig?.storage.mode || "direct";
 
   // Handle submodule mode

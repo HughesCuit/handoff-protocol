@@ -1,0 +1,12 @@
+{
+  "version": "1.5.1",
+  "storage": {
+    "mode": "direct",
+    "path": ".handoff"
+  },
+  "adapters": {
+    "obsidian": {
+      "vaultPath": "/Users/alice/Documents/Obsidian Vault"
+    }
+  }
+}
