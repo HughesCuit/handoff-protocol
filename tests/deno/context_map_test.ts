@@ -16,6 +16,7 @@ import {
   assertIncludes,
 } from "../shared/unit-suite.mjs";
 import { parseContextMap, SECTION_LABELS, SECTION_KEYS } from "../../scripts/context-map.mjs";
+import { GENERATED_MARKER, sha256Hex } from "../../scripts/views.mjs";
 
 const fixturesDir = new URL("../fixtures/", import.meta.url);
 const root = new URL("../../", import.meta.url);
@@ -144,6 +145,10 @@ Deno.test("save: low verbosity still writes the context map (and skips legacy ta
   const map = await Deno.readTextFile(mapPath);
   assertIncludes(map, "## Current Goal");
   assertIncludes(map, "## Excluded");
+  assert(
+    (await Deno.readTextFile(`${dir}/.handoff/HANDOFF.md`)).startsWith(GENERATED_MARKER),
+    "low verbosity HANDOFF.md is not a marked generated view"
+  );
   assert(!(await pathExists(`${dir}/.handoff/tasks.md`)), "low verbosity should skip tasks.md");
   assert(!(await pathExists(`${dir}/.handoff/decisions.md`)), "low verbosity should skip decisions.md");
 });
@@ -164,6 +169,14 @@ for (const [label, args] of [
     assert(parsed, `${label} wrote an unreadable context map`);
     for (const key of SECTION_KEYS) {
       assert(Array.isArray(parsed.sections[key]), `${label} omitted section '${key}'`);
+    }
+    // Compatibility views are still produced at every mode/verbosity.
+    for (const name of ["HANDOFF.md", "tasks.md", "decisions.md"]) {
+      assert(await pathExists(`${dir}/.handoff/${name}`), `${label} did not write ${name}`);
+      assert(
+        (await Deno.readTextFile(`${dir}/.handoff/${name}`)).startsWith(GENERATED_MARKER),
+        `${label} wrote ${name} without the generated marker`
+      );
     }
   });
 }
@@ -221,12 +234,79 @@ Deno.test("save: TODO scan only picks up comment tags and skips excluded directo
 
   const res = await runSave(dir);
   assertEqual(res.code, 0, res.stderr);
-  const ctx = JSON.parse(await Deno.readTextFile(`${dir}/.handoff/context.json`));
-  const tasks = ctx.todos.map((t) => t.task).join("\n");
-  assertIncludes(tasks, "wire up the real scanner (src/app.ts:1)");
-  assert(!tasks.includes("string false positive"), "string contents were scanned");
-  assert(!tasks.includes("template false positive"), "template literal contents were scanned");
-  assert(!tasks.includes("fixture dir must be excluded"), "tests/fixtures was scanned");
+  const tasksMd = await Deno.readTextFile(`${dir}/.handoff/tasks.md`);
+  assertIncludes(tasksMd, "wire up the real scanner (src/app.ts:1)");
+  assert(!tasksMd.includes("string false positive"), "string contents were scanned");
+  assert(!tasksMd.includes("template false positive"), "template literal contents were scanned");
+  assert(!tasksMd.includes("fixture dir must be excluded"), "tests/fixtures was scanned");
+});
+
+// ── Canonical state and generated views (v2) ────────────────────────────────
+
+const SEMANTIC_JSON_FIELDS = [
+  "current_goal", "status", "completed", "modified_files", "todos",
+  "blockers", "decisions", "next_steps", "risks", "notes",
+];
+
+Deno.test("save: v2 context.json drops semantic fields and stores SHA-256 view hashes", async () => {
+  const dir = await initTempRepo();
+  const res = await runSave(dir);
+  assertEqual(res.code, 0, res.stderr);
+
+  const json = JSON.parse(await Deno.readTextFile(`${dir}/.handoff/context.json`));
+  for (const field of SEMANTIC_JSON_FIELDS) {
+    assert(!(field in json), `semantic field '${field}' must not appear in v2 context.json`);
+  }
+  assert(json.project && json.timestamp && json.agent && json.git, "metadata missing from context.json");
+  assertEqual(JSON.stringify(json.diagnostics), JSON.stringify({ migration: [], conflicts: [] }));
+
+  for (const name of ["HANDOFF.md", "tasks.md", "decisions.md"]) {
+    const content = await Deno.readTextFile(`${dir}/.handoff/${name}`);
+    assert(content.startsWith(GENERATED_MARKER), `${name} does not begin with the generated marker`);
+    assertEqual(json.views[name], sha256Hex(content), `stored hash does not match written ${name}`);
+  }
+});
+
+Deno.test("save: manual view edits warn and are never imported into the map", async () => {
+  const dir = await initTempRepo();
+  let res = await runSave(dir);
+  assertEqual(res.code, 0, res.stderr);
+  await Deno.writeTextFile(`${dir}/.handoff/HANDOFF.md`, "manual vandalism\n");
+
+  res = await runSave(dir);
+  assertEqual(res.code, 0, `save failed: ${res.stderr}`);
+  assertIncludes(res.stderr, "HANDOFF.md");
+
+  const view = await Deno.readTextFile(`${dir}/.handoff/HANDOFF.md`);
+  assert(!view.includes("manual vandalism"), "manual edit survived regeneration");
+  const map = await Deno.readTextFile(`${dir}/.handoff/context-map.md`);
+  assert(!map.includes("manual vandalism"), "manual view edit was imported into the map");
+});
+
+Deno.test("load: warns when a generated view was manually edited, semantics still come from the map", async () => {
+  const dir = await initTempRepo();
+  const saveRes = await runSave(dir);
+  assertEqual(saveRes.code, 0, saveRes.stderr);
+  const tasksPath = `${dir}/.handoff/tasks.md`;
+  await Deno.writeTextFile(tasksPath, (await Deno.readTextFile(tasksPath)) + "\n- [ ] manual injected task\n");
+
+  const res = await runLoad(dir);
+  assertEqual(res.code, 0, `load failed: ${res.stderr}`);
+  assertIncludes(res.stderr, "tasks.md");
+  assertIncludes(res.stdout, "Current understanding:");
+  assert(!res.stdout.includes("manual injected task"), "manual view edit leaked into load output");
+});
+
+Deno.test("load: v2 handoff with a missing map falls back to the HANDOFF.md view", async () => {
+  const dir = await initTempRepo();
+  const saveRes = await runSave(dir);
+  assertEqual(saveRes.code, 0, saveRes.stderr);
+  await Deno.remove(`${dir}/.handoff/context-map.md`);
+
+  const res = await runLoad(dir);
+  assertEqual(res.code, 0, `load failed: ${res.stderr}`);
+  assertIncludes(res.stdout, "Current understanding:");
+  assertIncludes(res.stdout, "Project: fixture-app");
 });
 
 // ── Config validation integration ────────────────────────────────────────────

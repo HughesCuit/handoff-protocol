@@ -25,6 +25,7 @@ import {
   parseContextMap,
   type ParsedMap,
 } from "./context-map.ts";
+import { viewTamperWarnings } from "./views.mjs";
 import { validateProjectConfig } from "./config.mjs";
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -580,11 +581,33 @@ async function load(mode: string): Promise<LoadResult> {
   const map = await loadContextMap(handoffDir);
   let ctx = await loadContextJson(handoffDir);
 
+  // Generated views are never a semantic source. Warn when an on-disk view
+  // no longer matches the hash stored by the last save (manual edit); the
+  // map stays authoritative regardless.
+  if (ctx && (ctx as { views?: Record<string, string> }).views) {
+    const storedViews = (ctx as { views: Record<string, string> }).views;
+    const currentContents: Record<string, string> = {};
+    for (const name of Object.keys(storedViews)) {
+      try {
+        currentContents[name] = await Deno.readTextFile(join(handoffDir, name));
+      } catch {
+        // Missing views are regenerated on the next save.
+      }
+    }
+    for (const warning of viewTamperWarnings(storedViews, currentContents)) {
+      console.error(warning);
+    }
+  }
+
   if (map) {
     // Map semantics win; context.json (when present) supplies machine state
     // and any semantic field the map leaves empty. Works for map-only,
     // mixed-format, and (map absent) legacy handoffs.
     ctx = mergeContextMapWithJson(map, ctx);
+  } else if (ctx && !Array.isArray(ctx.todos)) {
+    // v2 context.json carries no semantic fields; without a readable map it
+    // cannot stand alone — fall through to the HANDOFF.md view.
+    ctx = null;
   }
 
   // Fallback: parse HANDOFF.md if the map is unusable and context.json is

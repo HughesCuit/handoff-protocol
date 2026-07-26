@@ -22,6 +22,7 @@ import {
   mergeContextMapWithJson,
   parseContextMap,
 } from "./context-map.mjs";
+import { viewTamperWarnings } from "../views.mjs";
 import { validateProjectConfig } from "../config.mjs";
 
 // ── Security ─────────────────────────────────────────────────────────────────
@@ -154,11 +155,32 @@ function load(mode) {
   const map = loadContextMap(handoffDir);
   let ctx = loadContextJson(handoffDir);
 
+  // Generated views are never a semantic source. Warn when an on-disk view
+  // no longer matches the hash stored by the last save (manual edit); the
+  // map stays authoritative regardless.
+  if (ctx && ctx.views) {
+    const currentContents = {};
+    for (const name of Object.keys(ctx.views)) {
+      try {
+        currentContents[name] = readFileSync(join(handoffDir, name), "utf-8");
+      } catch {
+        // Missing views are regenerated on the next save.
+      }
+    }
+    for (const warning of viewTamperWarnings(ctx.views, currentContents)) {
+      console.error(warning);
+    }
+  }
+
   if (map) {
     // Map semantics win; context.json (when present) supplies machine state
     // and any semantic field the map leaves empty. Works for map-only,
     // mixed-format, and (map absent) legacy handoffs.
     ctx = mergeContextMapWithJson(map, ctx);
+  } else if (ctx && !Array.isArray(ctx.todos)) {
+    // v2 context.json carries no semantic fields; without a readable map it
+    // cannot stand alone — fall through to the HANDOFF.md view.
+    ctx = null;
   }
 
   // Fallback: parse HANDOFF.md if the map is unusable and context.json is

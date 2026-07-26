@@ -9,6 +9,7 @@
 
 import {
   AGENT_MARKER,
+  PROTOCOL_VERSION,
   SECTION_KEYS,
   SECTION_LABELS,
   sectionKeyForLabel,
@@ -20,6 +21,13 @@ import {
   contextMapHasContent,
   filterSensitive,
 } from "../../scripts/context-map.mjs";
+import {
+  GENERATED_MARKER,
+  buildContextJson,
+  generateViews,
+  sha256Hex,
+  viewTamperWarnings,
+} from "../../scripts/views.mjs";
 import { extractTodoComments } from "../../scripts/source-comments.mjs";
 import { validateProjectConfig } from "../../scripts/config.mjs";
 
@@ -402,5 +410,119 @@ export function defineUnitTests(test, readFixture) {
   test("config: non-string version and non-string remote are rejected", () => {
     assert(!validateProjectConfig({ version: 151, storage: { mode: "direct", path: ".handoff" } }).valid);
     assert(!validateProjectConfig({ version: "1.5.1", storage: { mode: "submodule", path: ".handoff", remote: 42 } }).valid);
+  });
+
+  // ── Canonical state and generated views (v2) ──────────────────────────────
+
+  const VIEW_METADATA = {
+    timestamp: "2026-07-26T00:00:00.000Z",
+    agent: "test-agent",
+    project: "fixture-app",
+    lang: "en",
+    verbosity: "med",
+    git: { branch: "feature/map", latest_commit: "abc1234", commit_message: "feat: map", is_dirty: false },
+    completed: ["feat: initial commit"],
+    modifiedFiles: [{ path: "src/app.ts", description: "", change_type: "modified" }],
+    blockers: [],
+    nextSteps: [],
+  };
+
+  const SEMANTIC_JSON_FIELDS = [
+    "current_goal", "status", "completed", "modified_files", "todos",
+    "blockers", "decisions", "next_steps", "risks", "notes",
+  ];
+
+  test("views: sha256Hex matches published SHA-256 vectors", () => {
+    assertEqual(sha256Hex(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    assertEqual(sha256Hex("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    // Multi-byte input must be UTF-8 encoded before hashing.
+    assertEqual(sha256Hex("héllo 你好"), "7b76b0849c2e9a6a397ec9fe88fcd5489626b2b3a1dc47c47958bbe59da04390");
+  });
+
+  test("views: compatibility views are reproducibly generated from the same map", async () => {
+    const map = parseContextMap(await readFixture("maps/full-en.md"));
+    const first = generateViews(map, VIEW_METADATA);
+    const second = generateViews(map, VIEW_METADATA);
+
+    assertEqual(
+      JSON.stringify(Object.keys(first).sort()),
+      JSON.stringify(["HANDOFF.md", "decisions.md", "tasks.md"]),
+      "default verbosity must generate all three compatibility views"
+    );
+    for (const name of Object.keys(first)) {
+      assertEqual(second[name], first[name], `${name} was not deterministic across calls`);
+      assert(first[name].startsWith(GENERATED_MARKER), `${name} does not begin with the generated marker`);
+    }
+
+    // Semantics come from the map; machine state comes from metadata.
+    assertIncludes(first["HANDOFF.md"], "Ship the v1.5 context map release");
+    assertIncludes(first["HANDOFF.md"], "Implementation in progress, tests passing");
+    assertIncludes(first["HANDOFF.md"], "**Branch**: feature/map");
+    assertIncludes(first["HANDOFF.md"], "- `src/app.ts` [modified]");
+    assertIncludes(first["HANDOFF.md"], "- Map growth may bloat load context");
+    assertIncludes(first["tasks.md"], "# Pending Tasks");
+    assertIncludes(first["decisions.md"], "# Architecture Decisions");
+    assertIncludes(first["decisions.md"], "Shared ESM module keeps Deno and Node behavior identical");
+  });
+
+  test("views: task state and priorities flow from the map into the task view", async () => {
+    const map = parseContextMap(await readFixture("maps/full-en.md"));
+    const views = generateViews(map, VIEW_METADATA);
+    const tasksMd = views["tasks.md"];
+
+    const high = tasksMd.match(/## High Priority\n([\s\S]*?)\n\n## Medium/)[1];
+    const medium = tasksMd.match(/## Medium Priority\n([\s\S]*?)\n\n## Low/)[1];
+    assertIncludes(high, "- [ ] Add fixture-based tests for both runtimes");
+    assertNotIncludes(high, "Design context map format");
+    // Checked state and default (medium) priority come from the map.
+    assertIncludes(medium, "- [x] Design context map format");
+    assertIncludes(medium, "- [ ] Write the migration guide");
+  });
+
+  test("views: low verbosity generates only the HANDOFF.md view", async () => {
+    const map = parseContextMap(await readFixture("maps/full-en.md"));
+    const views = generateViews(map, VIEW_METADATA, { verbosity: "low" });
+    assertEqual(JSON.stringify(Object.keys(views)), JSON.stringify(["HANDOFF.md"]));
+    assert(views["HANDOFF.md"].startsWith(GENERATED_MARKER));
+  });
+
+  test("views: empty map sections produce documented placeholder content", () => {
+    const views = generateViews(null, VIEW_METADATA);
+    assertIncludes(views["HANDOFF.md"], "No explicit goal set.");
+    assertIncludes(views["HANDOFF.md"], "No pending tasks.");
+    assertIncludes(views["decisions.md"], "No decisions recorded.");
+    assertIncludes(views["tasks.md"], "None");
+  });
+
+  test("views: v2 context.json carries only metadata, view hashes, and diagnostics", () => {
+    const json = buildContextJson(VIEW_METADATA, { "HANDOFF.md": "deadbeef" });
+    for (const field of SEMANTIC_JSON_FIELDS) {
+      assert(!(field in json), `semantic field '${field}' must not appear in v2 context.json`);
+    }
+    assertEqual(json.version, PROTOCOL_VERSION);
+    assertEqual(json.timestamp, VIEW_METADATA.timestamp);
+    assertEqual(json.agent, "test-agent");
+    assertEqual(json.project, "fixture-app");
+    assertEqual(json.lang, "en");
+    assertEqual(json.git.branch, "feature/map");
+    assertEqual(json.views["HANDOFF.md"], "deadbeef");
+    assertEqual(JSON.stringify(json.diagnostics), JSON.stringify({ migration: [], conflicts: [] }));
+  });
+
+  test("views: tamper warnings fire on manual edits, never on matching or missing views", () => {
+    const stored = { "HANDOFF.md": sha256Hex("original"), "tasks.md": sha256Hex("tasks") };
+
+    // Untouched views: no warnings.
+    assertEqual(viewTamperWarnings(stored, { "HANDOFF.md": "original", "tasks.md": "tasks" }).length, 0);
+
+    // Manually edited view: exactly one warning naming the file.
+    const warnings = viewTamperWarnings(stored, { "HANDOFF.md": "manually edited", "tasks.md": "tasks" });
+    assertEqual(warnings.length, 1);
+    assertIncludes(warnings[0], "HANDOFF.md");
+    assertIncludes(warnings[0], "context-map.md");
+
+    // Missing views are regenerated silently; only mismatches warn.
+    assertEqual(viewTamperWarnings(stored, { "tasks.md": "tasks" }).length, 0);
+    assertEqual(viewTamperWarnings(null, { "HANDOFF.md": "anything" }).length, 0);
   });
 }

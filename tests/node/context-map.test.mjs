@@ -9,7 +9,7 @@
  */
 
 import { test } from "node:test";
-import { readFile, mkdtemp, writeFile, mkdir } from "node:fs/promises";
+import { readFile, mkdtemp, writeFile, mkdir, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,6 +24,7 @@ import {
   assertNotIncludes,
 } from "../shared/unit-suite.mjs";
 import { parseContextMap, SECTION_LABELS, SECTION_KEYS } from "../../scripts/context-map.mjs";
+import { GENERATED_MARKER, sha256Hex } from "../../scripts/views.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const fixturesDir = join(root, "tests", "fixtures");
@@ -130,6 +131,7 @@ test("save: low verbosity still writes the context map (and skips legacy task fi
   const map = await readFile(mapPath, "utf-8");
   assertIncludes(map, "## Current Goal");
   assertIncludes(map, "## Excluded");
+  assert((await readFile(join(dir, ".handoff", "HANDOFF.md"), "utf-8")).startsWith(GENERATED_MARKER), "low verbosity HANDOFF.md is not a marked generated view");
   assert(!existsSync(join(dir, ".handoff", "tasks.md")), "low verbosity should skip tasks.md");
   assert(!existsSync(join(dir, ".handoff", "decisions.md")), "low verbosity should skip decisions.md");
 });
@@ -149,6 +151,12 @@ for (const [label, args] of [
     assert(parsed, `${label} wrote an unreadable context map`);
     for (const key of SECTION_KEYS) {
       assert(Array.isArray(parsed.sections[key]), `${label} omitted section '${key}'`);
+    }
+    // Compatibility views are still produced at every mode/verbosity.
+    for (const name of ["HANDOFF.md", "tasks.md", "decisions.md"]) {
+      const viewPath = join(dir, ".handoff", name);
+      assert(existsSync(viewPath), `${label} did not write ${name}`);
+      assert((await readFile(viewPath, "utf-8")).startsWith(GENERATED_MARKER), `${label} wrote ${name} without the generated marker`);
     }
   });
 }
@@ -205,12 +213,75 @@ test("save: TODO scan only picks up comment tags and skips excluded directories"
   await writeFile(join(dir, "tests", "fixtures", "sample.ts"), "// TODO: fixture dir must be excluded\n");
 
   runSave(dir);
-  const ctx = JSON.parse(await readFile(join(dir, ".handoff", "context.json"), "utf-8"));
-  const tasks = ctx.todos.map((t) => t.task).join("\n");
-  assertIncludes(tasks, "wire up the real scanner (src/app.ts:1)");
-  assertNotIncludes(tasks, "string false positive");
-  assertNotIncludes(tasks, "template false positive");
-  assertNotIncludes(tasks, "fixture dir must be excluded");
+  const tasksMd = await readFile(join(dir, ".handoff", "tasks.md"), "utf-8");
+  assertIncludes(tasksMd, "wire up the real scanner (src/app.ts:1)");
+  assertNotIncludes(tasksMd, "string false positive");
+  assertNotIncludes(tasksMd, "template false positive");
+  assertNotIncludes(tasksMd, "fixture dir must be excluded");
+});
+
+// ── Canonical state and generated views (v2) ────────────────────────────────
+
+const SEMANTIC_JSON_FIELDS = [
+  "current_goal", "status", "completed", "modified_files", "todos",
+  "blockers", "decisions", "next_steps", "risks", "notes",
+];
+
+test("save: v2 context.json drops semantic fields and stores SHA-256 view hashes", async () => {
+  const dir = await initTempRepo();
+  runSave(dir);
+
+  const json = JSON.parse(await readFile(join(dir, ".handoff", "context.json"), "utf-8"));
+  for (const field of SEMANTIC_JSON_FIELDS) {
+    assert(!(field in json), `semantic field '${field}' must not appear in v2 context.json`);
+  }
+  assert(json.project && json.timestamp && json.agent && json.git, "metadata missing from context.json");
+  assertEqual(JSON.stringify(json.diagnostics), JSON.stringify({ migration: [], conflicts: [] }));
+
+  for (const name of ["HANDOFF.md", "tasks.md", "decisions.md"]) {
+    const content = await readFile(join(dir, ".handoff", name), "utf-8");
+    assert(content.startsWith(GENERATED_MARKER), `${name} does not begin with the generated marker`);
+    assertEqual(json.views[name], sha256Hex(content), `stored hash does not match written ${name}`);
+  }
+});
+
+test("save: manual view edits warn and are never imported into the map", async () => {
+  const dir = await initTempRepo();
+  runSave(dir);
+  await writeFile(join(dir, ".handoff", "HANDOFF.md"), "manual vandalism\n");
+
+  const res = spawnSync(process.execPath, [join(root, "scripts", "node", "save.mjs")], { cwd: dir, encoding: "utf-8" });
+  assertEqual(res.status, 0, `save failed: ${res.stderr}`);
+  assertIncludes(res.stderr, "HANDOFF.md");
+
+  const view = await readFile(join(dir, ".handoff", "HANDOFF.md"), "utf-8");
+  assertNotIncludes(view, "manual vandalism", "manual edit survived regeneration");
+  const map = await readFile(join(dir, ".handoff", "context-map.md"), "utf-8");
+  assertNotIncludes(map, "manual vandalism", "manual view edit was imported into the map");
+});
+
+test("load: warns when a generated view was manually edited, semantics still come from the map", async () => {
+  const dir = await initTempRepo();
+  runSave(dir);
+  const tasksPath = join(dir, ".handoff", "tasks.md");
+  await writeFile(tasksPath, (await readFile(tasksPath, "utf-8")) + "\n- [ ] manual injected task\n");
+
+  const res = spawnSync(process.execPath, [join(root, "scripts", "node", "load.mjs")], { cwd: dir, encoding: "utf-8" });
+  assertEqual(res.status, 0, `load failed: ${res.stderr}`);
+  assertIncludes(res.stderr, "tasks.md");
+  assertIncludes(res.stdout, "Current understanding:");
+  assertNotIncludes(res.stdout, "manual injected task");
+});
+
+test("load: v2 handoff with a missing map falls back to the HANDOFF.md view", async () => {
+  const dir = await initTempRepo();
+  runSave(dir);
+  await rm(join(dir, ".handoff", "context-map.md"));
+
+  const res = spawnSync(process.execPath, [join(root, "scripts", "node", "load.mjs")], { cwd: dir, encoding: "utf-8" });
+  assertEqual(res.status, 0, `load failed: ${res.stderr}`);
+  assertIncludes(res.stdout, "Current understanding:");
+  assertIncludes(res.stdout, "Project: fixture-app");
 });
 
 // ── Config validation integration ────────────────────────────────────────────
