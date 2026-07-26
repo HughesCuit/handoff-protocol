@@ -38,6 +38,11 @@ import {
   reconcileContextMap,
   renderContextMap,
 } from "./context-map.mjs";
+import {
+  extractTodoComments,
+  SCAN_EXCLUDED_DIRS,
+  SOURCE_EXTENSIONS,
+} from "../source-comments.mjs";
 
 // ── Security ─────────────────────────────────────────────────────────────────
 // SENSITIVE_PATTERNS and filterSensitive live in ./context-map.mjs (shared with
@@ -241,18 +246,8 @@ async function initStorage(cwd, mode) {
 
 // ── Auto-Analysis ────────────────────────────────────────────────────────────
 
-const SOURCE_EXTENSIONS = new Set([
-  ".ts", ".tsx", ".js", ".jsx", ".py", ".rs", ".go", ".java",
-  ".c", ".cpp", ".h", ".hpp", ".rb", ".php", ".swift", ".kt",
-]);
-
-const SKIP_DIRS = new Set([
-  "node_modules", ".git", ".handoff", "dist", "build", "vendor", "__pycache__",
-]);
-
 function scanTodos(dir, maxFiles = 200) {
   const todos = [];
-  const todoPattern = /\b(TODO|FIXME|HACK|XXX)\b[:\s]+(.+)/gi;
   let fileCount = 0;
 
   function walkDir(currentDir) {
@@ -263,20 +258,15 @@ function scanTodos(dir, maxFiles = 200) {
     for (const entry of entries) {
       if (fileCount > maxFiles) break;
       const fullPath = join(currentDir, entry.name);
-      if (entry.isDirectory()) { if (!SKIP_DIRS.has(entry.name)) walkDir(fullPath); continue; }
-      if (!entry.isFile() || !SOURCE_EXTENSIONS.has(extname(entry.name))) continue;
+      if (entry.isDirectory()) { if (!SCAN_EXCLUDED_DIRS.has(entry.name)) walkDir(fullPath); continue; }
+      const ext = extname(entry.name);
+      if (!entry.isFile() || !SOURCE_EXTENSIONS.has(ext)) continue;
 
       try {
         const content = readFileSync(fullPath, "utf-8");
-        const lines = content.split("\n");
-        for (let i = 0; i < lines.length; i++) {
-          let match;
-          todoPattern.lastIndex = 0;
-          while ((match = todoPattern.exec(lines[i])) !== null) {
-            const tag = match[1].toUpperCase();
-            const priority = (tag === "FIXME" || tag === "HACK") ? "high" : "medium";
-            todos.push({ task: `${match[2].trim()} (${relative(dir, fullPath)}:${i + 1})`, priority, status: "pending" });
-          }
+        for (const hit of extractTodoComments(content, ext)) {
+          const priority = (hit.tag === "FIXME" || hit.tag === "HACK") ? "high" : "medium";
+          todos.push({ task: `${hit.text} (${relative(dir, fullPath)}:${hit.line})`, priority, status: "pending" });
         }
       } catch {}
     }

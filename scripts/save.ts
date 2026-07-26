@@ -36,6 +36,11 @@ import {
   reconcileContextMap,
   renderContextMap,
 } from "./context-map.ts";
+import {
+  extractTodoComments,
+  SCAN_EXCLUDED_DIRS,
+  SOURCE_EXTENSIONS,
+} from "./source-comments.mjs";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -413,40 +418,32 @@ async function getDiffSummary(): Promise<string> {
 
 // ── Auto-Analysis ────────────────────────────────────────────────────────────
 
-const SOURCE_EXTENSIONS = new Set([
-  ".ts", ".tsx", ".js", ".jsx", ".py", ".rs", ".go", ".java",
-  ".c", ".cpp", ".h", ".hpp", ".rb", ".php", ".swift", ".kt",
-]);
+const SKIP_DIR_PATTERNS = [...SCAN_EXCLUDED_DIRS].map(
+  (name) => new RegExp(`(^|[/\\\\])${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([/\\\\]|$)`)
+);
 
 async function scanTodos(cwd: string): Promise<TodoItem[]> {
   const todos: TodoItem[] = [];
-  const todoPattern = /\b(TODO|FIXME|HACK|XXX)\b[:\s]+(.+)/gi;
   let fileCount = 0;
   const maxFiles = 200;
 
   try {
-    for await (const entry of walk(cwd, { skip: [/node_modules/, /\.git/, /\.handoff/, /dist/, /build/, /vendor/, /__pycache__/] })) {
+    for await (const entry of walk(cwd, { skip: SKIP_DIR_PATTERNS })) {
       if (!entry.isFile) continue;
-      if (!SOURCE_EXTENSIONS.has(extname(entry.path))) continue;
+      const ext = extname(entry.path);
+      if (!SOURCE_EXTENSIONS.has(ext)) continue;
       if (++fileCount > maxFiles) break;
 
       try {
         const content = await Deno.readTextFile(entry.path);
-        const lines = content.split("\n");
-        for (let i = 0; i < lines.length; i++) {
-          const match = todoPattern.exec(lines[i]);
-          if (match) {
-            const tag = match[1].toUpperCase();
-            const task = match[2].trim();
-            const priority = tag === "FIXME" ? "high" : tag === "HACK" ? "high" : "medium";
-            const relPath = entry.path.replace(cwd + "/", "");
-            todos.push({
-              task: `${task} (${relPath}:${i + 1})`,
-              priority,
-              status: "pending",
-            });
-          }
-          todoPattern.lastIndex = 0;
+        for (const hit of extractTodoComments(content, ext)) {
+          const priority = hit.tag === "FIXME" ? "high" : hit.tag === "HACK" ? "high" : "medium";
+          const relPath = entry.path.replace(cwd + "/", "");
+          todos.push({
+            task: `${hit.text} (${relPath}:${hit.line})`,
+            priority,
+            status: "pending",
+          });
         }
       } catch {
         // skip unreadable files

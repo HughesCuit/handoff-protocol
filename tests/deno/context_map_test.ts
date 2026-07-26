@@ -204,6 +204,31 @@ Deno.test("save: submodule storage includes context-map.md in the submodule comm
   assertIncludes(tracked.stdout, "HANDOFF.md", "legacy files not committed in submodule");
 });
 
+Deno.test("save: TODO scan only picks up comment tags and skips excluded directories", async () => {
+  const dir = await initTempRepo();
+  await Deno.mkdir(`${dir}/src`, { recursive: true });
+  await Deno.writeTextFile(
+    `${dir}/src/app.ts`,
+    [
+      "// TODO: wire up the real scanner",
+      'const fake = "FIXME: string false positive";',
+      "const tpl = `HACK: template false positive`;",
+      "",
+    ].join("\n")
+  );
+  await Deno.mkdir(`${dir}/tests/fixtures`, { recursive: true });
+  await Deno.writeTextFile(`${dir}/tests/fixtures/sample.ts`, "// TODO: fixture dir must be excluded\n");
+
+  const res = await runSave(dir);
+  assertEqual(res.code, 0, res.stderr);
+  const ctx = JSON.parse(await Deno.readTextFile(`${dir}/.handoff/context.json`));
+  const tasks = ctx.todos.map((t) => t.task).join("\n");
+  assertIncludes(tasks, "wire up the real scanner (src/app.ts:1)");
+  assert(!tasks.includes("string false positive"), "string contents were scanned");
+  assert(!tasks.includes("template false positive"), "template literal contents were scanned");
+  assert(!tasks.includes("fixture dir must be excluded"), "tests/fixtures was scanned");
+});
+
 // ── Cross-runtime parity ─────────────────────────────────────────────────────
 
 async function nodeAvailable() {

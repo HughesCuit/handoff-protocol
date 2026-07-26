@@ -189,6 +189,30 @@ test("save: submodule storage includes context-map.md in the submodule commit", 
   assertIncludes(tracked, "HANDOFF.md", "legacy files not committed in submodule");
 });
 
+test("save: TODO scan only picks up comment tags and skips excluded directories", async () => {
+  const dir = await initTempRepo();
+  await mkdir(join(dir, "src"), { recursive: true });
+  await writeFile(
+    join(dir, "src", "app.ts"),
+    [
+      "// TODO: wire up the real scanner",
+      'const fake = "FIXME: string false positive";',
+      "const tpl = `HACK: template false positive`;",
+      "",
+    ].join("\n")
+  );
+  await mkdir(join(dir, "tests", "fixtures"), { recursive: true });
+  await writeFile(join(dir, "tests", "fixtures", "sample.ts"), "// TODO: fixture dir must be excluded\n");
+
+  runSave(dir);
+  const ctx = JSON.parse(await readFile(join(dir, ".handoff", "context.json"), "utf-8"));
+  const tasks = ctx.todos.map((t) => t.task).join("\n");
+  assertIncludes(tasks, "wire up the real scanner (src/app.ts:1)");
+  assertNotIncludes(tasks, "string false positive");
+  assertNotIncludes(tasks, "template false positive");
+  assertNotIncludes(tasks, "fixture dir must be excluded");
+});
+
 // ── Cross-runtime parity ─────────────────────────────────────────────────────
 
 function denoAvailable() {

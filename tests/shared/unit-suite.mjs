@@ -20,6 +20,7 @@ import {
   contextMapHasContent,
   filterSensitive,
 } from "../../scripts/context-map.mjs";
+import { extractTodoComments } from "../../scripts/source-comments.mjs";
 
 // ── Minimal assertions (runtime-agnostic) ────────────────────────────────────
 
@@ -260,5 +261,43 @@ export function defineUnitTests(test, readFixture) {
     assertEqual(ctx.todos[1].status, "completed");
     assert(ctx.risks.includes("Loaders older than v1.5 ignore the map"), "risk missing");
     assertIncludes(ctx.notes, "The map alone must be sufficient to resume work");
+  });
+
+  // ── TODO scanner (v1.5.1) ──────────────────────────────────────────────────
+
+  test("scanner: C-style comment tags extracted; strings, templates, markdown examples ignored", async () => {
+    const results = extractTodoComments(await readFixture("scanner/comments.ts"), ".ts");
+    assertEqual(JSON.stringify(results), JSON.stringify([
+      { tag: "TODO", text: "real line comment", line: 7 },
+      { tag: "FIXME", text: "real block comment", line: 8 },
+      { tag: "HACK", text: "real tag on an inner block line", line: 19 },
+      { tag: "XXX", text: "real xxx tag stays medium priority", line: 21 },
+    ]));
+  });
+
+  test("scanner: Python hash comments extracted; strings and docstrings ignored", async () => {
+    const results = extractTodoComments(await readFixture("scanner/comments.py"), ".py");
+    assertEqual(JSON.stringify(results), JSON.stringify([
+      { tag: "TODO", text: "real hash comment", line: 2 },
+      { tag: "FIXME", text: "trailing real comment", line: 8 },
+    ]));
+  });
+
+  test("scanner: ruby block comments, php hash comments, unterminated comments, unknown extensions", () => {
+    const ruby = ["=begin", "TODO: ruby block comment", "=end", "# FIXME: ruby line"].join("\n");
+    assertEqual(JSON.stringify(extractTodoComments(ruby, ".rb")), JSON.stringify([
+      { tag: "TODO", text: "ruby block comment", line: 2 },
+      { tag: "FIXME", text: "ruby line", line: 4 },
+    ]));
+
+    assertEqual(JSON.stringify(extractTodoComments("<?php\n# TODO: php hash comment\n", ".php")), JSON.stringify([
+      { tag: "TODO", text: "php hash comment", line: 2 },
+    ]));
+
+    assertEqual(JSON.stringify(extractTodoComments("/* TODO: never closed", ".js")), JSON.stringify([
+      { tag: "TODO", text: "never closed", line: 1 },
+    ]));
+
+    assertEqual(extractTodoComments("// TODO: not a scanned extension", ".md").length, 0);
   });
 }
