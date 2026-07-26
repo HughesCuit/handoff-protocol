@@ -6,12 +6,17 @@
  * Reads and analyzes handoff context from .handoff/ directory.
  *
  * Usage:
- *   deno run --allow-read --allow-run load.ts [mode]
+ *   deno run --allow-read --allow-run load.ts [mode] [--focus "current task"] [--budget N] [--full]
  *
  * Modes:
  *   (default) - Standard read and summarize
  *   auto      - Auto-infer next steps with detailed analysis
  *   merge     - Merge with current git context
+ *
+ * Compiler flags (v2.1, require a readable context map):
+ *   --focus   - Compile the map down to nodes relevant to this text
+ *   --budget  - Estimated token limit for the compiled map (default 4000, min 512)
+ *   --full    - Return the entire map; overrides --focus and --budget
  */
 
 import { parse } from "https://deno.land/std@0.224.0/flags/mod.ts";
@@ -22,9 +27,16 @@ import {
   filterSensitive,
   MAP_FILENAME,
   mergeContextMapWithJson,
+  normalizeNodeText,
   parseContextMap,
   type ParsedMap,
 } from "./context-map.ts";
+import {
+  compileContext,
+  DEFAULT_BUDGET,
+  MIN_BUDGET,
+  validateBudget,
+} from "./context-compiler.mjs";
 import { viewTamperWarnings } from "./views.mjs";
 import { validateProjectConfig } from "./config.mjs";
 import { isMigrationNeeded } from "./migrate.mjs";
@@ -80,6 +92,25 @@ interface LoadResult {
   pendingTasks: number;
   context: HandoffContext | null;
   storageMode: string;
+  compiled?: CompileDiagnostics | null;
+}
+
+/** Compiler flags parsed from the CLI (`--focus/--budget/--full`). */
+interface CompileRequest {
+  focus?: string;
+  budget?: number;
+  full: boolean;
+}
+
+/** Diagnostics returned alongside the load result after a compilation. */
+interface CompileDiagnostics {
+  focus: string;
+  budget: number;
+  selectedPaths: string[];
+  omittedCount: number;
+  estimatedTokens: number;
+  overflow: boolean;
+  fallbackReason: string | null;
 }
 
 interface StorageConfig {
@@ -309,6 +340,17 @@ async function loadHandoffMd(handoffDir: string): Promise<string> {
   return await Deno.readTextFile(mdPath);
 }
 
+/**
+ * Standalone-CLI focus fallback (the Skill passes the current user request
+ * instead): Current Goal plus active (incomplete) Tasks.
+ */
+function defaultFocusFromMap(map: ParsedMap): string {
+  const parts: string[] = [];
+  for (const node of map.sections.goal || []) parts.push(node.text);
+  for (const node of map.sections.tasks || []) if (!node.checked) parts.push(node.text);
+  return parts.map((t) => normalizeNodeText(t)).join(" ");
+}
+
 // ── Analysis ─────────────────────────────────────────────────────────────────
 
 function generateUnderstanding(ctx: HandoffContext): string {
@@ -517,12 +559,25 @@ function formatOutput(result: LoadResult, mode: string): string {
     lines.push(`  Branch: ${result.context.git.branch}`);
   }
 
+  if (result.compiled) {
+    const c = result.compiled;
+    lines.push("");
+    lines.push("Context compiler:");
+    lines.push(`  Focus: ${filterSensitive(c.focus)}`);
+    lines.push(`  Budget: ${c.budget} estimated tokens`);
+    lines.push(`  Selected: ${c.selectedPaths.join(", ")}`);
+    lines.push(`  Omitted: ${c.omittedCount} node(s)`);
+    lines.push(`  Estimated tokens: ${c.estimatedTokens}`);
+    lines.push(`  Overflow: ${c.overflow ? "yes" : "no"}`);
+    if (c.fallbackReason) lines.push(`  Fallback: ${c.fallbackReason}`);
+  }
+
   return lines.join("\n");
 }
 
 // ── Main Load Logic ──────────────────────────────────────────────────────────
 
-async function load(mode: string): Promise<LoadResult> {
+async function load(mode: string, compile: CompileRequest | null = null): Promise<LoadResult> {
   const cwd = Deno.cwd();
   const handoffDir = join(cwd, ".handoff");
 
@@ -582,6 +637,7 @@ async function load(mode: string): Promise<LoadResult> {
   const map = await loadContextMap(handoffDir);
   let ctx = await loadContextJson(handoffDir);
   const legacyJsonVersion = ctx ? ctx.version : undefined;
+  let compileDiagnostics: CompileDiagnostics | null = null;
 
   // Generated views are never a semantic source. Warn when an on-disk view
   // no longer matches the hash stored by the last save (manual edit); the
@@ -605,7 +661,35 @@ async function load(mode: string): Promise<LoadResult> {
     // Map semantics win; context.json (when present) supplies machine state
     // and any semantic field the map leaves empty. Works for map-only,
     // mixed-format, and (map absent) legacy handoffs.
-    ctx = mergeContextMapWithJson(map, ctx);
+    // With --focus/--budget/--full, the map is first compiled down to the
+    // relevant nodes; diagnostics travel with the result.
+    let effectiveMap = map;
+    if (compile) {
+      const focus = compile.full ? "" : (compile.focus ?? defaultFocusFromMap(map));
+      const compiled = compileContext(map, {
+        focus,
+        budget: compile.budget,
+        full: compile.full,
+      }) as {
+        map: ParsedMap;
+        selectedPaths: string[];
+        omittedCount: number;
+        estimatedTokens: number;
+        overflow: boolean;
+        fallbackReason: string | null;
+      };
+      effectiveMap = compiled.map;
+      compileDiagnostics = {
+        focus: compile.full ? "(full map)" : focus,
+        budget: compile.budget ?? DEFAULT_BUDGET,
+        selectedPaths: compiled.selectedPaths,
+        omittedCount: compiled.omittedCount,
+        estimatedTokens: compiled.estimatedTokens,
+        overflow: compiled.overflow,
+        fallbackReason: compiled.fallbackReason,
+      };
+    }
+    ctx = mergeContextMapWithJson(effectiveMap, ctx);
   } else if (ctx && !Array.isArray(ctx.todos)) {
     // v2 context.json carries no semantic fields; without a readable map it
     // cannot stand alone — fall through to the HANDOFF.md view.
@@ -685,6 +769,7 @@ async function load(mode: string): Promise<LoadResult> {
     pendingTasks,
     context: ctx,
     storageMode,
+    compiled: compileDiagnostics,
   };
 }
 
@@ -693,7 +778,18 @@ async function load(mode: string): Promise<LoadResult> {
 async function main() {
   const args = parse(Deno.args, {
     default: { _: ["default"] },
+    string: ["focus", "budget"],
+    boolean: ["full"],
   });
+
+  // /handoff load [auto|merge] [--focus "current task"] [--budget N] [--full]
+  const allowedFlags = new Set(["_", "focus", "budget", "full"]);
+  for (const key of Object.keys(args)) {
+    if (!allowedFlags.has(key)) {
+      console.error(`Error: Unknown flag '--${key}'`);
+      Deno.exit(1);
+    }
+  }
 
   const mode = args._[0]?.toString() || "default";
   const validModes = ["default", "auto", "merge"];
@@ -703,8 +799,22 @@ async function main() {
     Deno.exit(1);
   }
 
+  let compile: CompileRequest | null = null;
+  if (args.focus !== undefined || args.budget !== undefined || args.full) {
+    let budget: number | undefined;
+    if (args.budget !== undefined) {
+      try {
+        budget = validateBudget(Number(args.budget));
+      } catch {
+        console.error(`Error: invalid --budget value '${args.budget}': expected an integer >= ${MIN_BUDGET}`);
+        Deno.exit(1);
+      }
+    }
+    compile = { focus: args.focus, budget, full: !!args.full };
+  }
+
   try {
-    const result = await load(mode);
+    const result = await load(mode, compile);
     console.log(formatOutput(result, mode));
   } catch (err) {
     console.error(`Error during load: ${err instanceof Error ? err.message : err}`);

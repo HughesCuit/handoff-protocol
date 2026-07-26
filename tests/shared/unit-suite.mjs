@@ -36,6 +36,12 @@ import {
   isMigrationNeeded,
   planMigration,
 } from "../../scripts/migrate.mjs";
+import {
+  DEFAULT_BUDGET,
+  MIN_BUDGET,
+  compileContext,
+  estimateTokens,
+} from "../../scripts/context-compiler.mjs";
 
 // ── Minimal assertions (runtime-agnostic) ────────────────────────────────────
 
@@ -885,5 +891,133 @@ export function defineUnitTests(test, readFixture) {
     const second = await applyMigration(secondPlan, paths, io, { timestamp: "2026-07-26T01:00:00.000Z" });
     assert(!second.migrated, "second migration must not write");
     assertEqual(JSON.stringify([...io.store.entries()].sort()), snapshot, "second migration changed files");
+  });
+
+  // ── Context compiler (v2.1) ────────────────────────────────────────────────
+
+  test("compiler: token estimate follows the documented CJK-aware formula", () => {
+    assertEqual(estimateTokens(""), 0);
+    assertEqual(estimateTokens("abcd"), 1, "4 ASCII chars / 4");
+    assertEqual(estimateTokens("abcde"), 2, "ceil(5/4)");
+    assertEqual(estimateTokens("你好"), 2, "ceil(2/1.5)");
+    assertEqual(estimateTokens("ab你好"), 2, "ceil(2/4 + 2/1.5)");
+    assertEqual(estimateTokens("你好世界"), 3, "ceil(4/1.5)");
+  });
+
+  test("compiler: budget below the minimum or non-numeric is rejected", async () => {
+    const map = parseContextMap(await readFixture("maps/compiler.md"));
+    for (const bad of [MIN_BUDGET - 1, 0, -512, 512.5, NaN, "100"]) {
+      let threw = false;
+      try {
+        compileContext(map, { budget: bad });
+      } catch (err) {
+        threw = true;
+        assert(/budget/i.test(err.message), `error should name the budget, got: ${err.message}`);
+      }
+      assert(threw, `budget ${JSON.stringify(bad)} must be rejected`);
+    }
+  });
+
+  test("compiler: core nodes are always included regardless of focus", async () => {
+    const map = parseContextMap(await readFixture("maps/compiler.md"));
+    const result = compileContext(map, { focus: "keyword overlap scoring" });
+    assertEqual(result.fallbackReason, null, `unexpected fallback: ${result.fallbackReason}`);
+
+    for (const core of ["goal[0]", "status[0]", "tasks[0]", "tasks[1]", "risks[0]"]) {
+      assert(result.selectedPaths.includes(core), `core node '${core}' missing from selection`);
+    }
+    assert(!result.selectedPaths.includes("tasks[2]"), "completed task must not be core");
+    assert(!result.selectedPaths.includes("risks[1]"), "non-high risk must not be core");
+  });
+
+  test("compiler: a relevant nested branch is selected with every ancestor", async () => {
+    const map = parseContextMap(await readFixture("maps/compiler.md"));
+    const result = compileContext(map, { focus: "normalization lowercases" });
+    assertEqual(result.fallbackReason, null, `unexpected fallback: ${result.fallbackReason}`);
+    assert(result.selectedPaths.includes("decisions[1]"), "matching nested node not selected");
+    assert(result.selectedPaths.includes("decisions[0]"), "ancestor of a selected node not included");
+    assert(!result.selectedPaths.includes("decisions[2]"), "unmatched sibling must stay omitted");
+  });
+
+  test("compiler: scoring spans node text and ancestor paths", async () => {
+    const map = parseContextMap(await readFixture("maps/compiler.md"));
+    // Neither keyword alone is reliable on the child text ("lowercases" only);
+    // the ancestor path contributes "keyword", so the branch matches reliably.
+    const result = compileContext(map, { focus: "keyword lowercases" });
+    assertEqual(result.fallbackReason, null, "ancestor-path scoring should prevent fallback");
+    assert(result.selectedPaths.includes("decisions[1]"), "branch matching via ancestor path not selected");
+    assert(result.selectedPaths.includes("decisions[0]"), "ancestor not included");
+  });
+
+  test("compiler: selection is deterministic and preserves document order", async () => {
+    const map = parseContextMap(await readFixture("maps/compiler.md"));
+    const first = compileContext(map, { focus: "keyword overlap scoring" });
+    const second = compileContext(map, { focus: "keyword overlap scoring" });
+    assertEqual(JSON.stringify(first), JSON.stringify(second), "compilation is not deterministic");
+
+    const expected = ["goal[0]", "status[0]", "tasks[0]", "tasks[1]", "decisions[0]", "decisions[1]", "risks[0]"];
+    assertEqual(
+      JSON.stringify(first.selectedPaths),
+      JSON.stringify(expected),
+      "selected paths must follow original section and node order"
+    );
+  });
+
+  test("compiler: overflow is reported and core nodes are never dropped", () => {
+    const bigGoal = "x".repeat(3000); // ~750 estimated tokens, over any minimal budget
+    const source = [
+      "# Context Map",
+      "",
+      "## Current Goal",
+      "",
+      `- ${bigGoal}`,
+      "",
+      "## Tasks",
+      "",
+      "- [ ] Small task",
+      "",
+    ].join("\n");
+    const map = parseContextMap(source);
+    const result = compileContext(map, { focus: "small task", budget: MIN_BUDGET });
+
+    assert(result.overflow, "core exceeding the budget must report overflow");
+    assert(result.selectedPaths.includes("goal[0]"), "core goal was dropped to satisfy the budget");
+    assert(result.selectedPaths.includes("tasks[0]"), "core task was dropped to satisfy the budget");
+    assert(result.estimatedTokens > MIN_BUDGET, "estimate should exceed the budget on overflow");
+  });
+
+  test("compiler: no reliable match falls back to the full map with a reason", async () => {
+    const map = parseContextMap(await readFixture("maps/compiler.md"));
+    // "scoring" matches weakly (1 of 3 keywords) — below the reliable threshold.
+    const result = compileContext(map, { focus: "zebra quokka scoring" });
+    assert(result.fallbackReason, "expected a fallback reason when nothing matches reliably");
+    assertEqual(result.omittedCount, 0, "fallback must return the full map");
+    assertEqual(result.selectedPaths.length, 13, "fallback must select every node");
+
+    const total = compileContext(map, { full: true });
+    assertEqual(
+      JSON.stringify(result.selectedPaths),
+      JSON.stringify(total.selectedPaths),
+      "fallback selection should equal the full-map selection"
+    );
+  });
+
+  test("compiler: --full overrides focus and budget", async () => {
+    const map = parseContextMap(await readFixture("maps/compiler.md"));
+    const result = compileContext(map, { focus: "zebra", budget: MIN_BUDGET, full: true });
+    assertEqual(result.fallbackReason, null, "--full is an explicit choice, not a fallback");
+    assertEqual(result.omittedCount, 0, "--full must omit nothing");
+    assertEqual(result.overflow, false, "--full overrides the budget");
+    assertEqual(result.selectedPaths.length, 13, "--full must select every node");
+  });
+
+  test("compiler: defaults are 4000 budget with no focus requirement", async () => {
+    const map = parseContextMap(await readFixture("maps/compiler.md"));
+    assertEqual(DEFAULT_BUDGET, 4000, "documented default budget changed");
+    assertEqual(MIN_BUDGET, 512, "documented minimum budget changed");
+    // No focus at all: nothing can match, so the full map comes back.
+    const result = compileContext(map, {});
+    assert(result.fallbackReason, "empty focus should fall back to the full map");
+    assertEqual(result.omittedCount, 0);
   });
 }

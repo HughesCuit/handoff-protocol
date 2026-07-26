@@ -454,6 +454,71 @@ test("storage: reports an invalid configuration instead of displaying it", async
   assertNotIncludes(res.stderr + res.stdout, "ghp_0123456789abcdef0123456789abcdef0123", "secret value was echoed back");
 });
 
+// ── Context compiler flags (v2.1) ────────────────────────────────────────────
+
+function runLoadArgs(cwd, args = []) {
+  return spawnSync(process.execPath, [join(root, "scripts", "node", "load.mjs"), ...args], {
+    cwd,
+    encoding: "utf-8",
+  });
+}
+
+test("load --focus: compiles the map and prints deterministic diagnostics", () => {
+  const res = runLoadArgs(join(fixturesDir, "handoffs", "map-only"), ["--focus", "vector database"]);
+  assertEqual(res.status, 0, `load failed: ${res.stderr}`);
+  assertIncludes(res.stdout, "Context compiler:");
+  assertIncludes(res.stdout, "Focus: vector database");
+  assertIncludes(res.stdout, "Budget: 4000 estimated tokens");
+  assertIncludes(res.stdout, "Selected: goal[0], status[0], tasks[0], excluded[0]");
+  assertIncludes(res.stdout, "Omitted: 5 node(s)");
+  assertIncludes(res.stdout, "Estimated tokens:");
+  assertIncludes(res.stdout, "Overflow: no");
+  assertNotIncludes(res.stdout, "Fallback:");
+  // Semantics still load from the (compiled) map.
+  assertIncludes(res.stdout, "Ship the v1.5 context map release");
+});
+
+test("load --focus: no reliable match falls back to the full map with a reason", () => {
+  const res = runLoadArgs(join(fixturesDir, "handoffs", "map-only"), ["--focus", "zebra quokka"]);
+  assertEqual(res.status, 0, `load failed: ${res.stderr}`);
+  assertIncludes(res.stdout, "Context compiler:");
+  assertIncludes(res.stdout, "Fallback:");
+  assertIncludes(res.stdout, "Omitted: 0 node(s)");
+});
+
+test("load --budget: values below 512 or non-numeric are rejected", () => {
+  for (const bad of ["100", "511", "abc", ""]) {
+    const res = runLoadArgs(join(fixturesDir, "handoffs", "map-only"), ["--budget", bad]);
+    assertEqual(res.status, 1, `budget '${bad}' must exit 1: ${res.stdout}${res.stderr}`);
+    assertIncludes(res.stderr, "budget");
+  }
+  const ok = runLoadArgs(join(fixturesDir, "handoffs", "map-only"), ["--budget", "512"]);
+  assertEqual(ok.status, 0, `budget 512 must be accepted: ${ok.stderr}`);
+  assertIncludes(ok.stdout, "Context compiler:");
+});
+
+test("load --full: selects the entire map regardless of focus", () => {
+  const res = runLoadArgs(join(fixturesDir, "handoffs", "map-only"), ["--full", "--focus", "zebra"]);
+  assertEqual(res.status, 0, `load failed: ${res.stderr}`);
+  assertIncludes(res.stdout, "Context compiler:");
+  assertIncludes(res.stdout, "Omitted: 0 node(s)");
+  assertIncludes(res.stdout, "Overflow: no");
+  assertNotIncludes(res.stdout, "Fallback:");
+});
+
+test("load: without compiler flags the output carries no compiler diagnostics", () => {
+  for (const mode of ["default", "auto", "merge"]) {
+    const res = runLoadArgs(join(fixturesDir, "handoffs", "map-only"), [mode]);
+    assertEqual(res.status, 0, `load failed: ${res.stderr}`);
+    assertNotIncludes(res.stdout, "Context compiler:");
+  }
+});
+
+test("load: unknown flags are rejected", () => {
+  const res = runLoadArgs(join(fixturesDir, "handoffs", "map-only"), ["--bogus"]);
+  assertEqual(res.status, 1, `unknown flag must exit 1: ${res.stdout}${res.stderr}`);
+});
+
 // ── Cross-runtime parity ─────────────────────────────────────────────────────
 
 function denoAvailable() {
