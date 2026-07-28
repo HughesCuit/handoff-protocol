@@ -42,6 +42,16 @@ import {
   compileContext,
   estimateTokens,
 } from "../../scripts/context-compiler.mjs";
+import {
+  linkPathFor,
+  obsidianLink,
+  obsidianStatus,
+  obsidianUnlink,
+  resolveAlias,
+  userConfigPath,
+  validateAlias,
+  validateVaultPath,
+} from "../../scripts/adapters/obsidian.mjs";
 
 // ── Minimal assertions (runtime-agnostic) ────────────────────────────────────
 
@@ -1019,5 +1029,329 @@ export function defineUnitTests(test, readFixture) {
     const result = compileContext(map, {});
     assert(result.fallbackReason, "empty focus should fall back to the full map");
     assertEqual(result.omittedCount, 0);
+  });
+
+  // ── Obsidian adapter (v2.2) ───────────────────────────────────────────────
+
+  // In-memory link-capable filesystem for the adapter's io seam. Directories
+  // are a Set of paths, symlinks/junctions a Map of linkPath -> target.
+  function makeLinkIo(seed = {}, failOn) {
+    const dirs = new Set(seed.dirs || []);
+    const links = new Map(Object.entries(seed.links || {}));
+    const ops = [];
+    return {
+      dirs,
+      links,
+      ops,
+      lstat: async (p) => {
+        if (links.has(p)) return { kind: "symlink" };
+        if (dirs.has(p)) return { kind: "directory" };
+        return null;
+      },
+      exists: async (p) => dirs.has(p),
+      readlink: async (p) => {
+        if (!links.has(p)) throw new Error(`EINVAL: not a symlink: ${p}`);
+        return links.get(p);
+      },
+      symlink: async (target, linkPath, opts) => {
+        ops.push(["symlink", target, linkPath, opts]);
+        if (failOn && failOn(linkPath)) {
+          const err = new Error(`EPERM: operation not permitted, symlink '${linkPath}'`);
+          err.code = "EPERM";
+          throw err;
+        }
+        links.set(linkPath, target);
+      },
+      mkdir: async (p) => {
+        ops.push(["mkdir", p]);
+        dirs.add(p);
+      },
+      unlink: async (p) => {
+        ops.push(["unlink", p]);
+        if (!links.has(p)) throw new Error(`ENOENT: ${p}`);
+        links.delete(p);
+      },
+    };
+  }
+
+  const VAULT = "/Users/alice/Documents/Obsidian Vault 知识库";
+  const PROJECT = "/work/handoff-protocol";
+  const HANDOFF_DIR = `${PROJECT}/.handoff`;
+
+  test("obsidian: validateVaultPath accepts absolute paths, including spaces and Unicode", () => {
+    for (const p of [
+      VAULT,
+      "/vault",
+      "/vault/with spaces",
+      "C:\\Users\\alice\\Vault",
+      "D:/Vault/知识库",
+      "\\\\NAS\\share\\Vault",
+    ]) {
+      const r = validateVaultPath(p);
+      assert(r.valid, `'${p}' should be a valid Vault path, errors: ${r.errors.join("; ")}`);
+    }
+    for (const [label, p] of [
+      ["empty", ""],
+      ["whitespace", "   "],
+      ["non-string", 42],
+      ["relative", "Documents/Vault"],
+      ["home-relative", "~/Vault"],
+      ["parent traversal", "/vault/../vault"],
+      ["windows relative", "Vault\\Notes"],
+    ]) {
+      const r = validateVaultPath(p);
+      assert(!r.valid, `${label} ('${p}') must be rejected`);
+      assert(r.errors.length > 0, `${label} should report an error`);
+    }
+  });
+
+  test("obsidian: validateAlias rejects empty, separator, and traversal aliases", () => {
+    for (const a of ["handoff-protocol", "my project", "项目 甲", "proj_2"]) {
+      assert(validateAlias(a).valid, `'${a}' should be a valid alias`);
+    }
+    for (const a of ["", "   ", "..", ".", "a/b", "a\\b", "../x", 42]) {
+      const r = validateAlias(a);
+      assert(!r.valid, `alias '${a}' must be rejected`);
+    }
+  });
+
+  test("obsidian: userConfigPath follows XDG, home fallback, and APPDATA", () => {
+    assertEqual(
+      userConfigPath({ XDG_CONFIG_HOME: "/cfg", HOME: "/home/alice" }, "linux"),
+      "/cfg/handoff/config.json",
+      "XDG_CONFIG_HOME must win on Linux"
+    );
+    assertEqual(
+      userConfigPath({ HOME: "/Users/alice" }, "darwin"),
+      "/Users/alice/.config/handoff/config.json",
+      "macOS must fall back to ~/.config"
+    );
+    assertEqual(
+      userConfigPath({ APPDATA: "C:\\Users\\alice\\AppData\\Roaming" }, "win32"),
+      "C:\\Users\\alice\\AppData\\Roaming\\handoff\\config.json",
+      "Windows must use %APPDATA%"
+    );
+    const r = userConfigPath({}, "linux");
+    assertEqual(r, null, "no HOME and no XDG_CONFIG_HOME should give no path");
+  });
+
+  test("obsidian: linkPathFor builds <Vault>/Projects/<alias>", () => {
+    assertEqual(linkPathFor("/vault", "proj"), "/vault/Projects/proj");
+    assertEqual(linkPathFor("/vault/", "proj"), "/vault/Projects/proj", "trailing separator must not duplicate");
+    assertEqual(linkPathFor(VAULT, "my project"), `${VAULT}/Projects/my project`);
+  });
+
+  test("obsidian: resolveAlias prefers explicit flag, then project config, then directory name", () => {
+    assertEqual(resolveAlias({ alias: "flag", projectAlias: "cfg", projectDir: "/work/dirname" }), "flag");
+    assertEqual(resolveAlias({ projectAlias: "cfg", projectDir: "/work/dirname" }), "cfg");
+    assertEqual(resolveAlias({ projectDir: "/work/dirname" }), "dirname");
+    assertEqual(resolveAlias({ projectDir: PROJECT }), "handoff-protocol");
+  });
+
+  test("obsidian: link creates a directory symlink into the Vault", async () => {
+    const io = makeLinkIo({ dirs: [VAULT, PROJECT, HANDOFF_DIR] });
+    const r = await obsidianLink({ vaultPath: VAULT, alias: "my proj", projectDir: PROJECT, platform: "darwin" }, io);
+    assert(r.ok, `link should succeed: ${r.message || ""}`);
+    assertEqual(r.state, "linked");
+    assertEqual(r.linkPath, `${VAULT}/Projects/my proj`);
+    assertEqual(r.target, HANDOFF_DIR);
+    assertEqual(io.links.get(r.linkPath), HANDOFF_DIR, "symlink must point at .handoff/");
+    assert(io.dirs.has(`${VAULT}/Projects`), "Projects folder must be created in the Vault");
+  });
+
+  test("obsidian: link uses a junction on Windows", async () => {
+    const io = makeLinkIo({ dirs: ["C:\\Vault", "C:\\proj", "C:\\proj\\.handoff"] });
+    const r = await obsidianLink(
+      { vaultPath: "C:\\Vault", alias: "proj", projectDir: "C:\\proj", platform: "win32" },
+      io
+    );
+    assert(r.ok, `link should succeed: ${r.message || ""}`);
+    const call = io.ops.find((op) => op[0] === "symlink");
+    assert(call, "symlink must be attempted");
+    assertEqual(call[3].junction, true, "Windows must request a directory junction");
+  });
+
+  test("obsidian: an existing correct link is an idempotent success", async () => {
+    const linkPath = linkPathFor(VAULT, "proj");
+    const io = makeLinkIo({
+      dirs: [VAULT, `${VAULT}/Projects`, PROJECT, HANDOFF_DIR],
+      links: { [linkPath]: HANDOFF_DIR },
+    });
+    const r = await obsidianLink({ vaultPath: VAULT, alias: "proj", projectDir: PROJECT, platform: "darwin" }, io);
+    assert(r.ok, "re-linking a correct link must succeed");
+    assertEqual(r.state, "already-linked");
+    assert(!io.ops.some((op) => op[0] === "symlink"), "no new symlink should be created");
+  });
+
+  test("obsidian: link refuses to replace a real directory or file", async () => {
+    for (const kind of ["directory", "file"]) {
+      const linkPath = linkPathFor(VAULT, "proj");
+      const io = makeLinkIo({ dirs: [VAULT, `${VAULT}/Projects`, PROJECT, HANDOFF_DIR] });
+      const baseLstat = io.lstat;
+      io.lstat = async (p) => (p === linkPath ? { kind } : baseLstat(p));
+      const r = await obsidianLink({ vaultPath: VAULT, alias: "proj", projectDir: PROJECT, platform: "darwin" }, io);
+      assert(!r.ok, `a real ${kind} at the link path must be refused`);
+      assertEqual(r.reason, "collision");
+      assert(r.message.includes(linkPath), "message should name the conflicting path");
+      assert(!io.ops.some((op) => op[0] === "symlink" || op[0] === "unlink"), "nothing may be created or removed");
+    }
+  });
+
+  test("obsidian: link refuses to replace a foreign link", async () => {
+    const linkPath = linkPathFor(VAULT, "proj");
+    const io = makeLinkIo({
+      dirs: [VAULT, `${VAULT}/Projects`, PROJECT, HANDOFF_DIR, "/other/.handoff"],
+      links: { [linkPath]: "/other/.handoff" },
+    });
+    const r = await obsidianLink({ vaultPath: VAULT, alias: "proj", projectDir: PROJECT, platform: "darwin" }, io);
+    assert(!r.ok, "a foreign link must be refused");
+    assertEqual(r.reason, "foreign-link");
+    assertEqual(io.links.get(linkPath), "/other/.handoff", "foreign link must be left untouched");
+  });
+
+  test("obsidian: link rejects an invalid Vault path before touching the filesystem", async () => {
+    const io = makeLinkIo();
+    const r = await obsidianLink({ vaultPath: "relative/Vault", alias: "proj", projectDir: PROJECT, platform: "darwin" }, io);
+    assert(!r.ok, "relative Vault path must be refused");
+    assertEqual(r.reason, "invalid-vault");
+    assertEqual(io.ops.length, 0, "no filesystem operations allowed for invalid paths");
+  });
+
+  test("obsidian: link requires the Vault to be an existing directory", async () => {
+    const io = makeLinkIo({ dirs: [PROJECT, HANDOFF_DIR] });
+    const r = await obsidianLink({ vaultPath: VAULT, alias: "proj", projectDir: PROJECT, platform: "darwin" }, io);
+    assert(!r.ok, "missing Vault must be refused");
+    assertEqual(r.reason, "vault-missing");
+    assertEqual(io.links.size, 0, "no link may be created");
+  });
+
+  test("obsidian: permission failures return actionable guidance", async () => {
+    const io = makeLinkIo({ dirs: [VAULT, PROJECT, HANDOFF_DIR] }, () => true);
+    for (const platform of ["darwin", "win32"]) {
+      const r = await obsidianLink({ vaultPath: VAULT, alias: "proj", projectDir: PROJECT, platform }, io);
+      assert(!r.ok, `${platform}: EPERM must fail the link`);
+      assertEqual(r.reason, "permission-denied");
+      assert(r.guidance && r.guidance.length > 20, `${platform}: actionable guidance required`);
+      if (platform === "win32") {
+        assert(/Developer Mode|administrator|elevated/i.test(r.guidance), `windows guidance must mention Developer Mode/elevation: ${r.guidance}`);
+      } else {
+        assert(/writable|permission|Full Disk Access/i.test(r.guidance), `posix guidance must mention permissions: ${r.guidance}`);
+      }
+    }
+  });
+
+  test("obsidian: status reports linked, missing, broken, and foreign states", async () => {
+    const linkPath = linkPathFor(VAULT, "proj");
+    const base = { vaultPath: VAULT, alias: "proj", projectDir: PROJECT, platform: "darwin" };
+
+    const linked = await obsidianStatus(base, makeLinkIo({
+      dirs: [VAULT, `${VAULT}/Projects`, HANDOFF_DIR],
+      links: { [linkPath]: HANDOFF_DIR },
+    }));
+    assertEqual(linked.state, "linked");
+
+    const missing = await obsidianStatus(base, makeLinkIo({ dirs: [VAULT, `${VAULT}/Projects`, HANDOFF_DIR] }));
+    assertEqual(missing.state, "missing");
+
+    const broken = await obsidianStatus(base, makeLinkIo({
+      dirs: [VAULT, `${VAULT}/Projects`],
+      links: { [linkPath]: HANDOFF_DIR },
+    }));
+    assertEqual(broken.state, "broken", "link whose target vanished must report broken");
+
+    const foreign = await obsidianStatus(base, makeLinkIo({
+      dirs: [VAULT, `${VAULT}/Projects`, "/other/.handoff"],
+      links: { [linkPath]: "/other/.handoff" },
+    }));
+    assertEqual(foreign.state, "foreign-link");
+    assertEqual(foreign.actualTarget, "/other/.handoff");
+
+    const conflict = await obsidianStatus(base, makeLinkIo({ dirs: [VAULT, `${VAULT}/Projects`, linkPath, HANDOFF_DIR] }));
+    assertEqual(conflict.state, "conflict", "a real directory at the link path is a conflict");
+  });
+
+  test("obsidian: unlink removes only a verified Adapter-created link", async () => {
+    const linkPath = linkPathFor(VAULT, "proj");
+    const io = makeLinkIo({
+      dirs: [VAULT, `${VAULT}/Projects`, HANDOFF_DIR],
+      links: { [linkPath]: HANDOFF_DIR },
+    });
+    const r = await obsidianUnlink({ vaultPath: VAULT, alias: "proj", projectDir: PROJECT, platform: "darwin" }, io);
+    assert(r.ok, `unlink should succeed: ${r.message || ""}`);
+    assertEqual(r.state, "unlinked");
+    assert(!io.links.has(linkPath), "link must be removed");
+    assert(io.dirs.has(HANDOFF_DIR), "the .handoff target must never be removed");
+  });
+
+  test("obsidian: unlink is idempotent when no link exists", async () => {
+    const io = makeLinkIo({ dirs: [VAULT, `${VAULT}/Projects`, HANDOFF_DIR] });
+    const r = await obsidianUnlink({ vaultPath: VAULT, alias: "proj", projectDir: PROJECT, platform: "darwin" }, io);
+    assert(r.ok, "unlink with nothing linked should succeed");
+    assertEqual(r.state, "not-linked");
+    assert(!io.ops.some((op) => op[0] === "unlink"), "nothing may be removed");
+  });
+
+  test("obsidian: unlink refuses real directories, files, and foreign links", async () => {
+    const linkPath = linkPathFor(VAULT, "proj");
+
+    const realDir = makeLinkIo({ dirs: [VAULT, `${VAULT}/Projects`, linkPath, HANDOFF_DIR] });
+    const r1 = await obsidianUnlink({ vaultPath: VAULT, alias: "proj", projectDir: PROJECT, platform: "darwin" }, realDir);
+    assert(!r1.ok, "unlink must refuse a real directory");
+    assertEqual(r1.reason, "collision");
+    assert(realDir.dirs.has(linkPath), "user directory must remain");
+
+    const foreign = makeLinkIo({
+      dirs: [VAULT, `${VAULT}/Projects`, "/other/.handoff", HANDOFF_DIR],
+      links: { [linkPath]: "/other/.handoff" },
+    });
+    const r2 = await obsidianUnlink({ vaultPath: VAULT, alias: "proj", projectDir: PROJECT, platform: "darwin" }, foreign);
+    assert(!r2.ok, "unlink must refuse a foreign link");
+    assertEqual(r2.reason, "foreign-link");
+    assertEqual(foreign.links.get(linkPath), "/other/.handoff", "foreign link must remain");
+    assert(!foreign.ops.some((op) => op[0] === "unlink"), "nothing may be removed");
+  });
+
+  test("config: adapters.obsidian portable shape passes validation", () => {
+    const config = {
+      version: "2.2.0",
+      storage: { mode: "direct", path: ".handoff" },
+      adapters: { obsidian: { enabled: true, projectAlias: "handoff-protocol" } },
+    };
+    const r = validateProjectConfig(config);
+    assert(r.valid, `adapters.obsidian should be valid, errors: ${r.errors.join("; ")}`);
+
+    const off = validateProjectConfig({
+      version: "2.2.0",
+      storage: { mode: "direct", path: ".handoff" },
+      adapters: { obsidian: { enabled: false } },
+    });
+    assert(off.valid, "projectAlias is optional, errors: " + off.errors.join("; "));
+  });
+
+  test("config: malformed adapters.obsidian shapes are rejected", () => {
+    const base = { version: "2.2.0", storage: { mode: "direct", path: ".handoff" } };
+    const cases = [
+      ["non-object adapters", { ...base, adapters: "obsidian" }],
+      ["non-object obsidian", { ...base, adapters: { obsidian: true } }],
+      ["non-boolean enabled", { ...base, adapters: { obsidian: { enabled: "yes" } } }],
+      ["non-string projectAlias", { ...base, adapters: { obsidian: { enabled: true, projectAlias: 7 } } }],
+      ["empty projectAlias", { ...base, adapters: { obsidian: { projectAlias: " " } } }],
+    ];
+    for (const [label, config] of cases) {
+      const r = validateProjectConfig(config);
+      assert(!r.valid, `${label} should be invalid`);
+      assert(r.errors.some((e) => e.includes("adapters")), `${label} error should name adapters: ${JSON.stringify(r.errors)}`);
+    }
+  });
+
+  test("config: Vault paths stay rejected in project config (user-level only)", () => {
+    const config = {
+      version: "2.2.0",
+      storage: { mode: "direct", path: ".handoff" },
+      adapters: { obsidian: { enabled: true, vaultPath: "/Users/alice/Documents/Vault" } },
+    };
+    const r = validateProjectConfig(config);
+    assert(!r.valid, "Vault absolute path in project config must be rejected");
+    assert(r.errors.some((e) => e.includes("adapters.obsidian.vaultPath")), `error should name the field: ${JSON.stringify(r.errors)}`);
   });
 }

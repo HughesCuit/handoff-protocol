@@ -110,6 +110,31 @@ export function validateProjectConfig(config) {
     }
   }
 
+  // Adapter configuration. Only portable, machine-independent state lives
+  // here: `enabled` and `projectAlias`. The Obsidian Vault absolute path is
+  // user-level configuration and is rejected by the portability scan below.
+  const adapters = config.adapters;
+  if (adapters !== undefined) {
+    if (!adapters || typeof adapters !== "object" || Array.isArray(adapters)) {
+      errors.push("adapters: must be an object");
+    } else if (adapters.obsidian !== undefined) {
+      const obsidian = adapters.obsidian;
+      if (!obsidian || typeof obsidian !== "object" || Array.isArray(obsidian)) {
+        errors.push("adapters.obsidian: must be an object");
+      } else {
+        if (obsidian.enabled !== undefined && typeof obsidian.enabled !== "boolean") {
+          errors.push("adapters.obsidian.enabled: must be a boolean");
+        }
+        if (
+          obsidian.projectAlias !== undefined &&
+          (typeof obsidian.projectAlias !== "string" || !obsidian.projectAlias.trim())
+        ) {
+          errors.push("adapters.obsidian.projectAlias: must be a non-empty string");
+        }
+      }
+    }
+  }
+
   scanForNonPortableValues(config, "", errors);
 
   return { valid: errors.length === 0, errors, config };

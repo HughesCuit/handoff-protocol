@@ -158,6 +158,32 @@ Read and restore context from `.handoff/`.
 4. Summarize current state
 5. Generate recommended next actions
 
+### /handoff adapter obsidian link --vault PATH [--alias NAME]
+
+Link the project's `.handoff/` into an Obsidian Vault as `<Vault>/Projects/<alias>` (directory symlink on macOS/Linux, directory junction on Windows).
+
+**Execution:**
+1. Validate the Vault path (must be absolute; spaces and Unicode are fine)
+2. Create `<Vault>/Projects/` if needed, then the link
+3. Store the Vault path in the **user-level** config only: `$XDG_CONFIG_HOME/handoff/config.json` (falling back to `~/.config/handoff/config.json` on macOS/Linux) or `%APPDATA%/handoff/config.json` on Windows — never in `.handoff.config.json`
+4. Record portable adapter state in `.handoff.config.json`:
+   ```json
+   "adapters": { "obsidian": { "enabled": true, "projectAlias": "<alias>" } }
+   ```
+
+**Safety rules:**
+- An existing link to this project's `.handoff/` is an idempotent success
+- Real directories, files, or links pointing elsewhere are never replaced
+- Permission failures return actionable guidance (macOS Full Disk Access; Windows Developer Mode or an elevated terminal)
+
+### /handoff adapter obsidian status
+
+Show the Vault path, alias, link path, and state (`linked`, `missing`, `broken`, `foreign-link`, `conflict`).
+
+### /handoff adapter obsidian unlink
+
+Remove only a verified Adapter-created link (a symlink/junction whose target is exactly this project's `.handoff/`). Never removes the link's target, real directories, files, or foreign links.
+
 ## Output Format
 
 When loading, generate:
@@ -247,13 +273,16 @@ Enhanced functionality (optional). Two runtimes supported:
 **Deno (recommended):**
 - `scripts/save.ts`
 - `scripts/load.ts`
+- `scripts/adapter.ts` - Obsidian adapter commands (`obsidian link|status|unlink`)
 
 **Node.js:**
 - `scripts/node/save.mjs`
 - `scripts/node/load.mjs`
+- `scripts/node/adapter.mjs` - Obsidian adapter commands (`obsidian link|status|unlink`)
 
 **Shared core:**
 - `scripts/context-map.mjs` - Context Map parsing, reconciliation, rendering, and sanitization. Runtime-agnostic ESM imported by both runtimes, so behavior stays identical. Verified by fixture-based tests in `tests/` (`deno test --allow-read --allow-write --allow-run --allow-env tests/deno/` and `node --test "tests/node/**/*.test.mjs"`).
+- `scripts/adapters/obsidian.mjs` - Obsidian adapter core. Runtime-agnostic ESM with an injected `io` seam for symlink/junction operations; consumed by both adapter entry points.
 
 The skill works purely via prompt - scripts provide additional capabilities when available.
 
