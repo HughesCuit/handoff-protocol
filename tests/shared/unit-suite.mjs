@@ -903,6 +903,48 @@ export function defineUnitTests(test, readFixture) {
     }
   });
 
+  test("migrate: a rename-phase failure rolls every replaced file back byte-identically", async () => {
+    const inputs = await readHandoffInputs("legacy-1x");
+    const plan = planMigration(inputs);
+    const seed = seedFromInputs(inputs);
+    const io = makeFakeIo(seed);
+
+    // Inject a failure on the SECOND temp->final rename (context-map.md has
+    // already been moved into place; it had no original).
+    const baseRename = io.rename;
+    let finalRenames = 0;
+    io.rename = async (from, to) => {
+      if (from.endsWith(".migration-tmp")) {
+        finalRenames += 1;
+        if (finalRenames === 2) throw new Error("injected rename failure");
+      }
+      return baseRename(from, to);
+    };
+
+    await assertRejects(
+      () =>
+        applyMigration(
+          plan,
+          { handoffDir: MIGRATE_HANDOFF_DIR, configPath: MIGRATE_CONFIG_PATH },
+          io,
+          { timestamp: "2026-07-26T00:00:00.000Z" }
+        ),
+      "injected rename failure should abort the migration"
+    );
+
+    // Every original file is byte-identical afterwards.
+    for (const [key, value] of Object.entries(seed)) {
+      assertEqual(io.store.get(key), value, `original file changed despite rollback: ${key}`);
+    }
+    // The already-renamed new file (no original) is removed again.
+    assert(!io.store.has(`${MIGRATE_HANDOFF_DIR}/context-map.md`), "rolled-back output left behind");
+    // No temp or rollback residue remains.
+    for (const key of io.store.keys()) {
+      assert(!key.includes("migration-tmp"), `temp file left behind: ${key}`);
+      assert(!key.includes("migration-rollback"), `rollback file left behind: ${key}`);
+    }
+  });
+
   test("migrate: repeated migration is idempotent", async () => {
     const inputs = await readHandoffInputs("legacy-1x");
     const io = makeFakeIo(seedFromInputs(inputs));

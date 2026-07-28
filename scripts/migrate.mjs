@@ -42,7 +42,10 @@
  * `.handoff/history/migrations/<UTC-timestamp>/`, and only then renames each
  * temp file into place — the configuration (the version upgrade) renames
  * last, after the final data rename. Any failure before the rename phase
- * leaves the original files and configuration untouched.
+ * leaves the original files and configuration untouched; a failure DURING
+ * the rename phase rolls every already-replaced file back from its rollback
+ * sibling, so the originals are again byte-identical and no mixed
+ * legacy/v2 state can survive.
  */
 
 import {
@@ -69,6 +72,8 @@ import { validateProjectConfig } from "./config.mjs";
 export const MIGRATION_CONFLICT_LABEL = "Migration conflict";
 /** Suffix for the temporary sibling files outputs are written through. */
 export const MIGRATION_TMP_SUFFIX = ".migration-tmp";
+/** Suffix for the rollback siblings originals are moved to during the rename phase. */
+export const MIGRATION_ROLLBACK_SUFFIX = ".migration-rollback";
 
 const CONFIG_OUTPUT_NAME = ".handoff.config.json";
 /** Canonical reporting order for the files a migration consumed. */
@@ -619,15 +624,21 @@ function validateOutputs(plan) {
  * `paths`: { handoffDir, configPath? }.
  * `io`: runtime-injected filesystem adapter —
  *   { readFile(path), writeFile(path, content), rename(from, to),
- *     mkdir(path), exists(path), remove?(path) } (all may be async).
+ *     mkdir(path), exists(path), remove(path) } (all may be async).
+ *   `remove` is required: the rename phase keeps rollback siblings of the
+ *   originals and restores them on failure.
  * `options.timestamp` fixes the backup directory name (defaults to the
  * current UTC time); tests pass a fixed value for determinism.
  *
  * Sequence: validate plan → write temp files → re-validate temp files →
  * back up originals (filtered) under `.handoff/history/migrations/<UTC>/` →
  * rename data files into place → rename the config (version upgrade) last.
- * A failure before the rename phase leaves originals untouched and cleans up
- * temporary files. Returns `{ migrated, backupDir?, written?, reason? }`.
+ * Before each final rename the existing original (if any) is moved to a
+ * `<final>.migration-rollback` sibling; on ANY rename-phase failure every
+ * already-replaced file is restored from its sibling (files without an
+ * original are removed), so originals end up byte-identical and no mixed
+ * legacy/v2 state remains. Rollback siblings are removed on success.
+ * Returns `{ migrated, backupDir?, written?, reason? }`.
  */
 export async function applyMigration(plan, paths, io, options = {}) {
   if (!plan || !plan.needed) {
@@ -635,6 +646,7 @@ export async function applyMigration(plan, paths, io, options = {}) {
   }
   if (!paths || !paths.handoffDir) throw new Error("applyMigration requires paths.handoffDir");
   if (!io) throw new Error("applyMigration requires an io adapter");
+  if (typeof io.remove !== "function") throw new Error("applyMigration requires io.remove for rename-phase rollback");
   if (!plan.valid) throw new Error("migration plan failed validation; refusing to write");
 
   // Validate every output before touching the filesystem.
@@ -646,6 +658,7 @@ export async function applyMigration(plan, paths, io, options = {}) {
   const backupDir = `${handoffDir}/history/migrations/${sanitizeTimestamp(options.timestamp || new Date().toISOString())}`;
 
   const temps = []; // { name, tempPath, finalPath }
+  const replaced = []; // { finalPath, rollbackPath } — rename-phase rollback state
   try {
     // 1. Write every output through a temporary sibling file.
     for (const [name, content] of Object.entries(outputs)) {
@@ -675,14 +688,38 @@ export async function applyMigration(plan, paths, io, options = {}) {
     }
 
     // 4. Rename data files into place; the version upgrade renames last.
-    for (const temp of temps.filter((t) => t.name !== CONFIG_OUTPUT_NAME)) {
+    //    Each existing original first moves to a rollback sibling so any
+    //    failure mid-phase can restore every already-replaced file.
+    const ordered = [
+      ...temps.filter((t) => t.name !== CONFIG_OUTPUT_NAME),
+      ...temps.filter((t) => t.name === CONFIG_OUTPUT_NAME),
+    ];
+    for (const temp of ordered) {
+      const entry = { finalPath: temp.finalPath, rollbackPath: null };
+      if (await io.exists(temp.finalPath)) {
+        entry.rollbackPath = `${temp.finalPath}${MIGRATION_ROLLBACK_SUFFIX}`;
+        await io.rename(temp.finalPath, entry.rollbackPath);
+      }
+      replaced.push(entry);
       await io.rename(temp.tempPath, temp.finalPath);
     }
-    for (const temp of temps.filter((t) => t.name === CONFIG_OUTPUT_NAME)) {
-      await io.rename(temp.tempPath, temp.finalPath);
+    // Success: drop the rollback siblings.
+    for (const entry of replaced) {
+      if (entry.rollbackPath) await io.remove(entry.rollbackPath);
     }
   } catch (err) {
-    // Best-effort cleanup of temporary files; originals were not renamed yet.
+    // Roll back the rename phase: restore every replaced original and drop
+    // new files that had no original, so no mixed legacy/v2 state survives.
+    for (const entry of replaced.reverse()) {
+      try {
+        if (await io.exists(entry.finalPath)) await io.remove(entry.finalPath);
+        if (entry.rollbackPath) await io.rename(entry.rollbackPath, entry.finalPath);
+      } catch {
+        // Best effort: keep restoring the remaining files.
+      }
+    }
+    // Best-effort cleanup of temporary files; originals were not renamed yet
+    // or have been rolled back above.
     for (const temp of temps) {
       try {
         if (io.remove) await io.remove(temp.tempPath);
