@@ -49,6 +49,7 @@ import {
 } from "./source-comments.mjs";
 import { validateProjectConfig } from "./config.mjs";
 import { applyMigration, planMigration } from "./migrate.mjs";
+import { writeSnapshot } from "./snapshots.mjs";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -652,6 +653,33 @@ const migrationIo = {
   },
 };
 
+// Filesystem adapter for the shared, runtime-agnostic snapshot core.
+const snapshotIo = {
+  readFile: (p: string) => Deno.readTextFile(p),
+  writeFile: async (p: string, content: string) => {
+    await Deno.writeTextFile(p, content);
+  },
+  mkdir: async (p: string) => {
+    await Deno.mkdir(p, { recursive: true });
+  },
+  listDir: async (p: string): Promise<string[]> => {
+    const names: string[] = [];
+    try {
+      for await (const entry of Deno.readDir(p)) names.push(entry.name);
+    } catch {
+      // Missing snapshots directory: no snapshots yet.
+    }
+    return names;
+  },
+  remove: async (p: string) => {
+    try {
+      await Deno.remove(p);
+    } catch {
+      // Already gone: nothing to clean.
+    }
+  },
+};
+
 /**
  * Migrate a legacy (pre-v2) handoff into the canonical model before the save
  * proceeds. The migration is atomic: originals are backed up under
@@ -862,6 +890,15 @@ async function save(mode: string, lang?: string, verbosity?: string): Promise<vo
     join(handoffDir, "context.json"),
     filterSensitive(JSON.stringify(contextJson, null, 2))
   );
+
+  // Semantic snapshot (v2.3): record the reconciled map after a successful
+  // canonical save. Best-effort — a failed snapshot never fails the save.
+  try {
+    const snapshot = await writeSnapshot(reconciled, { handoffDir }, snapshotIo);
+    if (snapshot.written) console.log(`Snapshot: ${snapshot.path}`);
+  } catch (err) {
+    console.error(`Warning: snapshot failed: ${(err as Error).message}`);
+  }
 
   let fileSummary = "HANDOFF.md, context.json, context-map.md";
   if (verbosity !== "low") {

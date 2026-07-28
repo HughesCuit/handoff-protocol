@@ -51,6 +51,7 @@ import {
 } from "../source-comments.mjs";
 import { CONFIG_FILENAME, validateProjectConfig } from "../config.mjs";
 import { applyMigration, planMigration } from "../migrate.mjs";
+import { writeSnapshot } from "../snapshots.mjs";
 
 // ── Security ─────────────────────────────────────────────────────────────────
 // SENSITIVE_PATTERNS and filterSensitive live in ./context-map.mjs (shared with
@@ -330,6 +331,21 @@ const migrationIo = {
   remove: async (p) => rmSync(p, { force: true }),
 };
 
+// Filesystem adapter for the shared, runtime-agnostic snapshot core.
+const snapshotIo = {
+  readFile: async (p) => readFileSync(p, "utf-8"),
+  writeFile: async (p, content) => writeFileSync(p, content),
+  mkdir: async (p) => mkdirSync(p, { recursive: true }),
+  listDir: async (p) => {
+    try {
+      return readdirSync(p);
+    } catch {
+      return [];
+    }
+  },
+  remove: async (p) => rmSync(p, { force: true }),
+};
+
 /**
  * Migrate a legacy (pre-v2) handoff into the canonical model before the save
  * proceeds. The migration is atomic: originals are backed up under
@@ -503,6 +519,15 @@ async function save(mode, lang, verbosity) {
   }
   const contextJson = buildContextJson(metadata, viewHashes, migrationDiagnostics || undefined);
   writeFileSync(join(handoffDir, "context.json"), filterSensitive(JSON.stringify(contextJson, null, 2)));
+
+  // Semantic snapshot (v2.3): record the reconciled map after a successful
+  // canonical save. Best-effort — a failed snapshot never fails the save.
+  try {
+    const snapshot = await writeSnapshot(reconciled, { handoffDir }, snapshotIo);
+    if (snapshot.written) console.log(`Snapshot: ${snapshot.path}`);
+  } catch (err) {
+    console.error(`Warning: snapshot failed: ${err.message}`);
+  }
 
   if (storageMode === "submodule") {
     if (commitAndPushSubmodule(handoffDir)) {

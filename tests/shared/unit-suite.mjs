@@ -10,6 +10,7 @@
 import {
   AGENT_MARKER,
   PROTOCOL_VERSION,
+  emptyContextMap,
   SECTION_KEYS,
   SECTION_LABELS,
   sectionKeyForLabel,
@@ -36,6 +37,13 @@ import {
   isMigrationNeeded,
   planMigration,
 } from "../../scripts/migrate.mjs";
+import {
+  SNAPSHOT_DIR,
+  SNAPSHOT_RETENTION,
+  buildSnapshot,
+  snapshotDigest,
+  writeSnapshot,
+} from "../../scripts/snapshots.mjs";
 import {
   DEFAULT_BUDGET,
   MIN_BUDGET,
@@ -602,6 +610,14 @@ export function defineUnitTests(test, readFixture) {
         ops.push(["mkdir", p]);
       },
       exists: async (p) => store.has(p),
+      listDir: async (p) => {
+        const prefix = p.endsWith("/") ? p : `${p}/`;
+        const names = new Set();
+        for (const key of store.keys()) {
+          if (key.startsWith(prefix)) names.add(key.slice(prefix.length).split("/")[0]);
+        }
+        return [...names];
+      },
       remove: async (p) => {
         ops.push(["remove", p]);
         store.delete(p);
@@ -901,6 +917,127 @@ export function defineUnitTests(test, readFixture) {
     const second = await applyMigration(secondPlan, paths, io, { timestamp: "2026-07-26T01:00:00.000Z" });
     assert(!second.migrated, "second migration must not write");
     assertEqual(JSON.stringify([...io.store.entries()].sort()), snapshot, "second migration changed files");
+  });
+
+  // ── Semantic snapshots (v2.3) ─────────────────────────────────────────────
+
+  const SNAP_HANDOFF_DIR = "/proj/.handoff";
+  const SNAP_PATHS = { handoffDir: SNAP_HANDOFF_DIR };
+
+  function sampleSnapshotMap(goalText = "Ship semantic snapshots") {
+    const map = emptyContextMap();
+    map.sections.goal.push({ text: goalText, origin: "agent", depth: 0 });
+    map.sections.tasks.push({ text: "**high** Wire snapshot writes", origin: "agent", depth: 0, checked: false });
+    map.sections.tasks.push({ text: "Review retention policy", origin: "user", depth: 1, checked: true });
+    return map;
+  }
+
+  function snapshotFiles(io) {
+    return [...io.store.keys()].filter((k) => k.includes(`${SNAPSHOT_DIR}/`)).sort();
+  }
+
+  test("snapshots: first save writes a normalized, sanitized snapshot", async () => {
+    const io = makeFakeIo({});
+    const result = await writeSnapshot(sampleSnapshotMap(), SNAP_PATHS, io, {
+      timestamp: "2026-07-28T00:00:00.000Z",
+    });
+    assert(result.written, "first save should write a snapshot");
+
+    const expected = `${SNAP_HANDOFF_DIR}/${SNAPSHOT_DIR}/2026-07-28T00-00-00-000Z-${result.digest}.json`;
+    assertEqual(result.path, expected, "unexpected snapshot path");
+    const raw = io.store.get(expected);
+    assert(raw, "snapshot file missing");
+
+    const parsed = JSON.parse(raw);
+    assertEqual(parsed.version, PROTOCOL_VERSION);
+    assertEqual(parsed.captured_at, "2026-07-28T00:00:00.000Z");
+    assertEqual(parsed.digest, result.digest);
+    assertEqual(parsed.digest, snapshotDigest(parsed.state), "stored digest does not cover the state");
+    // Normalized: fixed section keys, never localized headings.
+    assertEqual(JSON.stringify(Object.keys(parsed.state.sections)), JSON.stringify(SECTION_KEYS));
+    assertEqual(parsed.state.sections.goal[0].text, "Ship semantic snapshots");
+    assertEqual(parsed.state.sections.tasks[1].checked, true);
+    assertEqual(parsed.state.sections.tasks[1].depth, 1);
+    assertNotIncludes(raw, "agent-hash", "generated fingerprint leaked into the snapshot");
+  });
+
+  test("snapshots: unchanged save writes no new snapshot", async () => {
+    const io = makeFakeIo({});
+    const first = await writeSnapshot(sampleSnapshotMap(), SNAP_PATHS, io, {
+      timestamp: "2026-07-28T00:00:00.000Z",
+    });
+    assert(first.written, "first save should write");
+    const before = JSON.stringify([...io.store.entries()].sort());
+
+    const second = await writeSnapshot(sampleSnapshotMap(), SNAP_PATHS, io, {
+      timestamp: "2026-07-28T01:00:00.000Z",
+    });
+    assert(!second.written, "unchanged semantic state must not write a snapshot");
+    assertEqual(second.reason, "unchanged");
+    assertEqual(JSON.stringify([...io.store.entries()].sort()), before, "unchanged save touched files");
+  });
+
+  test("snapshots: changed save writes a new snapshot", async () => {
+    const io = makeFakeIo({});
+    await writeSnapshot(sampleSnapshotMap(), SNAP_PATHS, io, { timestamp: "2026-07-28T00:00:00.000Z" });
+
+    const second = await writeSnapshot(sampleSnapshotMap("Ship semantic snapshots v2"), SNAP_PATHS, io, {
+      timestamp: "2026-07-28T01:00:00.000Z",
+    });
+    assert(second.written, "changed semantic state must write a snapshot");
+    assertEqual(snapshotFiles(io).length, 2, "changed save should leave both snapshots");
+  });
+
+  test("snapshots: retention keeps the latest 20 snapshots", async () => {
+    const io = makeFakeIo({});
+    for (let i = 0; i < SNAPSHOT_RETENTION + 3; i++) {
+      await writeSnapshot(sampleSnapshotMap(`Goal revision ${i}`), SNAP_PATHS, io, {
+        timestamp: `2026-07-28T00:00:${String(i).padStart(2, "0")}.000Z`,
+      });
+    }
+    const files = snapshotFiles(io);
+    assertEqual(files.length, SNAPSHOT_RETENTION, "retention should cap snapshots at the default 20");
+    assert(files.some((f) => f.includes("00-00-22")), "newest snapshot was pruned");
+    assert(!files.some((f) => f.includes("00-00-00")), "oldest snapshot was retained");
+    assert(!files.some((f) => f.includes("00-00-02")), "third-oldest snapshot was retained");
+  });
+
+  test("snapshots: normalization is stable across localized headings and agent fingerprints", async () => {
+    const en = parseContextMap(renderContextMap(sampleSnapshotMap(), { lang: "en" }));
+    const zh = parseContextMap(renderContextMap(sampleSnapshotMap(), { lang: "zh" }));
+    assertEqual(
+      snapshotDigest(buildSnapshot(en)),
+      snapshotDigest(buildSnapshot(zh)),
+      "localized headings or regenerated fingerprints changed the semantic digest"
+    );
+  });
+
+  test("snapshots: sensitive data is filtered before persistence", async () => {
+    const map = sampleSnapshotMap();
+    map.sections.knowledge.push({ text: "deploy key: api_key=abcdefghijklmnop123456", origin: "user", depth: 0 });
+    const io = makeFakeIo({});
+    const result = await writeSnapshot(map, SNAP_PATHS, io, { timestamp: "2026-07-28T00:00:00.000Z" });
+    const raw = io.store.get(result.path);
+    assertNotIncludes(raw, "abcdefghijklmnop123456", "secret leaked into the snapshot");
+    assertIncludes(raw, "[REDACTED]");
+  });
+
+  test("snapshots: cleanup never touches migration backups or non-snapshot files", async () => {
+    const backupDir = `${SNAP_HANDOFF_DIR}/history/migrations/2026-07-26T00-00-00-000Z`;
+    const seed = {};
+    seed[`${backupDir}/HANDOFF.md`] = "migration backup";
+    seed[`${backupDir}/context.json`] = "{}";
+    seed[`${SNAP_HANDOFF_DIR}/${SNAPSHOT_DIR}/notes.txt`] = "not a snapshot";
+    const io = makeFakeIo(seed);
+
+    for (let i = 0; i < SNAPSHOT_RETENTION + 2; i++) {
+      await writeSnapshot(sampleSnapshotMap(`Goal ${i}`), SNAP_PATHS, io, {
+        timestamp: `2026-07-28T00:00:${String(i).padStart(2, "0")}.000Z`,
+      });
+    }
+    assertEqual(io.store.get(`${backupDir}/HANDOFF.md`), "migration backup", "migration backup was touched");
+    assertEqual(io.store.get(`${backupDir}/context.json`), "{}", "migration backup was touched");
+    assertEqual(io.store.get(`${SNAP_HANDOFF_DIR}/${SNAPSHOT_DIR}/notes.txt`), "not a snapshot", "non-snapshot file was pruned");
   });
 
   // ── Context compiler (v2.1) ────────────────────────────────────────────────

@@ -122,6 +122,32 @@ test("save: generates context-map.md with all sections, reconciles idempotently"
   assertEqual(parsed.sections.goal.length, 1, "goal duplicated across saves");
 });
 
+test("save: snapshots semantic state only when it changes", async () => {
+  const dir = await initTempRepo();
+  runSave(dir);
+  const snapDir = join(dir, ".handoff", "history", "snapshots");
+
+  const first = await readdir(snapDir);
+  assertEqual(first.length, 1, "first save should write one snapshot");
+  assert(first[0].endsWith(".json"), "snapshot should be JSON");
+  const snapshot = JSON.parse(await readFile(join(snapDir, first[0]), "utf-8"));
+  assertEqual(snapshot.version, PROTOCOL_VERSION);
+  assert(snapshot.digest && snapshot.state, "snapshot missing digest/state");
+
+  runSave(dir); // unchanged
+  assertEqual((await readdir(snapDir)).length, 1, "unchanged save must not snapshot");
+
+  // A user edit to the map changes semantic state.
+  const mapPath = join(dir, ".handoff", "context-map.md");
+  const map = await readFile(mapPath, "utf-8");
+  await writeFile(
+    mapPath,
+    map.replace("## Knowledge and Notes", "## Knowledge and Notes\n\n- User note from a human edit")
+  );
+  runSave(dir);
+  assertEqual((await readdir(snapDir)).length, 2, "changed save should write a second snapshot");
+});
+
 test("save: low verbosity still writes the context map (and skips legacy task files)", async () => {
   const dir = await initTempRepo();
   runSave(dir, ["--verbosity", "low"]);

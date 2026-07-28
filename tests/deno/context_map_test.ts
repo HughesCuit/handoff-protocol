@@ -135,6 +135,35 @@ Deno.test("save: generates context-map.md with all sections, reconciles idempote
   assertEqual(second, first, "repeated save was not idempotent");
 });
 
+Deno.test("save: snapshots semantic state only when it changes", async () => {
+  const dir = await initTempRepo();
+  let res = await runSave(dir);
+  assertEqual(res.code, 0, res.stderr);
+  const snapDir = `${dir}/.handoff/history/snapshots`;
+  const names = async (): Promise<string[]> => {
+    const out: string[] = [];
+    for await (const entry of Deno.readDir(snapDir)) out.push(entry.name);
+    return out;
+  };
+
+  assertEqual((await names()).length, 1, "first save should write one snapshot");
+
+  res = await runSave(dir); // unchanged
+  assertEqual(res.code, 0, res.stderr);
+  assertEqual((await names()).length, 1, "unchanged save must not snapshot");
+
+  // A user edit to the map changes semantic state.
+  const mapPath = `${dir}/.handoff/context-map.md`;
+  const map = await Deno.readTextFile(mapPath);
+  await Deno.writeTextFile(
+    mapPath,
+    map.replace("## Knowledge and Notes", "## Knowledge and Notes\n\n- User note from a human edit")
+  );
+  res = await runSave(dir);
+  assertEqual(res.code, 0, res.stderr);
+  assertEqual((await names()).length, 2, "changed save should write a second snapshot");
+});
+
 Deno.test("save: low verbosity still writes the context map (and skips legacy task files)", async () => {
   const dir = await initTempRepo();
   const res = await runSave(dir, ["--verbosity", "low"]);
