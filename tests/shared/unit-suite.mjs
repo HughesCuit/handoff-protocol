@@ -1798,6 +1798,91 @@ export function defineUnitTests(test, readFixture) {
     assertEqual(io.store.get(DIFF_MAP_PATH), mapBody, "context map changed");
   });
 
+  test("diff: default baseline falls back to the previous snapshot after save", async () => {
+    // save → diff: the newest snapshot equals the current state, so the
+    // default comparison must use the PREVIOUS snapshot and show the last
+    // real change instead of reporting "no changes".
+    const before = diffState({ goal: [{ text: "Old goal", depth: 0 }] });
+    const [oldName, oldBody] = diffSnapshotFile(before, "2026-07-28T00-00-00-000Z");
+    const currentMap = emptyContextMap();
+    currentMap.sections.goal.push({ text: "New goal", origin: "user", depth: 0 });
+    const [newName, newBody] = diffSnapshotFile(buildSnapshot(currentMap), "2026-07-28T01-00-00-000Z");
+    const io = makeFakeIo({
+      [oldName]: oldBody,
+      [newName]: newBody,
+      [DIFF_MAP_PATH]: renderContextMap(currentMap, { lang: "en" }),
+    });
+
+    const result = await runDiff({ handoffDir: DIFF_HANDOFF_DIR }, io);
+    assert(result.ok, `runDiff failed: ${result.error}`);
+    assertEqual(
+      result.snapshot.id,
+      oldName.split("/").pop().replace(/\.json$/, ""),
+      "default baseline must be the previous snapshot, not the newest"
+    );
+    assertIncludes(result.output, "Old goal");
+    assertIncludes(result.output, "New goal");
+    assertNotIncludes(result.output, "No changes");
+  });
+
+  test("diff: default baseline stays the newest snapshot with unsaved changes", async () => {
+    // The map drifted since the last save: the newest snapshot differs from
+    // the current state and remains the default baseline.
+    const saved = diffState({ goal: [{ text: "Saved goal", depth: 0 }] });
+    const [snapName, snapBody] = diffSnapshotFile(saved, "2026-07-28T00-00-00-000Z");
+    const currentMap = emptyContextMap();
+    currentMap.sections.goal.push({ text: "Unsaved edit", origin: "user", depth: 0 });
+    const io = makeFakeIo({
+      [snapName]: snapBody,
+      [DIFF_MAP_PATH]: renderContextMap(currentMap, { lang: "en" }),
+    });
+
+    const result = await runDiff({ handoffDir: DIFF_HANDOFF_DIR }, io);
+    assert(result.ok, `runDiff failed: ${result.error}`);
+    assertEqual(result.snapshot.id, snapName.split("/").pop().replace(/\.json$/, ""));
+    assertIncludes(result.output, "Saved goal");
+    assertIncludes(result.output, "Unsaved edit");
+  });
+
+  test("diff: explicit --from latest keeps the literal newest snapshot", async () => {
+    const before = diffState({ goal: [{ text: "Old goal", depth: 0 }] });
+    const [oldName, oldBody] = diffSnapshotFile(before, "2026-07-28T00-00-00-000Z");
+    const currentMap = emptyContextMap();
+    currentMap.sections.goal.push({ text: "New goal", origin: "user", depth: 0 });
+    const [newName, newBody] = diffSnapshotFile(buildSnapshot(currentMap), "2026-07-28T01-00-00-000Z");
+    const io = makeFakeIo({
+      [oldName]: oldBody,
+      [newName]: newBody,
+      [DIFF_MAP_PATH]: renderContextMap(currentMap, { lang: "en" }),
+    });
+
+    const result = await runDiff({ handoffDir: DIFF_HANDOFF_DIR }, io, { from: "latest" });
+    assert(result.ok, `runDiff failed: ${result.error}`);
+    assertEqual(
+      result.snapshot.id,
+      newName.split("/").pop().replace(/\.json$/, ""),
+      "--from latest must pick the newest snapshot even when it equals the current state"
+    );
+    assertIncludes(result.output, "No changes");
+  });
+
+  test("diff: no eligible default baseline is a clear actionable error", async () => {
+    // A single snapshot that already equals the current state: there is no
+    // previous snapshot to compare against.
+    const currentMap = emptyContextMap();
+    currentMap.sections.goal.push({ text: "Only goal", origin: "user", depth: 0 });
+    const [snapName, snapBody] = diffSnapshotFile(buildSnapshot(currentMap), "2026-07-28T00-00-00-000Z");
+    const io = makeFakeIo({
+      [snapName]: snapBody,
+      [DIFF_MAP_PATH]: renderContextMap(currentMap, { lang: "en" }),
+    });
+
+    const result = await runDiff({ handoffDir: DIFF_HANDOFF_DIR }, io);
+    assert(!result.ok, "a missing earlier baseline must fail");
+    assertIncludes(result.error, "current state", "error should explain the situation");
+    assert(result.guidance && result.guidance.includes("--from"), `guidance should be actionable: ${result.guidance}`);
+  });
+
   test("diff: runDiff selects a snapshot by id and honors --format json", async () => {
     const older = diffState({ goal: [{ text: "v1", depth: 0 }] });
     const newer = diffState({ goal: [{ text: "v2", depth: 0 }] });

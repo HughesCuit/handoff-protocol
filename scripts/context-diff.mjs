@@ -12,10 +12,13 @@
  * Diff contract
  * -------------
  * `/handoff diff [--from latest|<snapshot-id>] [--format markdown|json]`
- * compares a semantic snapshot (default: the newest one under
- * `.handoff/history/snapshots/`) against the CURRENT normalized state of the
+ * compares a semantic snapshot against the CURRENT normalized state of the
  * canonical Context Map, and reports added, removed, edited, moved, and
- * task-state-changed nodes as separate, stable arrays.
+ * task-state-changed nodes as separate, stable arrays. Without `--from`,
+ * the baseline is the previous semantic snapshot: the newest snapshot under
+ * `.handoff/history/snapshots/`, unless its digest equals the current
+ * state's digest (the save → diff sequence), in which case the snapshot
+ * before it is used. `--from latest` is literal: always the newest one.
  *
  * Node matching is content-based — no persistent node IDs exist anywhere.
  * Nodes are flattened per section with a hierarchy path ("Parent > Child")
@@ -46,6 +49,7 @@ import {
   SNAPSHOT_DIR,
   SNAPSHOT_FILE_RE,
   buildSnapshot,
+  snapshotDigest,
 } from "./snapshots.mjs";
 
 /** Output formats accepted by `--format`. */
@@ -272,10 +276,30 @@ function parseSnapshot(raw, id) {
 }
 
 /**
+ * Report whether a snapshot file's content digest equals `digest`. The
+ * stored digest is trusted when present and recomputed otherwise; an
+ * unreadable or malformed snapshot never matches (it is picked as-is and
+ * surfaces its own parse error later).
+ */
+async function snapshotMatchesDigest(io, snapshotsDir, name, digest) {
+  try {
+    const snapshot = JSON.parse(await io.readFile(`${snapshotsDir}/${name}`));
+    if (snapshot && typeof snapshot.digest === "string") return snapshot.digest === digest;
+    if (snapshot && snapshot.state) return snapshotDigest(snapshot.state) === digest;
+  } catch {
+    // Fall through: not a match.
+  }
+  return false;
+}
+
+/**
  * Run `/handoff diff` against an injected filesystem.
  *
  * `paths`: { handoffDir }.
- * `options.from`: "latest" (default) or a snapshot id;
+ * `options.from`: a snapshot id, or "latest" for the literal newest snapshot.
+ *   When omitted, the default baseline is the previous semantic snapshot:
+ *   the newest snapshot unless its digest equals the current state's digest
+ *   (save → diff), in which case the snapshot before it is used;
  * `options.format`: "markdown" (default) or "json".
  * `io`: { readFile(path), listDir(path) } — read-only; nothing is ever
  * written, renamed, or removed.
@@ -302,9 +326,36 @@ export async function runDiff(paths, io, options = {}) {
   const snapshotsDir = `${paths.handoffDir}/${SNAPSHOT_DIR}`;
   const names = ((await io.listDir(snapshotsDir)) || []).filter((name) => SNAPSHOT_FILE_RE.test(name)).sort();
 
-  const from = options.from || "latest";
+  const from = options.from;
   let id;
-  if (from === "latest") {
+  if (from === undefined) {
+    // Default baseline: the previous SEMANTIC snapshot. When the newest
+    // snapshot's digest equals the current state's digest (the usual
+    // save → diff sequence), comparing against it would always report
+    // "no changes", so the snapshot before it becomes the baseline. When
+    // the map drifted since the last save, the newest snapshot differs
+    // from the current state and stays the baseline.
+    if (names.length === 0) {
+      return failure(
+        "no semantic snapshots found",
+        "Run `/handoff save` at least once to record a snapshot before diffing."
+      );
+    }
+    const currentDigest = snapshotDigest(current);
+    let pick = names.length - 1;
+    if (await snapshotMatchesDigest(io, snapshotsDir, names[pick], currentDigest)) {
+      pick -= 1;
+    }
+    if (pick < 0) {
+      return failure(
+        "no earlier snapshot to compare against: the newest snapshot already matches the current state",
+        "Use --from latest to compare against the newest snapshot anyway, or make a change and run `/handoff save` first."
+      );
+    }
+    id = names[pick].replace(/\.json$/, "");
+  } else if (from === "latest") {
+    // Explicit --from latest is literal: the newest snapshot, even when it
+    // equals the current state.
     if (names.length === 0) {
       return failure(
         "no semantic snapshots found",
