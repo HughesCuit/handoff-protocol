@@ -326,3 +326,16 @@ test("adapter: CRLF line endings in an existing index are preserved", async () =
   assert(!/(?<!\r)\n/.test(index), "no lone LF may be introduced");
   assertIncludes(index, "- [[Projects/alpha/context-map]]");
 });
+
+test("adapter: a flag-like token is never bound as a flag value", async () => {
+  const project = await makeProject("flag-value");
+  const env = await withXdg();
+
+  const misroute = runAdapter(project, ["obsidian", "link", "--vault", "--alias", "x"], env);
+  assertEqual(misroute.code, 1, "flag-like value must be rejected");
+  assertIncludes(misroute.stderr, "--vault requires a value");
+
+  const trailing = runAdapter(project, ["obsidian", "link", "--vault"], env);
+  assertEqual(trailing.code, 1, "trailing --vault with no value must be rejected");
+  assertIncludes(trailing.stderr, "--vault requires a value");
+});

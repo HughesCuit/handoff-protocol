@@ -104,6 +104,12 @@ export function validateAlias(alias) {
   if (alias === "." || alias === ".." || /[\\/]/.test(alias)) {
     errors.push(`alias: must be a plain directory name, not a path (got "${alias}")`);
   }
+  // Newlines inject extra lines into the managed index block; `]`, `|`,
+  // `#`, `^` break or repurpose the wikilink entry; control characters
+  // corrupt the Vault note.
+  if (/[\r\n\]|[#^\u0000-\u001f\u007f]/.test(alias)) {
+    errors.push("alias: must not contain newlines, control characters, or wikilink syntax characters ( ] | # ^ )");
+  }
   return { valid: errors.length === 0, errors };
 }
 

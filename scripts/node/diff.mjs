@@ -35,8 +35,16 @@ const rawArgs = process.argv.slice(2);
 const namedArgs = {};
 const positionalArgs = [];
 for (let i = 0; i < rawArgs.length; i++) {
-  if ((rawArgs[i] === "--from" || rawArgs[i] === "--format") && rawArgs[i + 1]) {
-    namedArgs[rawArgs[i].slice(2)] = rawArgs[++i];
+  if (rawArgs[i] === "--from" || rawArgs[i] === "--format") {
+    const value = rawArgs[i + 1];
+    // A missing value or a following flag must not be bound as the value or
+    // fall into the positional parse (parity with load.mjs).
+    if (value === undefined || value.startsWith("--")) {
+      console.error(`Error: ${rawArgs[i]} requires a value`);
+      process.exit(1);
+    }
+    namedArgs[rawArgs[i].slice(2)] = value;
+    i++;
   } else {
     positionalArgs.push(rawArgs[i]);
   }

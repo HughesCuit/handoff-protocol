@@ -174,3 +174,15 @@ Deno.test("diff: output is sensitive-filtered before display", async () => {
     assertIncludes(r.stdout, "[REDACTED]");
   }
 });
+
+Deno.test("diff: a flag-like token is never bound as a flag value", async () => {
+  const project = await makeProject();
+
+  const misroute = await runDiff(project, ["--from", "--format", "json"]);
+  assertEqual(misroute.code, 1, "flag-like value must be rejected");
+  assertIncludes(misroute.stderr, "--from requires a value");
+
+  const trailing = await runDiff(project, ["--from"]);
+  assertEqual(trailing.code, 1, "trailing --from with no value must be rejected");
+  assertIncludes(trailing.stderr, "--from requires a value");
+});

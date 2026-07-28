@@ -1267,6 +1267,25 @@ export function defineUnitTests(test, readFixture) {
     }
   });
 
+  test("obsidian: validateAlias rejects wikilink and index-block injection", () => {
+    // Newlines inject extra lines into the managed index block; `]]` closes
+    // the wikilink early; `|`, `#`, `^` are Obsidian wikilink syntax; control
+    // characters corrupt the note.
+    for (const [label, a] of [
+      ["newline", "alpha\n- [[evil]]"],
+      ["carriage return", "alpha\r\nbeta"],
+      ["wikilink close", "alpha]]"],
+      ["wikilink pipe", "alpha|beta"],
+      ["heading ref", "alpha#beta"],
+      ["block ref", "alpha^beta"],
+      ["control char", "alpha\u0007beta"],
+    ]) {
+      const r = validateAlias(a);
+      assert(!r.valid, `${label} alias must be rejected`);
+      assert(r.errors.length > 0, `${label} alias should report an error`);
+    }
+  });
+
   test("obsidian: userConfigPath follows XDG, home fallback, and APPDATA", () => {
     assertEqual(
       userConfigPath({ XDG_CONFIG_HOME: "/cfg", HOME: "/home/alice" }, "linux"),
