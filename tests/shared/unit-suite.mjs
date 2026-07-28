@@ -1636,6 +1636,31 @@ export function defineUnitTests(test, readFixture) {
     assert(r.errors.some((e) => e.includes("adapters.obsidian.vaultPath")), `error should name the field: ${JSON.stringify(r.errors)}`);
   });
 
+  test("config: adapters.obsidian rejects any vaultPath and undeclared keys", () => {
+    const base = { version: "2.2.0", storage: { mode: "direct", path: ".handoff" } };
+    for (const [label, obsidian] of [
+      ["relative vaultPath", { enabled: true, vaultPath: "relative-vault" }],
+      ["absolute vaultPath", { enabled: true, vaultPath: "/Users/alice/Documents/Vault" }],
+      ["windows vaultPath", { vaultPath: "C:\\Vault" }],
+      ["empty vaultPath", { vaultPath: "" }],
+      ["unknown key", { enabled: true, theme: "dark" }],
+      ["machine-specific relative key", { vaultDir: "relative-vault" }],
+    ]) {
+      const r = validateProjectConfig({ ...base, adapters: { obsidian } });
+      assert(!r.valid, `${label} must be rejected`);
+      assert(
+        r.errors.some((e) => e.includes("adapters.obsidian") && /user-level config/.test(e)),
+        `${label} error should point at the user-level config: ${JSON.stringify(r.errors)}`
+      );
+    }
+
+    const ok = validateProjectConfig({
+      ...base,
+      adapters: { obsidian: { enabled: true, projectAlias: "handoff-protocol" } },
+    });
+    assert(ok.valid, `{enabled, projectAlias} must stay valid, errors: ${ok.errors.join("; ")}`);
+  });
+
   // ── Semantic context diff (v2.3) ───────────────────────────────────────────
 
   const DIFF_HANDOFF_DIR = "/proj/.handoff";

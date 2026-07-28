@@ -111,8 +111,13 @@ export function validateProjectConfig(config) {
   }
 
   // Adapter configuration. Only portable, machine-independent state lives
-  // here: `enabled` and `projectAlias`. The Obsidian Vault absolute path is
-  // user-level configuration and is rejected by the portability scan below.
+  // here: `enabled` and `projectAlias`. The Obsidian Vault path (and any
+  // other machine-specific setting) is user-level configuration — rejected
+  // outright here, regardless of value, with a pointer at the user-level
+  // config location.
+  const USER_CONFIG_HINT =
+    "user-level config ($XDG_CONFIG_HOME/handoff/config.json, ~/.config/handoff/config.json, or %APPDATA%/handoff/config.json)";
+  const OBSIDIAN_ALLOWED_KEYS = new Set(["enabled", "projectAlias"]);
   const adapters = config.adapters;
   if (adapters !== undefined) {
     if (!adapters || typeof adapters !== "object" || Array.isArray(adapters)) {
@@ -122,6 +127,18 @@ export function validateProjectConfig(config) {
       if (!obsidian || typeof obsidian !== "object" || Array.isArray(obsidian)) {
         errors.push("adapters.obsidian: must be an object");
       } else {
+        if ("vaultPath" in obsidian) {
+          errors.push(
+            `adapters.obsidian.vaultPath: Vault paths are machine-specific and never portable; configure it in the ${USER_CONFIG_HINT}, not in .handoff.config.json`
+          );
+        }
+        for (const key of Object.keys(obsidian)) {
+          if (!OBSIDIAN_ALLOWED_KEYS.has(key) && key !== "vaultPath") {
+            errors.push(
+              `adapters.obsidian.${key}: unknown key; only "enabled" and "projectAlias" are portable — machine-specific settings belong in the ${USER_CONFIG_HINT}`
+            );
+          }
+        }
         if (obsidian.enabled !== undefined && typeof obsidian.enabled !== "boolean") {
           errors.push("adapters.obsidian.enabled: must be a boolean");
         }
