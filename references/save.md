@@ -60,7 +60,7 @@ Control the detail level of generated handoff content.
 - No TODO/FIXME scan
 - No risk analysis
 - No diff stats
-- Generated files: HANDOFF.md + context.json + context-map.md (skip tasks.md, decisions.md)
+- Generated files: context-map.md + HANDOFF.md view + context.json (skip tasks.md, decisions.md views)
 
 #### `med` (default)
 - Full goal description
@@ -70,7 +70,7 @@ Control the detail level of generated handoff content.
 - TODO/FIXME scan (up to 20 items)
 - Risk analysis enabled
 - Diff stats included
-- Generated files: all 4 (HANDOFF.md, context.json, tasks.md, decisions.md) + context-map.md
+- Generated files: context-map.md + all views (HANDOFF.md, tasks.md, decisions.md) + context.json
 
 #### `high`
 - Full goal description with context
@@ -81,7 +81,7 @@ Control the detail level of generated handoff content.
 - Full risk analysis with severity levels
 - Full diff stats with per-file breakdown
 - Extended architecture notes
-- Generated files: all 4 + context-map.md + optional `analysis.md` (detailed codebase analysis)
+- Generated files: context-map.md + all views + context.json + optional `analysis.md` (detailed codebase analysis)
 
 ## Pre-Flight Checks
 
@@ -175,7 +175,11 @@ Extract `mode`, `--lang`, and `--verbosity` from the command:
 - If `mode` is `compact` and `--verbosity` is also specified, `--verbosity` takes precedence for the detail level, but `compact` mode still applies its own constraints (e.g., reduced commit count).
 - If `mode` is `full` and `--verbosity` is `low`, use `low` verbosity behavior (verbosity overrides mode for detail level).
 
-### 2. Collect Git State
+### 2. Migrate Legacy Handoffs (v2)
+
+If the existing `.handoff/` is a legacy 1.x / v1.5 handoff (including a v1.5 map-only or mixed handoff that predates v2), migrate it first — atomically — before generating new state. See **Legacy Migration** below. Already-migrated v2 handoffs skip this step.
+
+### 3. Collect Git State
 
 ```bash
 git status
@@ -189,13 +193,13 @@ If git unavailable, fall back to:
 - Analyze project structure
 - Extract TODO/FIXME comments
 
-### 3. Analyze Current State
+### 4. Analyze Current State
 
 Determine:
 - Current goal (inferred from recent commits)
 - Progress status (from git working state)
 - Modified files (from `git status --porcelain`)
-- TODO/FIXME items (scanned from source files)
+- TODO/FIXME items (scanned from source file comments; strings, template literals, and Markdown examples are ignored)
 - Risk factors (high-priority items, untracked files)
 
 The depth of analysis is controlled by `--verbosity`:
@@ -208,7 +212,7 @@ The depth of analysis is controlled by `--verbosity`:
 | Diff stats | ✗ | ✓ | ✓ (per-file) |
 | Architecture notes | ✗ | ✗ | ✓ |
 
-### 4. Security Filter
+### 5. Security Filter
 
 **MUST NOT include:**
 - API keys (generic, GitHub `ghp_*`, GitLab `glpat-*`, AWS `AKIA*`)
@@ -220,175 +224,13 @@ The depth of analysis is controlled by `--verbosity`:
 - OAuth tokens, OpenAI API keys
 - `.env` contents
 
-Filter before writing to any `.handoff/` file.
+Filter before writing to any `.handoff/` file — including snapshots and migration backups.
 
-### 5. Generate Output Files
+### 6. Generate Output Files
 
-#### HANDOFF.md (Human-readable)
+Since v2, `context-map.md` is the only writable source of semantic state. Everything else is derived from it.
 
-Structure varies by `--verbosity`:
-
-**low verbosity:**
-```markdown
-# Project Handoff
-
-**Saved**: ISO-8601 timestamp
-**Agent**: agent-name
-**Project**: project-name
-**Branch**: current-branch
-
-## Current Goal
-[inferred from recent commits]
-
-## Current Status
-[brief status]
-
-## Next Steps
-1. [actionable step]
-2. [second step]
-3. [third step]
-```
-
-**med verbosity (default):**
-```markdown
-# Project Handoff
-
-**Saved**: ISO-8601 timestamp
-**Agent**: agent-name
-**Project**: project-name
-**Branch**: current-branch
-**Commit**: hash - message
-
-## Current Goal
-[inferred from recent commits]
-
-## Current Status
-[progress summary from git state]
-
-## Completed Work
-- [item from recent commits]
-
-## Modified Files
-- `path/to/file` [change_type]
-
-## Outstanding Issues
-- [blocker or issue]
-
-## TODO
-- [ ] **priority** task (file:line)
-
-## Recommended Next Steps
-1. [actionable step]
-
-## Risks / Notes
-- [risk or important note]
-```
-
-**high verbosity:**
-```markdown
-# Project Handoff
-
-**Saved**: ISO-8601 timestamp
-**Agent**: agent-name
-**Project**: project-name
-**Branch**: current-branch
-**Commit**: hash - message
-**Language**: lang-code
-
-## Current Goal
-[detailed goal with context]
-
-## Current Status
-[detailed status with file-level breakdown]
-
-## Completed Work
-- [item from recent commits]
-
-## Modified Files
-- `path/to/file` [change_type] - [description of change]
-
-## Outstanding Issues
-- [blocker or issue]
-
-## TODO
-- [ ] **priority** task (file:line)
-
-## Recommended Next Steps
-1. [actionable step] - [rationale]
-
-## Risks / Notes
-- [risk or important note]
-
-## Extended Analysis
-[detailed codebase analysis, dependency changes, test coverage impact]
-```
-
-#### context.json (Machine-readable)
-
-```json
-{
-  "version": "1.5.1",
-  "timestamp": "ISO-8601",
-  "agent": "opencode",
-  "project": "project-name",
-  "current_goal": "description",
-  "status": "in-progress",
-  "completed": ["item1", "item2"],
-  "modified_files": [{"path": "file", "description": "", "change_type": "modified"}],
-  "todos": [{"task": "task", "priority": "high", "status": "pending"}],
-  "blockers": [],
-  "decisions": [],
-  "next_steps": [],
-  "git": {
-    "branch": "main",
-    "latest_commit": "abc1234",
-    "commit_message": "msg",
-    "is_dirty": true
-  },
-  "risks": [],
-  "notes": "",
-  "lang": "zh",
-  "verbosity": "med"
-}
-```
-
-New fields in v1.2.0:
-- `lang` (string): The language code used for this handoff's human-readable content.
-- `verbosity` (string): The verbosity level used (`low`, `med`, `high`).
-
-Since v1.5.0 the semantic content of a handoff is also indexed in `context-map.md`; `context.json` remains the machine-state supplement (git, timestamps, modified files).
-
-#### tasks.md (Pending Work)
-
-Only generated when `verbosity` is `med` or `high`.
-
-```markdown
-# Pending Tasks
-
-## High Priority
-- [ ] [task]
-
-## Medium Priority
-- [ ] [task]
-
-## Low Priority
-- [ ] [task]
-```
-
-#### decisions.md (Architecture Decisions)
-
-Only generated when `verbosity` is `med` or `high`.
-
-```markdown
-# Architecture Decisions
-
-## [Decision Title]
-- **Context**: [why this decision was needed]
-- **Decision**: [what was decided]
-- **Rationale**: [why this approach]
-```
-
-#### context-map.md (Context Map, v1.5)
+#### context-map.md (canonical semantic state)
 
 Generated or reconciled on **every** save, at every mode and verbosity level (including `low`).
 
@@ -399,11 +241,58 @@ The map has eight semantic sections: Current Goal, Current Status, Tasks, Decisi
 - Nodes ending with `<!-- agent -->` are agent-managed: they are replaced by fresh inference for that section, but only when the new inference is non-empty (so a low-verbosity save never degrades the map).
 - Current Goal and Current Status are single-value sections: if the user wrote a value, inference is suppressed for that section.
 - An inferred node that is a semantic duplicate of an existing node (compared case-insensitively, ignoring checkbox state, priority markers, and punctuation) is not appended, so repeated saves are idempotent.
-- The sensitive-data filter (step 4) is applied before any map content is written.
+- The sensitive-data filter (step 5) is applied before any map content is written.
 
 See `assets/context-map.template.md` for the full layout.
 
-### 6. Write Files and Commit
+#### HANDOFF.md, tasks.md, decisions.md (generated views)
+
+Deterministic views rendered from the map (plus save-time machine metadata). Every view begins with:
+
+```
+<!-- generated-from: context-map.md; do not edit -->
+```
+
+- `tasks.md` and `decisions.md` views are skipped at `low` verbosity (their hash entries in `context.json` are preserved, so tamper detection keeps working).
+- On save, any view whose on-disk content no longer matches its stored hash produces a warning naming the file; the manual edit is never imported into the map and is overwritten by regeneration. To change semantic state, edit `context-map.md`.
+
+#### context.json (v2, machine-readable metadata)
+
+Carries **no semantic fields** — the Context Map is the only semantic source.
+
+```json
+{
+  "version": "2.0.0",
+  "timestamp": "ISO-8601",
+  "agent": "opencode",
+  "project": "project-name",
+  "lang": null,
+  "git": {
+    "branch": "main",
+    "latest_commit": "abc1234",
+    "commit_message": "msg",
+    "is_dirty": true
+  },
+  "views": {
+    "HANDOFF.md": "sha256-of-the-written-view",
+    "tasks.md": "sha256-of-the-written-view",
+    "decisions.md": "sha256-of-the-written-view"
+  },
+  "diagnostics": {
+    "migration": [],
+    "conflicts": []
+  }
+}
+```
+
+- `views` holds SHA-256 hashes of the generated views as written; loaders and savers compare on-disk contents against these hashes to surface manual edits.
+- `diagnostics.migration` records what a legacy migration consumed; `diagnostics.conflicts` mirrors the "Migration conflict" nodes.
+
+### 7. Write Semantic Snapshot
+
+After writing the files, compare the map's semantic state against the latest snapshot under `.handoff/history/snapshots/` and write a new snapshot **only when the semantic state changed**. Snapshots are sanitized (sensitive-data filter applied, generated fingerprints stripped), bounded to the 20 most recent (pruned oldest-first, snapshot-pattern files only), and are the baseline for `/handoff diff`.
+
+### 8. Write Files and Commit
 
 **direct mode:**
 1. Write files to `.handoff/` (file count depends on verbosity)
@@ -432,6 +321,29 @@ Commit it in the parent repository only if you want collaborators
 to use this exact handoff revision.
 ```
 
+## Legacy Migration (v2)
+
+Legacy 1.x and v1.5 handoffs migrate automatically on the next save. `load` never migrates — it reads legacy handoffs unchanged and prints a note that migration is available.
+
+**Precedence (highest first):**
+1. Explicit current user instructions and direct Context Map edits
+2. Structured legacy `context.json`
+3. Human-readable legacy files (`tasks.md`, `decisions.md`, `HANDOFF.md`)
+
+Singleton fields (goal, status) have exactly one winner. Superseded lower-priority values are never dropped: they stay visible as child nodes under an Open Questions "Migration conflict" node, each labeled with its source file (e.g. `(source: context.json)`), and are mirrored into `diagnostics.conflicts`. List sections merge across sources in precedence order with semantic deduplication, so task state, decision rationale, risks, questions, and exclusions are all preserved — no silent loss.
+
+**Atomicity and backup:**
+1. The migration plan is computed purely (no I/O) and validated, along with every output.
+2. All outputs are written through temporary sibling files and re-validated.
+3. The originals — including `.handoff.config.json` — are backed up under `.handoff/history/migrations/<UTC-timestamp>/`.
+4. Only then is each temp file renamed into place; the config (the version upgrade) renames last.
+
+Any failure **before** the rename phase leaves the original files and configuration untouched and cleans up temporary files. If a failure strikes **during** the rename phase, recovery is manual: copy the originals back from `.handoff/history/migrations/<UTC-timestamp>/` (including `.handoff.config.json`) and re-run `/handoff save`.
+
+**Backups are sensitive-data filtered.** If a legacy file contained credential-like content, its backup copy holds the filtered text, not the original bytes — do not rely on the backup to recover secrets.
+
+Migration is idempotent: an already-migrated v2 handoff needs no migration and creates no second backup.
+
 ## Verbosity-Specific Behavior Summary
 
 | Feature | low | med | high |
@@ -441,11 +353,12 @@ to use this exact handoff revision.
 | Risk analysis | ✗ | ✓ | ✓ (extended) |
 | Diff stats | ✗ | ✓ | ✓ (per-file) |
 | Next steps limit | 3 | 8 | 15 |
-| tasks.md | ✗ | ✓ | ✓ |
-| decisions.md | ✗ | ✓ | ✓ |
 | context-map.md | ✓ | ✓ | ✓ |
+| HANDOFF.md view | ✓ | ✓ | ✓ |
+| tasks.md view | ✗ | ✓ | ✓ |
+| decisions.md view | ✗ | ✓ | ✓ |
 | analysis.md | ✗ | ✗ | ✓ |
-| File descriptions | ✗ | ✗ | ✓ |
+| Semantic snapshot | on change | on change | on change |
 
 ## Mode vs Verbosity Interaction
 
@@ -474,6 +387,8 @@ Rule: `--verbosity` sets the detail floor. `mode` adds behavior on top.
 | Permission error | Report error, suggest fix |
 | Invalid `--lang` value | Warn and fall back to conversation language |
 | Invalid `--verbosity` value | Error: show valid values (low, med, high) |
+| Legacy handoff detected | Migrate atomically with backup, then save |
+| Generated view manually edited | Warn, regenerate from the map (never import the edit) |
 
 ## Examples
 

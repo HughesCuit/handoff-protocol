@@ -1,13 +1,13 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "Handoff Context",
-  "description": "Machine-readable work context for cross-agent handoff",
+  "title": "Handoff Context (v2)",
+  "description": "Machine-readable metadata for cross-agent handoff. Since v2 this file carries no semantic fields — context-map.md is the only semantic source; this file holds protocol metadata, git state, SHA-256 hashes of the generated views, and migration/conflict diagnostics.",
   "type": "object",
-  "required": ["project", "current_goal", "status", "timestamp"],
+  "required": ["version", "timestamp", "project"],
   "properties": {
     "version": {
       "type": "string",
-      "default": "1.5.1"
+      "default": "2.0.0"
     },
     "timestamp": {
       "type": "string",
@@ -22,78 +22,9 @@
       "type": "string",
       "description": "Project name or identifier"
     },
-    "current_goal": {
-      "type": "string",
-      "description": "Primary objective"
-    },
-    "status": {
-      "type": "string",
-      "enum": ["in-progress", "blocked", "completed", "paused"],
-      "description": "Current work status"
-    },
-    "completed": {
-      "type": "array",
-      "items": { "type": "string" },
-      "description": "List of completed tasks"
-    },
-    "modified_files": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "path": { "type": "string" },
-          "description": { "type": "string" },
-          "change_type": {
-            "type": "string",
-            "enum": ["added", "modified", "deleted", "renamed"]
-          }
-        },
-        "required": ["path"]
-      },
-      "description": "Files modified during work"
-    },
-    "todos": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "task": { "type": "string" },
-          "priority": {
-            "type": "string",
-            "enum": ["high", "medium", "low"]
-          },
-          "status": {
-            "type": "string",
-            "enum": ["pending", "in-progress"]
-          }
-        },
-        "required": ["task"]
-      },
-      "description": "Pending tasks"
-    },
-    "blockers": {
-      "type": "array",
-      "items": { "type": "string" },
-      "description": "Current blockers or issues"
-    },
-    "decisions": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "title": { "type": "string" },
-          "context": { "type": "string" },
-          "decision": { "type": "string" },
-          "rationale": { "type": "string" }
-        },
-        "required": ["title", "decision"]
-      },
-      "description": "Architecture decisions made"
-    },
-    "next_steps": {
-      "type": "array",
-      "items": { "type": "string" },
-      "description": "Recommended next actions"
+    "lang": {
+      "type": ["string", "null"],
+      "description": "Language code used for human-readable content (e.g. zh, en, ja)"
     },
     "git": {
       "type": "object",
@@ -101,38 +32,30 @@
         "branch": { "type": "string" },
         "latest_commit": { "type": "string" },
         "commit_message": { "type": "string" },
-        "remote_url": { "type": "string" },
         "is_dirty": { "type": "boolean" }
       },
       "description": "Git repository state"
     },
-    "environment": {
+    "views": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "SHA-256 hashes of the generated views (HANDOFF.md, tasks.md, decisions.md) as written; used to detect manual view edits"
+    },
+    "diagnostics": {
       "type": "object",
       "properties": {
-        "language": { "type": "string" },
-        "framework": { "type": "string" },
-        "runtime": { "type": "string" }
+        "migration": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "What a legacy-to-v2 migration consumed"
+        },
+        "conflicts": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Superseded values preserved under Open Questions > Migration conflict"
+        }
       },
-      "description": "Project environment info"
-    },
-    "risks": {
-      "type": "array",
-      "items": { "type": "string" },
-      "description": "Known risks or concerns"
-    },
-    "notes": {
-      "type": "string",
-      "description": "Additional notes"
-    },
-    "lang": {
-      "type": "string",
-      "description": "Language code used for human-readable content (e.g. zh, en, ja)"
-    },
-    "verbosity": {
-      "type": "string",
-      "enum": ["low", "med", "high"],
-      "default": "med",
-      "description": "Detail level of the handoff content"
+      "description": "Migration and conflict diagnostics"
     }
   }
 }
