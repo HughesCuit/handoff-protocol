@@ -51,6 +51,13 @@ import {
   estimateTokens,
 } from "../../scripts/context-compiler.mjs";
 import {
+  DIFF_FORMATS,
+  diffStates,
+  renderDiffJson,
+  renderDiffMarkdown,
+  runDiff,
+} from "../../scripts/context-diff.mjs";
+import {
   linkPathFor,
   obsidianLink,
   obsidianStatus,
@@ -1498,5 +1505,307 @@ export function defineUnitTests(test, readFixture) {
     const r = validateProjectConfig(config);
     assert(!r.valid, "Vault absolute path in project config must be rejected");
     assert(r.errors.some((e) => e.includes("adapters.obsidian.vaultPath")), `error should name the field: ${JSON.stringify(r.errors)}`);
+  });
+
+  // ── Semantic context diff (v2.3) ───────────────────────────────────────────
+
+  const DIFF_HANDOFF_DIR = "/proj/.handoff";
+  const DIFF_SNAP_DIR = `${DIFF_HANDOFF_DIR}/${SNAPSHOT_DIR}`;
+  const DIFF_MAP_PATH = `${DIFF_HANDOFF_DIR}/context-map.md`;
+
+  function diffState(nodesBySection) {
+    const sections = {};
+    for (const key of SECTION_KEYS) {
+      sections[key] = (nodesBySection[key] || []).map((n) => ({ origin: "user", ...n }));
+    }
+    return { sections, extras: nodesBySection.extras || [] };
+  }
+
+  function diffSnapshotFile(state, timestamp = "2026-07-28T00-00-00-000Z") {
+    const digest = snapshotDigest(state);
+    return [`${DIFF_SNAP_DIR}/${timestamp}-${digest}.json`, JSON.stringify({
+      version: PROTOCOL_VERSION,
+      captured_at: timestamp,
+      digest,
+      state,
+    }, null, 2)];
+  }
+
+  test("diff: no changes yields empty change classes", () => {
+    const state = diffState({
+      goal: [{ text: "Ship v2.3", depth: 0 }],
+      tasks: [{ text: "Wire diff", depth: 0, checked: false }],
+    });
+    const model = diffStates(state, JSON.parse(JSON.stringify(state)));
+    for (const key of ["added", "removed", "edited", "moved", "taskStateChanged"]) {
+      assertEqual(model[key].length, 0, `${key} must be empty for identical states`);
+    }
+  });
+
+  test("diff: added and removed nodes are reported separately", () => {
+    const before = diffState({
+      goal: [{ text: "Old goal", depth: 0 }],
+      decisions: [{ text: "Drop this decision", depth: 0 }],
+    });
+    const after = diffState({
+      goal: [{ text: "Old goal", depth: 0 }],
+      risks: [{ text: "Brand new risk", depth: 0 }],
+    });
+    const model = diffStates(before, after);
+    assertEqual(model.added.length, 1, "one added node expected");
+    assertEqual(model.removed.length, 1, "one removed node expected");
+    assertEqual(model.edited.length, 0, "cross-section changes must not be paired as edits");
+
+    assertEqual(model.added[0].section, "risks");
+    assertEqual(model.added[0].after, "Brand new risk");
+    assert(!("before" in model.added[0]), "added entries carry no before text");
+
+    assertEqual(model.removed[0].section, "decisions");
+    assertEqual(model.removed[0].before, "Drop this decision");
+    assert(!("after" in model.removed[0]), "removed entries carry no after text");
+
+    // Edited pairing only applies within the same section and depth.
+    const edited = diffStates(
+      diffState({ status: [{ text: "Half done", depth: 0 }] }),
+      diffState({ status: [{ text: "Nearly done", depth: 0 }] })
+    );
+    assertEqual(edited.edited.length, 1, "same-slot rewrite must be an edit");
+    assertEqual(edited.edited[0].before, "Half done");
+    assertEqual(edited.edited[0].after, "Nearly done");
+    assertEqual(edited.added.length + edited.removed.length, 0, "an edit is not add+remove");
+  });
+
+  test("diff: moved nodes are reported once, not as remove+add", () => {
+    const before = diffState({
+      decisions: [{ text: "Parent", depth: 0 }, { text: "Child", depth: 1 }],
+    });
+    const after = diffState({
+      decisions: [{ text: "Child", depth: 0 }, { text: "Parent", depth: 0 }],
+    });
+    const model = diffStates(before, after);
+    assertEqual(model.added.length, 0, "moves must not surface as additions");
+    assertEqual(model.removed.length, 0, "moves must not surface as removals");
+    assertEqual(model.moved.length, 1, "only the re-parented node moved");
+    const child = model.moved.find((m) => m.text === "Child");
+    assertEqual(child.before.path, "Parent > Child");
+    assertEqual(child.after.path, "Child");
+    assertEqual(child.before.section, "decisions");
+    assertEqual(child.after.section, "decisions");
+  });
+
+  test("diff: identical texts in different positions match by occurrence", () => {
+    const before = diffState({
+      decisions: [{ text: "Same", depth: 0 }, { text: "Same", depth: 0 }],
+    });
+    const after = diffState({
+      decisions: [{ text: "Same", depth: 0 }, { text: "Same", depth: 0 }],
+    });
+    const model = diffStates(before, after);
+    assertEqual(model.moved.length, 0, "identical duplicates in identical order must not move");
+    assertEqual(model.added.length + model.removed.length, 0);
+  });
+
+  test("diff: task checkbox flips are task-state changes, not edits", () => {
+    const before = diffState({
+      tasks: [
+        { text: "Wire diff", depth: 0, checked: false },
+        { text: "Done already", depth: 0, checked: true },
+      ],
+    });
+    const after = diffState({
+      tasks: [
+        { text: "Wire diff", depth: 0, checked: true },
+        { text: "Done already", depth: 0, checked: true },
+      ],
+    });
+    const model = diffStates(before, after);
+    assertEqual(model.taskStateChanged.length, 1);
+    assertEqual(model.edited.length, 0, "a checkbox flip is not a text edit");
+    const change = model.taskStateChanged[0];
+    assertEqual(change.section, "tasks");
+    assertEqual(change.path, "Wire diff");
+    assertEqual(change.task.before, false);
+    assertEqual(change.task.after, true);
+  });
+
+  test("diff: mixed changes populate every class independently", () => {
+    const before = diffState({
+      goal: [{ text: "Keep", depth: 0 }],
+      tasks: [{ text: "Flip me", depth: 0, checked: false }],
+      decisions: [
+        { text: "Move me", depth: 0 },
+        { text: "Edit me", depth: 0 },
+        { text: "Remove me", depth: 0 },
+      ],
+    });
+    const after = diffState({
+      goal: [{ text: "Keep", depth: 0 }],
+      tasks: [{ text: "Flip me", depth: 0, checked: true }],
+      decisions: [{ text: "Edit me instead", depth: 0 }],
+      risks: [
+        { text: "Move me", depth: 0 },
+        { text: "Fresh risk", depth: 0 },
+      ],
+    });
+    const model = diffStates(before, after);
+    assertEqual(model.added.length, 1);
+    assertEqual(model.added[0].section, "risks");
+    assertEqual(model.removed.length, 1);
+    assertEqual(model.removed[0].before, "Remove me");
+    assertEqual(model.edited.length, 1);
+    assertEqual(model.edited[0].before, "Edit me");
+    assertEqual(model.edited[0].after, "Edit me instead");
+    assertEqual(model.moved.length, 1);
+    assertEqual(model.moved[0].text, "Move me");
+    assertEqual(model.taskStateChanged.length, 1);
+    assertEqual(model.taskStateChanged[0].path, "Flip me");
+  });
+
+  test("diff: JSON and Markdown render the same model", () => {
+    const before = diffState({
+      tasks: [{ text: "Flip me", depth: 0, checked: false }],
+      decisions: [{ text: "Gone", depth: 0 }],
+    });
+    const after = diffState({
+      tasks: [{ text: "Flip me", depth: 0, checked: true }],
+      decisions: [{ text: "Here", depth: 0 }],
+    });
+    const model = diffStates(before, after);
+    const meta = { from: "latest", snapshotId: "snap-1", capturedAt: "2026-07-28T00:00:00.000Z" };
+
+    const json = JSON.parse(renderDiffJson(model, meta));
+    assertEqual(json.snapshot.id, "snap-1");
+    for (const key of ["added", "removed", "edited", "moved", "taskStateChanged"]) {
+      assert(Array.isArray(json[key]), `json.${key} must be an array`);
+      assertEqual(json[key].length, model[key].length, `json.${key} diverges from the model`);
+    }
+
+    const md = renderDiffMarkdown(model, meta);
+    assertIncludes(md, "Context diff");
+    assertIncludes(md, "snap-1");
+    assertIncludes(md, "Added");
+    assertIncludes(md, "Removed");
+    assertIncludes(md, "Edited");
+    assertIncludes(md, "Moved");
+    assertIncludes(md, "Task state changed");
+    assertIncludes(md, "Here");
+    assertIncludes(md, "Gone");
+    assertIncludes(md, "Flip me");
+
+    const empty = renderDiffMarkdown(diffStates(before, JSON.parse(JSON.stringify(before))), meta);
+    assertIncludes(empty, "No changes", "an empty diff should say so");
+  });
+
+  test("diff: output is sensitive-filtered even from a hostile snapshot", () => {
+    const before = diffState({
+      knowledge: [{ text: "deploy key: api_key=abcdefghijklmnop123456", depth: 0 }],
+    });
+    const after = diffState({ knowledge: [{ text: "rotated", depth: 0 }] });
+    const model = diffStates(before, after);
+    for (const out of [renderDiffJson(model, {}), renderDiffMarkdown(model, {})]) {
+      assertNotIncludes(out, "abcdefghijklmnop123456", "raw secret leaked into diff output");
+      assertIncludes(out, "[REDACTED]");
+    }
+  });
+
+  test("diff: runDiff defaults to the latest snapshot and never mutates", async () => {
+    const before = diffState({
+      goal: [{ text: "Old goal", depth: 0 }],
+      tasks: [{ text: "Flip", depth: 0, checked: false }],
+    });
+    const [snapName, snapBody] = diffSnapshotFile(before, "2026-07-28T00-00-00-000Z");
+    const afterMap = emptyContextMap();
+    afterMap.sections.goal.push({ text: "New goal", origin: "agent", depth: 0 });
+    afterMap.sections.tasks.push({ text: "Flip", origin: "user", depth: 0, checked: true });
+    const mapBody = renderContextMap(afterMap, { lang: "en" });
+    const io = makeFakeIo({ [snapName]: snapBody, [DIFF_MAP_PATH]: mapBody });
+
+    const result = await runDiff({ handoffDir: DIFF_HANDOFF_DIR }, io);
+    assert(result.ok, `runDiff failed: ${result.error}`);
+    assertEqual(result.format, "markdown", "default format must be markdown");
+    assertEqual(result.snapshot.id, snapName.split("/").pop().replace(/\.json$/, ""));
+    assertIncludes(result.output, "New goal");
+    assertIncludes(result.output, "Old goal");
+
+    const parsed = JSON.parse(renderDiffJson(result.model, {}));
+    assertEqual(parsed.edited.length, 1, "goal rewrite must be an edit");
+    assertEqual(parsed.taskStateChanged.length, 1, "task flip must be reported");
+
+    // Read-only contract: nothing was written, moved, or removed.
+    assertEqual(io.ops.length, 0, `diff must not mutate state, ops: ${JSON.stringify(io.ops)}`);
+    assertEqual(io.store.get(snapName), snapBody, "snapshot file changed");
+    assertEqual(io.store.get(DIFF_MAP_PATH), mapBody, "context map changed");
+  });
+
+  test("diff: runDiff selects a snapshot by id and honors --format json", async () => {
+    const older = diffState({ goal: [{ text: "v1", depth: 0 }] });
+    const newer = diffState({ goal: [{ text: "v2", depth: 0 }] });
+    const [oldName, oldBody] = diffSnapshotFile(older, "2026-07-28T00-00-00-000Z");
+    const [newName, newBody] = diffSnapshotFile(newer, "2026-07-28T01-00-00-000Z");
+    const afterMap = emptyContextMap();
+    afterMap.sections.goal.push({ text: "v3", origin: "user", depth: 0 });
+    const io = makeFakeIo({
+      [oldName]: oldBody,
+      [newName]: newBody,
+      [DIFF_MAP_PATH]: renderContextMap(afterMap, { lang: "en" }),
+    });
+
+    const oldId = oldName.split("/").pop().replace(/\.json$/, "");
+    const result = await runDiff({ handoffDir: DIFF_HANDOFF_DIR }, io, { from: oldId, format: "json" });
+    assert(result.ok, `runDiff failed: ${result.error}`);
+    assertEqual(result.snapshot.id, oldId, "explicit --from id must win over the latest snapshot");
+    const json = JSON.parse(result.output);
+    assertEqual(json.edited[0].before, "v1", "diff must compare against the requested snapshot");
+    assertEqual(json.edited[0].after, "v3");
+  });
+
+  test("diff: unknown or malformed snapshot ids are actionable errors", async () => {
+    const state = diffState({ goal: [{ text: "v1", depth: 0 }] });
+    const [snapName, snapBody] = diffSnapshotFile(state);
+    const io = makeFakeIo({
+      [snapName]: snapBody,
+      [DIFF_MAP_PATH]: renderContextMap(emptyContextMap(), { lang: "en" }),
+    });
+
+    const unknown = await runDiff({ handoffDir: DIFF_HANDOFF_DIR }, io, { from: "1999-01-01T00-00-00-000Z-deadbeef" });
+    assert(!unknown.ok, "unknown snapshot id must fail");
+    assertIncludes(unknown.error, "1999-01-01T00-00-00-000Z-deadbeef");
+
+    const invalid = await runDiff({ handoffDir: DIFF_HANDOFF_DIR }, io, { from: "../../etc/passwd" });
+    assert(!invalid.ok, "malformed snapshot id must fail");
+    assertIncludes(invalid.error, "invalid", "error should call the id invalid");
+
+    const badFormat = await runDiff({ handoffDir: DIFF_HANDOFF_DIR }, io, { format: "yaml" });
+    assert(!badFormat.ok, "unknown format must fail");
+    assertIncludes(badFormat.error, "markdown", "error should list valid formats");
+    assertIncludes(badFormat.error, "json", "error should list valid formats");
+  });
+
+  test("diff: missing snapshots and malformed snapshot files fail cleanly", async () => {
+    const io = makeFakeIo({ [DIFF_MAP_PATH]: renderContextMap(emptyContextMap(), { lang: "en" }) });
+    const none = await runDiff({ handoffDir: DIFF_HANDOFF_DIR }, io);
+    assert(!none.ok, "no snapshots must fail");
+    assertIncludes(none.error, "snapshot");
+
+    const broken = makeFakeIo({
+      [`${DIFF_SNAP_DIR}/2026-07-28T00-00-00-000Z-abcdef01.json`]: "{ not json",
+      [DIFF_MAP_PATH]: renderContextMap(emptyContextMap(), { lang: "en" }),
+    });
+    const malformed = await runDiff({ handoffDir: DIFF_HANDOFF_DIR }, broken, { from: "2026-07-28T00-00-00-000Z-abcdef01" });
+    assert(!malformed.ok, "unparseable snapshot must fail");
+    assertIncludes(malformed.error, "malformed");
+
+    const noState = makeFakeIo({
+      [`${DIFF_SNAP_DIR}/2026-07-28T00-00-00-000Z-abcdef02.json`]: JSON.stringify({ version: "2.0.0" }),
+      [DIFF_MAP_PATH]: renderContextMap(emptyContextMap(), { lang: "en" }),
+    });
+    const missing = await runDiff({ handoffDir: DIFF_HANDOFF_DIR }, noState, { from: "2026-07-28T00-00-00-000Z-abcdef02" });
+    assert(!missing.ok, "snapshot without state must fail");
+    assertIncludes(missing.error, "malformed");
+
+    const noMap = makeFakeIo({});
+    const noMapResult = await runDiff({ handoffDir: DIFF_HANDOFF_DIR }, noMap, { from: "whatever" });
+    assert(!noMapResult.ok, "missing context map must fail");
+    assertIncludes(noMapResult.error, "context-map.md");
   });
 }

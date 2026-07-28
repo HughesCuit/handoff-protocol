@@ -184,6 +184,18 @@ Show the Vault path, alias, link path, and state (`linked`, `missing`, `broken`,
 
 Remove only a verified Adapter-created link (a symlink/junction whose target is exactly this project's `.handoff/`). Never removes the link's target, real directories, files, or foreign links.
 
+### /handoff diff [--from latest|SNAPSHOT_ID] [--format markdown|json]
+
+Compare a semantic snapshot against the current Context Map and report added, removed, edited, moved, and task-state-changed nodes as separate groups. The default comparison is the latest snapshot under `.handoff/history/snapshots/` against the current state; `--from <snapshot-id>` pins an older snapshot.
+
+**Execution:**
+1. Run `scripts/diff.ts` (Deno) or `scripts/node/diff.mjs` (Node.js) with the requested flags
+2. Present the report; `--format json` emits stable arrays (`added`, `removed`, `edited`, `moved`, `taskStateChanged`) with `section`, `path`, `before`/`after`, and task state where relevant
+
+**Safety rules:**
+- Diff is strictly read-only: it never mutates snapshots, the Context Map, or any other file
+- Comparison works on normalized semantic state, so localized headings and generated fingerprints never produce phantom changes
+
 ## Output Format
 
 When loading, generate:
@@ -274,15 +286,18 @@ Enhanced functionality (optional). Two runtimes supported:
 - `scripts/save.ts`
 - `scripts/load.ts`
 - `scripts/adapter.ts` - Obsidian adapter commands (`obsidian link|status|unlink`)
+- `scripts/diff.ts` - Semantic context diff (`--from latest|<snapshot-id>`, `--format markdown|json`)
 
 **Node.js:**
 - `scripts/node/save.mjs`
 - `scripts/node/load.mjs`
 - `scripts/node/adapter.mjs` - Obsidian adapter commands (`obsidian link|status|unlink`)
+- `scripts/node/diff.mjs` - Semantic context diff (`--from latest|<snapshot-id>`, `--format markdown|json`)
 
 **Shared core:**
 - `scripts/context-map.mjs` - Context Map parsing, reconciliation, rendering, and sanitization. Runtime-agnostic ESM imported by both runtimes, so behavior stays identical. Verified by fixture-based tests in `tests/` (`deno test --allow-read --allow-write --allow-run --allow-env tests/deno/` and `node --test "tests/node/**/*.test.mjs"`).
 - `scripts/adapters/obsidian.mjs` - Obsidian adapter core. Runtime-agnostic ESM with an injected `io` seam for symlink/junction operations; consumed by both adapter entry points.
+- `scripts/context-diff.mjs` - Semantic diff core. Runtime-agnostic ESM that matches nodes by normalized content, section, and hierarchy (no persistent IDs) and renders both output formats; strictly read-only.
 
 The skill works purely via prompt - scripts provide additional capabilities when available.
 
