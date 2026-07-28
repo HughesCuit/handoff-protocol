@@ -506,6 +506,14 @@ test("load --full: selects the entire map regardless of focus", () => {
   assertNotIncludes(res.stdout, "Fallback:");
 });
 
+test("load --focus: a present-but-empty value is rejected like a missing one", () => {
+  for (const args of [["--focus"], ["--focus", ""]]) {
+    const res = runLoadArgs(join(fixturesDir, "handoffs", "map-only"), args);
+    assertEqual(res.status, 1, `args ${JSON.stringify(args)} must exit 1: ${res.stdout}${res.stderr}`);
+    assertIncludes(res.stderr, "--focus requires a value");
+  }
+});
+
 test("load: without compiler flags the output carries no compiler diagnostics", () => {
   for (const mode of ["default", "auto", "merge"]) {
     const res = runLoadArgs(join(fixturesDir, "handoffs", "map-only"), [mode]);

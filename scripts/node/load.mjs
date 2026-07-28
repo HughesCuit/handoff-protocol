@@ -298,7 +298,9 @@ function parseCliArgs(argv) {
       full = true;
     } else if (arg === "--focus" || arg === "--budget") {
       const value = argv[i + 1];
-      if (value === undefined) {
+      // An empty --focus is rejected like a missing one (parity with the
+      // Deno CLI, which cannot distinguish a bare flag from an empty value).
+      if (value === undefined || (arg === "--focus" && value === "")) {
         console.error(`Error: ${arg} requires a value`);
         process.exit(1);
       }

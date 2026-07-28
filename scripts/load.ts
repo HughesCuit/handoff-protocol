@@ -799,6 +799,13 @@ async function main() {
     Deno.exit(1);
   }
 
+  // std flags cannot distinguish a bare `--focus` from an empty value; both
+  // are rejected, matching the Node CLI's error and exit code.
+  if (args.focus !== undefined && args.focus === "") {
+    console.error("Error: --focus requires a value");
+    Deno.exit(1);
+  }
+
   let compile: CompileRequest | null = null;
   if (args.focus !== undefined || args.budget !== undefined || args.full) {
     let budget: number | undefined;

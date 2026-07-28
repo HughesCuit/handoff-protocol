@@ -542,6 +542,14 @@ Deno.test("load --full: selects the entire map regardless of focus", async () =>
   assert(!res.stdout.includes("Fallback:"), "--full is not a fallback");
 });
 
+Deno.test("load --focus: a present-but-empty value is rejected like a missing one", async () => {
+  for (const args of [["--focus"], ["--focus", ""]]) {
+    const res = await runLoadArgs(fixturePath("map-only"), args);
+    assertEqual(res.code, 1, `args ${JSON.stringify(args)} must exit 1: ${res.stdout}${res.stderr}`);
+    assertIncludes(res.stderr, "--focus requires a value");
+  }
+});
+
 Deno.test("load: without compiler flags the output carries no compiler diagnostics", async () => {
   for (const mode of ["default", "auto", "merge"]) {
     const res = await runLoadArgs(fixturePath("map-only"), [mode]);
