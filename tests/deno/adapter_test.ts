@@ -188,6 +188,28 @@ Deno.test("adapter: unlink refuses a real directory without touching it", async 
   assert(await pathExists(`${vault}/Projects/${alias}/user-note.md`), "user data must remain untouched");
 });
 
+Deno.test("adapter: unlink refuses a hand-crafted symlink without provenance", async () => {
+  const project = await makeProject("unlink-craft");
+  const vault = await makeVault();
+  const xdg = await makeXdg();
+  const alias = project.split("/").pop();
+  // A user-made symlink to the same target: indistinguishable by target alone.
+  await Deno.mkdir(`${vault}/Projects`, { recursive: true });
+  await Deno.symlink(`${await Deno.realPath(project)}/.handoff`, `${vault}/Projects/${alias}`, { type: "dir" });
+  // Seed the user config with the Vault but NO provenance record (as a link
+  // created before provenance existed would look).
+  await Deno.mkdir(`${xdg}/handoff`, { recursive: true });
+  await Deno.writeTextFile(
+    `${xdg}/handoff/config.json`,
+    JSON.stringify({ adapters: { obsidian: { vaultPath: vault } } }, null, 2)
+  );
+
+  const r = await runAdapter(project, ["obsidian", "unlink"], { XDG_CONFIG_HOME: xdg });
+  assert(r.code !== 0, "unlink without a provenance record must be refused");
+  assertIncludes(r.stderr + r.stdout, "manually", "output should direct the user to remove the link manually");
+  assert(await pathExists(`${vault}/Projects/${alias}`), "the unverified link must remain");
+});
+
 Deno.test("adapter: status without a configured Vault gives actionable output", async () => {
   const project = await makeProject("novault");
   const xdg = await makeXdg();

@@ -209,6 +209,29 @@ test("adapter: unlink refuses a real directory without touching it", async () =>
   assert(existsSync(join(vault, "Projects", alias, "user-note.md")), "user data must remain untouched");
 });
 
+test("adapter: unlink refuses a hand-crafted symlink without provenance", async () => {
+  const project = await makeProject("unlink-craft");
+  const vault = await makeVault();
+  const env = await withXdg();
+  const alias = project.split("/").pop();
+  // A user-made symlink to the same target: indistinguishable by target alone.
+  const realProject = await realpath(project);
+  await mkdir(join(vault, "Projects"), { recursive: true });
+  await symlink(join(realProject, ".handoff"), join(vault, "Projects", alias), "dir");
+  // Seed the user config with the Vault but NO provenance record (as a link
+  // created before provenance existed would look).
+  await mkdir(join(env._xdg, "handoff"), { recursive: true });
+  await writeFile(
+    join(env._xdg, "handoff", "config.json"),
+    JSON.stringify({ adapters: { obsidian: { vaultPath: vault } } }, null, 2)
+  );
+
+  const r = runAdapter(project, ["obsidian", "unlink"], env);
+  assert(r.code !== 0, "unlink without a provenance record must be refused");
+  assertIncludes(r.stderr + r.stdout, "manually", "output should direct the user to remove the link manually");
+  assert(existsSync(join(vault, "Projects", alias)), "the unverified link must remain");
+});
+
 test("adapter: status without a configured Vault gives actionable output", async () => {
   const project = await makeProject("novault");
   const env = await withXdg();

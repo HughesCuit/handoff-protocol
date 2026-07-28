@@ -58,10 +58,14 @@ import {
   runDiff,
 } from "../../scripts/context-diff.mjs";
 import {
+  findLinkProvenance,
   linkPathFor,
+  linkProvenanceRecord,
   obsidianLink,
   obsidianStatus,
   obsidianUnlink,
+  recordLinkProvenance,
+  removeLinkProvenance,
   resolveAlias,
   userConfigPath,
   validateAlias,
@@ -1489,11 +1493,75 @@ export function defineUnitTests(test, readFixture) {
       dirs: [VAULT, `${VAULT}/Projects`, HANDOFF_DIR],
       links: { [linkPath]: HANDOFF_DIR },
     });
-    const r = await obsidianUnlink({ vaultPath: VAULT, alias: "proj", projectDir: PROJECT, platform: "darwin" }, io);
+    const provenance = linkProvenanceRecord({ vaultPath: VAULT, alias: "proj", projectDir: PROJECT });
+    const r = await obsidianUnlink({ vaultPath: VAULT, alias: "proj", projectDir: PROJECT, platform: "darwin", provenance }, io);
     assert(r.ok, `unlink should succeed: ${r.message || ""}`);
     assertEqual(r.state, "unlinked");
     assert(!io.links.has(linkPath), "link must be removed");
     assert(io.dirs.has(HANDOFF_DIR), "the .handoff target must never be removed");
+  });
+
+  test("obsidian: link returns provenance for the user-level config", async () => {
+    const io = makeLinkIo({ dirs: [VAULT, PROJECT, HANDOFF_DIR] });
+    const r = await obsidianLink({ vaultPath: VAULT, alias: "proj", projectDir: PROJECT, platform: "darwin" }, io);
+    assert(r.ok, `link should succeed: ${r.message || ""}`);
+    assert(r.provenance, "a successful link must carry a provenance record");
+    assertEqual(r.provenance.vaultPath, VAULT);
+    assertEqual(r.provenance.alias, "proj");
+    assertEqual(r.provenance.linkPath, linkPathFor(VAULT, "proj"));
+    assertEqual(r.provenance.target, HANDOFF_DIR);
+  });
+
+  test("obsidian: unlink without provenance refuses and deletes nothing", async () => {
+    // A user-crafted symlink to the same target is indistinguishable from an
+    // Adapter-created one without a provenance record — it must survive.
+    const linkPath = linkPathFor(VAULT, "proj");
+    const io = makeLinkIo({
+      dirs: [VAULT, `${VAULT}/Projects`, HANDOFF_DIR],
+      links: { [linkPath]: HANDOFF_DIR },
+    });
+    const r = await obsidianUnlink({ vaultPath: VAULT, alias: "proj", projectDir: PROJECT, platform: "darwin" }, io);
+    assert(!r.ok, "unlink without a provenance record must be refused");
+    assertEqual(r.reason, "unverified-link");
+    assert(/manual/i.test(r.message), `message should direct the user to remove it manually: ${r.message}`);
+    assertEqual(io.links.get(linkPath), HANDOFF_DIR, "the unverified link must remain");
+    assert(!io.ops.some((op) => op[0] === "unlink"), "nothing may be removed");
+  });
+
+  test("obsidian: unlink refuses a mismatched provenance record", async () => {
+    const linkPath = linkPathFor(VAULT, "proj");
+    const io = makeLinkIo({
+      dirs: [VAULT, `${VAULT}/Projects`, HANDOFF_DIR],
+      links: { [linkPath]: HANDOFF_DIR },
+    });
+    const provenance = linkProvenanceRecord({ vaultPath: VAULT, alias: "proj", projectDir: "/work/other-project" });
+    const r = await obsidianUnlink({ vaultPath: VAULT, alias: "proj", projectDir: PROJECT, platform: "darwin", provenance }, io);
+    assert(!r.ok, "a provenance record for a different target must not authorize unlink");
+    assertEqual(r.reason, "unverified-link");
+    assertEqual(io.links.get(linkPath), HANDOFF_DIR, "the link must remain");
+  });
+
+  test("obsidian: provenance records round-trip through the user-level config", async () => {
+    const record = linkProvenanceRecord({ vaultPath: VAULT, alias: "proj", projectDir: PROJECT });
+
+    // Backward tolerance: missing, partial, and unknown-field configs.
+    for (const config of [{}, { adapters: {} }, { adapters: { obsidian: { vaultPath: VAULT, future: 1 } } }, null]) {
+      const hadObsidian = !!(config && config.adapters && config.adapters.obsidian);
+      const next = recordLinkProvenance(config || {}, record);
+      const found = findLinkProvenance(next, { vaultPath: VAULT, alias: "proj" });
+      assert(found, `provenance must be found after recording, config: ${JSON.stringify(config)}`);
+      assertEqual(found.target, record.target);
+      assert(removeLinkProvenance(next, { vaultPath: VAULT, alias: "proj" }), "removal must report a change");
+      assertEqual(findLinkProvenance(next, { vaultPath: VAULT, alias: "proj" }), null, "provenance must be gone after removal");
+      if (hadObsidian) {
+        assertEqual(next.adapters.obsidian.future, 1, "unknown user-config fields must be preserved");
+        assertEqual(next.adapters.obsidian.vaultPath, VAULT, "vaultPath must be preserved");
+      }
+    }
+
+    // Unknown lookups and repeat removals are clean no-ops.
+    assertEqual(findLinkProvenance({}, { vaultPath: VAULT, alias: "proj" }), null);
+    assertEqual(removeLinkProvenance({}, { vaultPath: VAULT, alias: "proj" }), false);
   });
 
   test("obsidian: unlink is idempotent when no link exists", async () => {

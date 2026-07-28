@@ -16,9 +16,12 @@
 import { filterSensitive } from "./context-map.mjs";
 import { CONFIG_FILENAME, validateProjectConfig } from "./config.mjs";
 import {
+  findLinkProvenance,
   obsidianLink,
   obsidianStatus,
   obsidianUnlink,
+  recordLinkProvenance,
+  removeLinkProvenance,
   resolveAlias,
   userConfigPath,
 } from "./adapters/obsidian.mjs";
@@ -140,6 +143,17 @@ function recordVaultPath(vaultPath) {
   writeUserConfig(config);
 }
 
+// Link provenance (vault path, alias, normalized link path, target) lives in
+// the user-level config; unlink refuses without it.
+function recordProvenance(record) {
+  writeUserConfig(recordLinkProvenance(readUserConfig(), record));
+}
+
+function clearProvenance(vaultPath, alias) {
+  const config = readUserConfig();
+  if (removeLinkProvenance(config, { vaultPath, alias })) writeUserConfig(config);
+}
+
 // Persist portable adapter state (enabled + alias) into the project config
 // when one exists. The Vault path is never written here.
 function recordProjectAdapter(cwd, projectConfig, alias) {
@@ -252,6 +266,7 @@ async function main() {
     printResult(result);
     if (!result.ok) Deno.exit(1);
     recordVaultPath(namedArgs.vault);
+    if (result.provenance) recordProvenance(result.provenance);
     recordProjectAdapter(cwd, projectConfig, alias);
     return;
   }
@@ -269,9 +284,11 @@ async function main() {
     return;
   }
 
-  const result = await obsidianUnlink({ vaultPath, alias, projectDir: cwd, platform }, io);
+  const provenance = findLinkProvenance(readUserConfig(), { vaultPath, alias });
+  const result = await obsidianUnlink({ vaultPath, alias, projectDir: cwd, platform, provenance }, io);
   printResult(result);
   if (!result.ok) Deno.exit(1);
+  clearProvenance(vaultPath, alias);
 }
 
 main().catch((err) => {

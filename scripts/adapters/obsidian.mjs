@@ -22,8 +22,13 @@
  *   idempotent success ("already-linked"); nothing is recreated.
  * - A real directory or file at the link path is never replaced ("collision").
  * - A link pointing anywhere else is never replaced or removed ("foreign-link").
- * - Unlink removes only a verified Adapter-created link (a symlink/junction
- *   whose target is exactly this project's `.handoff/`) and never its target.
+ * - Unlink removes only a verified Adapter-created link: it requires BOTH a
+ *   matching provenance record in the user-level config (recorded at link
+ *   time) AND on-disk verification that the path is a symlink/junction whose
+ *   target is exactly this project's `.handoff/`. Without provenance (a
+ *   user-crafted link, or one created before provenance existed) unlink
+ *   refuses and tells the user to remove the link manually. The link's
+ *   target is never touched.
  * - The Vault absolute path is stored only in the user-level config
  *   ($XDG_CONFIG_HOME/handoff/config.json, falling back to
  *   ~/.config/handoff/config.json on macOS/Linux; %APPDATA%/handoff/config.json
@@ -175,6 +180,82 @@ function sameTarget(a, b) {
   return normalizeTarget(a) === normalizeTarget(b);
 }
 
+// ── Link provenance (user-level config) ──────────────────────────────────────
+//
+// A symlink whose target matches is necessary but NOT sufficient proof that
+// the Adapter created it — a user can craft such a link by hand. The Adapter
+// therefore records provenance at link time in the USER-LEVEL config (never
+// the portable project config) under `adapters.obsidian.links`, keyed by the
+// normalized link path:
+//   { vaultPath, alias, linkPath, target }
+// Unlink requires BOTH a matching provenance record AND the on-disk
+// symlink+target verification. The shape is backward-tolerant: missing or
+// unknown config fields are preserved and never required.
+
+/** Build the provenance record for a link (normalized paths). */
+export function linkProvenanceRecord({ vaultPath, alias, projectDir }) {
+  return {
+    vaultPath: String(vaultPath),
+    alias: String(alias),
+    linkPath: normalizeTarget(linkPathFor(vaultPath, alias)),
+    target: normalizeTarget(joinPath(projectDir, ".handoff")),
+  };
+}
+
+function linksMap(config) {
+  const obsidian = config && config.adapters && config.adapters.obsidian;
+  const links = obsidian && obsidian.links;
+  return links && typeof links === "object" && !Array.isArray(links) ? links : null;
+}
+
+/** Look up the recorded provenance for a link, or null. */
+export function findLinkProvenance(userConfig, { vaultPath, alias }) {
+  const links = linksMap(userConfig);
+  if (!links) return null;
+  const record = links[normalizeTarget(linkPathFor(vaultPath, alias))];
+  return record && typeof record === "object" ? record : null;
+}
+
+/** Record provenance for a link. Returns the (mutated) config for chaining. */
+export function recordLinkProvenance(userConfig, record) {
+  const config = userConfig && typeof userConfig === "object" && !Array.isArray(userConfig) ? userConfig : {};
+  config.adapters = config.adapters && typeof config.adapters === "object" && !Array.isArray(config.adapters) ? config.adapters : {};
+  const obsidian = config.adapters.obsidian && typeof config.adapters.obsidian === "object" && !Array.isArray(config.adapters.obsidian)
+    ? config.adapters.obsidian
+    : {};
+  config.adapters.obsidian = obsidian;
+  obsidian.links = linksMap(config) || {};
+  obsidian.links[record.linkPath] = {
+    vaultPath: record.vaultPath,
+    alias: record.alias,
+    linkPath: record.linkPath,
+    target: record.target,
+  };
+  return config;
+}
+
+/** Drop the provenance record for a link. Returns true when anything changed. */
+export function removeLinkProvenance(userConfig, { vaultPath, alias }) {
+  const links = linksMap(userConfig);
+  if (!links) return false;
+  const key = normalizeTarget(linkPathFor(vaultPath, alias));
+  if (!(key in links)) return false;
+  delete links[key];
+  if (Object.keys(links).length === 0) delete userConfig.adapters.obsidian.links;
+  return true;
+}
+
+/** A record authorizes removal only when every field matches this link. */
+function provenanceMatches(record, { vaultPath, alias, linkPath, target }) {
+  return (
+    record &&
+    record.vaultPath === vaultPath &&
+    record.alias === alias &&
+    normalizeTarget(record.linkPath || "") === normalizeTarget(linkPath) &&
+    sameTarget(record.target || "", target)
+  );
+}
+
 // ── Result constructors ──────────────────────────────────────────────────────
 
 function ok(state, linkPath, target, extra = {}) {
@@ -292,7 +373,9 @@ export async function obsidianLink({ vaultPath, alias, projectDir, platform }, i
       const actual = await io.readlink(linkPath);
       if (sameTarget(actual, target)) {
         await updateVaultIndex(io, vaultPath, alias, { add: true });
-        return ok("already-linked", linkPath, target);
+        return ok("already-linked", linkPath, target, {
+          provenance: linkProvenanceRecord({ vaultPath, alias, projectDir }),
+        });
       }
       return fail(
         "foreign-link",
@@ -322,7 +405,9 @@ export async function obsidianLink({ vaultPath, alias, projectDir, platform }, i
     return fail("error", `Could not create the link: ${err.message || err}`, linkPath, target);
   }
   await updateVaultIndex(io, vaultPath, alias, { add: true });
-  return ok("linked", linkPath, target);
+  return ok("linked", linkPath, target, {
+    provenance: linkProvenanceRecord({ vaultPath, alias, projectDir }),
+  });
 }
 
 // ── Status ───────────────────────────────────────────────────────────────────
@@ -349,11 +434,18 @@ export async function obsidianStatus({ vaultPath, alias, projectDir, platform },
 // ── Unlink ───────────────────────────────────────────────────────────────────
 
 /**
- * Remove the Adapter-created link. Only a symlink/junction whose target is
- * exactly this project's `.handoff/` is removed; real directories, files, and
- * foreign links are refused. The link's target is never touched.
+ * Remove the Adapter-created link. Removal requires BOTH:
+ *   1. a provenance record in the user-level config (passed as `provenance`,
+ *      from findLinkProvenance) matching this vault/alias/link/target, AND
+ *   2. on-disk verification that the path is a symlink/junction whose target
+ *      is exactly this project's `.handoff/`.
+ * Without provenance — including links created before provenance existed —
+ * the link is refused with instructions to remove it manually: a matching
+ * symlink alone cannot prove the Adapter created it. Real directories,
+ * files, and foreign links are refused as before. The link's target is
+ * never touched.
  */
-export async function obsidianUnlink({ vaultPath, alias, projectDir, platform }, io) {
+export async function obsidianUnlink({ vaultPath, alias, projectDir, platform, provenance }, io) {
   const target = joinPath(projectDir, ".handoff");
   const linkPath = linkPathFor(vaultPath, alias);
 
@@ -378,6 +470,14 @@ export async function obsidianUnlink({ vaultPath, alias, projectDir, platform },
       linkPath,
       target,
       { actualTarget: actual }
+    );
+  }
+  if (!provenanceMatches(provenance, { vaultPath, alias, linkPath, target })) {
+    return fail(
+      "unverified-link",
+      `Refusing to remove ${linkPath}: no Adapter provenance record exists for this link,\nso the adapter cannot prove it created it (a matching symlink is not enough).\nRemove the link manually if it is yours, e.g.: rm ${linkPath}`,
+      linkPath,
+      target
     );
   }
   await io.unlink(linkPath);
