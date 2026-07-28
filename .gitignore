@@ -37,3 +37,6 @@ yarn-error.log*
 
 # Local tooling (Deno for tests)
 .tools/
+
+# Deno lockfile (local test artifact)
+deno.lock

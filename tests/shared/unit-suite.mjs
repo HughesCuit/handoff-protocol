@@ -1034,14 +1034,17 @@ export function defineUnitTests(test, readFixture) {
   // ── Obsidian adapter (v2.2) ───────────────────────────────────────────────
 
   // In-memory link-capable filesystem for the adapter's io seam. Directories
-  // are a Set of paths, symlinks/junctions a Map of linkPath -> target.
+  // are a Set of paths, symlinks/junctions a Map of linkPath -> target, and
+  // text files a Map of path -> content.
   function makeLinkIo(seed = {}, failOn) {
     const dirs = new Set(seed.dirs || []);
     const links = new Map(Object.entries(seed.links || {}));
+    const files = new Map(Object.entries(seed.files || {}));
     const ops = [];
     return {
       dirs,
       links,
+      files,
       ops,
       lstat: async (p) => {
         if (links.has(p)) return { kind: "symlink" };
@@ -1070,6 +1073,11 @@ export function defineUnitTests(test, readFixture) {
         ops.push(["unlink", p]);
         if (!links.has(p)) throw new Error(`ENOENT: ${p}`);
         links.delete(p);
+      },
+      readFile: async (p) => (files.has(p) ? files.get(p) : null),
+      writeFile: async (p, content) => {
+        ops.push(["writeFile", p]);
+        files.set(p, content);
       },
     };
   }

@@ -9,7 +9,7 @@
  */
 
 import { test } from "node:test";
-import { mkdtemp, mkdir, writeFile, readFile, lstat, readlink, realpath, symlink } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile, lstat, readdir, readlink, realpath, rm, symlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -55,6 +55,29 @@ function withXdg(env = {}) {
 
 async function readProjectConfig(dir) {
   return JSON.parse(await readFile(join(dir, ".handoff.config.json"), "utf-8"));
+}
+
+// ── Vault index helpers ─────────────────────────────────────────────────────
+
+const INDEX_FILENAME = "Handoff Projects.md";
+const seedFixture = join(root, "tests", "fixtures", "adapters", "vault-index-seed.md");
+
+async function readIndex(vault) {
+  return readFile(join(vault, INDEX_FILENAME), "utf-8");
+}
+
+async function seedIndex(vault, content) {
+  await writeFile(join(vault, INDEX_FILENAME), content ?? (await readFile(seedFixture, "utf-8")));
+}
+
+async function listFilesRecursive(dir) {
+  const out = [];
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) out.push(...(await listFilesRecursive(full)));
+    else out.push(full);
+  }
+  return out;
 }
 
 // ── link ─────────────────────────────────────────────────────────────────────
@@ -192,4 +215,114 @@ test("adapter: status without a configured Vault gives actionable output", async
   const r = runAdapter(project, ["obsidian", "status"], env);
   assert(r.code !== 0, "status without a Vault must fail");
   assertIncludes(r.stderr + r.stdout, "link --vault", "output should point at the link command");
+});
+
+// ── Vault index ──────────────────────────────────────────────────────────────
+
+test("adapter: link maintains a sorted wikilink index in Handoff Projects.md", async () => {
+  const vault = await makeVault();
+  const env = await withXdg();
+
+  const zeta = await makeProject("idx-zeta");
+  assertEqual(runAdapter(zeta, ["obsidian", "link", "--vault", vault, "--alias", "zeta"], env).code, 0);
+  const alpha = await makeProject("idx-alpha");
+  assertEqual(runAdapter(alpha, ["obsidian", "link", "--vault", vault, "--alias", "alpha"], env).code, 0);
+
+  const index = await readIndex(vault);
+  assertIncludes(index, "<!-- handoff-projects:start -->");
+  assertIncludes(index, "<!-- handoff-projects:end -->");
+  assertIncludes(index, "- [[Projects/alpha/context-map]]");
+  assertIncludes(index, "- [[Projects/zeta/context-map]]");
+  assert(
+    index.indexOf("[[Projects/alpha/context-map]]") < index.indexOf("[[Projects/zeta/context-map]]"),
+    "entries must be sorted"
+  );
+});
+
+test("adapter: user content outside the managed block survives link", async () => {
+  const vault = await makeVault();
+  const env = await withXdg();
+  await seedIndex(vault);
+
+  const alpha = await makeProject("keep-link");
+  assertEqual(runAdapter(alpha, ["obsidian", "link", "--vault", vault, "--alias", "alpha"], env).code, 0);
+
+  const index = await readIndex(vault);
+  assertIncludes(index, "User notes above the managed block.");
+  assertIncludes(index, "User notes below the managed block.");
+  assertIncludes(index, "# My Vault");
+  assertIncludes(index, "- [[Projects/zeta/context-map]]", "pre-existing entry must survive");
+  assertIncludes(index, "- [[Projects/alpha/context-map]]", "new entry must be added");
+  assert(
+    index.indexOf("[[Projects/alpha/context-map]]") < index.indexOf("[[Projects/zeta/context-map]]"),
+    "entries must be re-sorted"
+  );
+});
+
+test("adapter: unlink removes only the matching entry and preserves user content", async () => {
+  const vault = await makeVault();
+  const env = await withXdg();
+  await seedIndex(vault); // contains a zeta entry
+
+  const alpha = await makeProject("unl-alpha");
+  assertEqual(runAdapter(alpha, ["obsidian", "link", "--vault", vault, "--alias", "alpha"], env).code, 0);
+  const beta = await makeProject("unl-beta");
+  assertEqual(runAdapter(beta, ["obsidian", "link", "--vault", vault, "--alias", "beta"], env).code, 0);
+
+  const r = runAdapter(beta, ["obsidian", "unlink"], env);
+  assertEqual(r.code, 0, `unlink failed: ${r.stderr}`);
+
+  const index = await readIndex(vault);
+  assertNotIncludes(index, "[[Projects/beta/context-map]]", "unlinked entry must be removed");
+  assertIncludes(index, "- [[Projects/alpha/context-map]]", "other entries must remain");
+  assertIncludes(index, "- [[Projects/zeta/context-map]]", "seeded entry must remain");
+  assertIncludes(index, "User notes above the managed block.");
+  assertIncludes(index, "User notes below the managed block.");
+});
+
+test("adapter: sensitive data is filtered before writing the index", async () => {
+  const vault = await makeVault();
+  const env = await withXdg();
+  const alias = "AKIAIOSFODNN7EXAMPLE"; // matches the AWS-access-key sensitive pattern
+
+  const project = await makeProject("secret");
+  // A credential-like alias is (correctly) refused in the portable project
+  // config; drop it so the link itself can proceed to the index write.
+  await rm(join(project, ".handoff.config.json"));
+  assertEqual(runAdapter(project, ["obsidian", "link", "--vault", vault, "--alias", alias], env).code, 0);
+
+  const index = await readIndex(vault);
+  assertNotIncludes(index, alias, "raw credential-like alias must never reach the index");
+  assertIncludes(index, "[REDACTED]");
+});
+
+test("adapter: no Canvas or Dataview files are generated", async () => {
+  const vault = await makeVault();
+  const env = await withXdg();
+
+  const project = await makeProject("nocanvas");
+  assertEqual(runAdapter(project, ["obsidian", "link", "--vault", vault], env).code, 0);
+
+  const files = await listFilesRecursive(vault);
+  for (const file of files) {
+    assert(!file.endsWith(".canvas"), `no Canvas file may be generated: ${file}`);
+    assert(!file.toLowerCase().includes("dataview"), `no Dataview artifact may be generated: ${file}`);
+  }
+  const rootEntries = (await readdir(vault)).sort();
+  assertEqual(rootEntries.join(","), [INDEX_FILENAME, "Projects"].sort().join(","), "vault root must only hold the index note and Projects/");
+});
+
+test("adapter: CRLF line endings in an existing index are preserved", async () => {
+  const vault = await makeVault();
+  const env = await withXdg();
+  const crlf = (await readFile(seedFixture, "utf-8")).replace(/\n/g, "\r\n");
+  await seedIndex(vault, crlf);
+
+  const alpha = await makeProject("crlf");
+  assertEqual(runAdapter(alpha, ["obsidian", "link", "--vault", vault, "--alias", "alpha"], env).code, 0);
+
+  const index = await readIndex(vault);
+  assert(index.includes("\r\n"), "CRLF line endings must be preserved");
+  assert(!/(?<!\r)\n/.test(index), "no lone LF may be introduced");
+  assertIncludes(index, "- [[Projects/alpha/context-map]]");
 });

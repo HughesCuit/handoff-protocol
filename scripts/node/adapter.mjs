@@ -54,6 +54,14 @@ const io = {
   symlink: async (target, linkPath, opts) => symlinkSync(target, linkPath, opts && opts.junction ? "junction" : "dir"),
   mkdir: async (p) => mkdirSync(p, { recursive: true }),
   unlink: async (p) => unlinkSync(p),
+  readFile: async (p) => {
+    try {
+      return readFileSync(p, "utf-8");
+    } catch {
+      return null;
+    }
+  },
+  writeFile: async (p, content) => writeFileSync(p, content),
 };
 
 // ── Config helpers ───────────────────────────────────────────────────────────

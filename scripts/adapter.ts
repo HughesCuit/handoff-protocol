@@ -51,6 +51,14 @@ const io = {
   },
   mkdir: (p) => Deno.mkdir(p, { recursive: true }),
   unlink: (p) => Deno.remove(p),
+  readFile: async (p) => {
+    try {
+      return await Deno.readTextFile(p);
+    } catch {
+      return null;
+    }
+  },
+  writeFile: (p, content) => Deno.writeTextFile(p, content),
 };
 
 // ── Config helpers ───────────────────────────────────────────────────────────

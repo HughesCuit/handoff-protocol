@@ -60,6 +60,29 @@ async function pathExists(path) {
   }
 }
 
+// ── Vault index helpers ─────────────────────────────────────────────────────
+
+const INDEX_FILENAME = "Handoff Projects.md";
+const seedFixture = new URL("tests/fixtures/adapters/vault-index-seed.md", root).pathname;
+
+async function readIndex(vault) {
+  return await Deno.readTextFile(`${vault}/${INDEX_FILENAME}`);
+}
+
+async function seedIndex(vault, content) {
+  await Deno.writeTextFile(`${vault}/${INDEX_FILENAME}`, content ?? (await Deno.readTextFile(seedFixture)));
+}
+
+async function listFilesRecursive(dir) {
+  const out = [];
+  for await (const entry of Deno.readDir(dir)) {
+    const full = `${dir}/${entry.name}`;
+    if (entry.isDirectory) out.push(...(await listFilesRecursive(full)));
+    else out.push(full);
+  }
+  return out;
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 Deno.test("adapter: link creates <Vault>/Projects/<alias> pointing at .handoff/", async () => {
@@ -171,4 +194,124 @@ Deno.test("adapter: status without a configured Vault gives actionable output", 
   const r = await runAdapter(project, ["obsidian", "status"], { XDG_CONFIG_HOME: xdg });
   assert(r.code !== 0, "status without a Vault must fail");
   assertIncludes(r.stderr + r.stdout, "link --vault", "output should point at the link command");
+});
+
+// ── Vault index ──────────────────────────────────────────────────────────────
+
+Deno.test("adapter: link maintains a sorted wikilink index in Handoff Projects.md", async () => {
+  const vault = await makeVault();
+  const xdg = await makeXdg();
+
+  const zeta = await makeProject("idx-zeta");
+  const lz = await runAdapter(zeta, ["obsidian", "link", "--vault", vault, "--alias", "zeta"], { XDG_CONFIG_HOME: xdg });
+  assertEqual(lz.code, 0, `link failed: ${lz.stderr}`);
+  const alpha = await makeProject("idx-alpha");
+  const la = await runAdapter(alpha, ["obsidian", "link", "--vault", vault, "--alias", "alpha"], { XDG_CONFIG_HOME: xdg });
+  assertEqual(la.code, 0, `link failed: ${la.stderr}`);
+
+  const index = await readIndex(vault);
+  assertIncludes(index, "<!-- handoff-projects:start -->");
+  assertIncludes(index, "<!-- handoff-projects:end -->");
+  assertIncludes(index, "- [[Projects/alpha/context-map]]");
+  assertIncludes(index, "- [[Projects/zeta/context-map]]");
+  assert(
+    index.indexOf("[[Projects/alpha/context-map]]") < index.indexOf("[[Projects/zeta/context-map]]"),
+    "entries must be sorted"
+  );
+});
+
+Deno.test("adapter: user content outside the managed block survives link", async () => {
+  const vault = await makeVault();
+  const xdg = await makeXdg();
+  await seedIndex(vault);
+
+  const alpha = await makeProject("keep-link");
+  const r = await runAdapter(alpha, ["obsidian", "link", "--vault", vault, "--alias", "alpha"], { XDG_CONFIG_HOME: xdg });
+  assertEqual(r.code, 0, `link failed: ${r.stderr}`);
+
+  const index = await readIndex(vault);
+  assertIncludes(index, "User notes above the managed block.");
+  assertIncludes(index, "User notes below the managed block.");
+  assertIncludes(index, "# My Vault");
+  assertIncludes(index, "- [[Projects/zeta/context-map]]", "pre-existing entry must survive");
+  assertIncludes(index, "- [[Projects/alpha/context-map]]", "new entry must be added");
+  assert(
+    index.indexOf("[[Projects/alpha/context-map]]") < index.indexOf("[[Projects/zeta/context-map]]"),
+    "entries must be re-sorted"
+  );
+});
+
+Deno.test("adapter: unlink removes only the matching entry and preserves user content", async () => {
+  const vault = await makeVault();
+  const xdg = await makeXdg();
+  await seedIndex(vault); // contains a zeta entry
+
+  const alpha = await makeProject("unl-alpha");
+  const la = await runAdapter(alpha, ["obsidian", "link", "--vault", vault, "--alias", "alpha"], { XDG_CONFIG_HOME: xdg });
+  assertEqual(la.code, 0, `link failed: ${la.stderr}`);
+  const beta = await makeProject("unl-beta");
+  const lb = await runAdapter(beta, ["obsidian", "link", "--vault", vault, "--alias", "beta"], { XDG_CONFIG_HOME: xdg });
+  assertEqual(lb.code, 0, `link failed: ${lb.stderr}`);
+
+  const r = await runAdapter(beta, ["obsidian", "unlink"], { XDG_CONFIG_HOME: xdg });
+  assertEqual(r.code, 0, `unlink failed: ${r.stderr}`);
+
+  const index = await readIndex(vault);
+  assertNotIncludes(index, "[[Projects/beta/context-map]]", "unlinked entry must be removed");
+  assertIncludes(index, "- [[Projects/alpha/context-map]]", "other entries must remain");
+  assertIncludes(index, "- [[Projects/zeta/context-map]]", "seeded entry must remain");
+  assertIncludes(index, "User notes above the managed block.");
+  assertIncludes(index, "User notes below the managed block.");
+});
+
+Deno.test("adapter: sensitive data is filtered before writing the index", async () => {
+  const vault = await makeVault();
+  const xdg = await makeXdg();
+  const alias = "AKIAIOSFODNN7EXAMPLE"; // matches the AWS-access-key sensitive pattern
+
+  const project = await makeProject("secret");
+  // A credential-like alias is (correctly) refused in the portable project
+  // config; drop it so the link itself can proceed to the index write.
+  await Deno.remove(`${project}/.handoff.config.json`);
+  const r = await runAdapter(project, ["obsidian", "link", "--vault", vault, "--alias", alias], { XDG_CONFIG_HOME: xdg });
+  assertEqual(r.code, 0, `link failed: ${r.stderr}`);
+
+  const index = await readIndex(vault);
+  assertNotIncludes(index, alias, "raw credential-like alias must never reach the index");
+  assertIncludes(index, "[REDACTED]");
+});
+
+Deno.test("adapter: no Canvas or Dataview files are generated", async () => {
+  const vault = await makeVault();
+  const xdg = await makeXdg();
+
+  const project = await makeProject("nocanvas");
+  const r = await runAdapter(project, ["obsidian", "link", "--vault", vault], { XDG_CONFIG_HOME: xdg });
+  assertEqual(r.code, 0, `link failed: ${r.stderr}`);
+
+  const files = await listFilesRecursive(vault);
+  for (const file of files) {
+    assert(!file.endsWith(".canvas"), `no Canvas file may be generated: ${file}`);
+    assert(!file.toLowerCase().includes("dataview"), `no Dataview artifact may be generated: ${file}`);
+  }
+  const rootEntries = [];
+  for await (const entry of Deno.readDir(vault)) rootEntries.push(entry.name);
+  rootEntries.sort();
+  assertEqual(rootEntries.join(","), [INDEX_FILENAME, "Projects"].sort().join(","), "vault root must only hold the index note and Projects/");
+});
+
+Deno.test("adapter: CRLF line endings in an existing index are preserved", async () => {
+  const vault = await makeVault();
+  const xdg = await makeXdg();
+  const crlf = (await Deno.readTextFile(seedFixture)).replace(/\n/g, "\r\n");
+  await seedIndex(vault, crlf);
+
+  const alpha = await makeProject("crlf");
+  const r = await runAdapter(alpha, ["obsidian", "link", "--vault", vault, "--alias", "alpha"], { XDG_CONFIG_HOME: xdg });
+  assertEqual(r.code, 0, `link failed: ${r.stderr}`);
+
+  const index = await readIndex(vault);
+  assert(index.includes("\r\n"), "CRLF line endings must be preserved");
+  assert(!/(?<!\r)\n/.test(index), "no lone LF may be introduced");
+  assertIncludes(index, "- [[Projects/alpha/context-map]]");
 });

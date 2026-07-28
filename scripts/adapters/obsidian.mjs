@@ -29,6 +29,16 @@
  *   ~/.config/handoff/config.json on macOS/Linux; %APPDATA%/handoff/config.json
  *   on Windows). It must never be copied into the portable project config.
  *
+ * Vault index
+ * -----------
+ * The adapter also maintains a managed index block in the Vault-root note
+ * `Handoff Projects.md`, enclosed by the markers
+ * `<!-- handoff-projects:start -->` / `<!-- handoff-projects:end -->`. The
+ * block holds sorted wikilinks to each linked project's `context-map.md`.
+ * Content outside the markers is user-authored and never touched; when the
+ * markers are missing from an existing note, the block is appended. The
+ * sensitive-data filter runs on the managed block content before every write.
+ *
  * io seam
  * -------
  *   lstat(path)      -> { kind: "directory" | "file" | "symlink" | "other" } | null
@@ -37,7 +47,11 @@
  *   symlink(target, linkPath, { junction }) -> void (throws on failure)
  *   mkdir(path)      -> void (recursive)
  *   unlink(path)     -> void (removes the link itself, never its target)
+ *   readFile(path)   -> string | null (null when the file does not exist)
+ *   writeFile(path, content) -> void
  */
+
+import { filterSensitive } from "../context-map.mjs";
 
 // ── Path validation ──────────────────────────────────────────────────────────
 
@@ -172,6 +186,67 @@ function permissionGuidance(platform) {
   return "The operating system refused to create the link. Check that the Vault directory is writable by your user; on macOS, if the Vault lives under Documents/Desktop/Downloads, grant your terminal Full Disk Access (System Settings > Privacy & Security > Full Disk Access), then retry.";
 }
 
+// ── Vault index ──────────────────────────────────────────────────────────────
+
+/** The Vault-root note holding the managed index block. */
+export const INDEX_FILENAME = "Handoff Projects.md";
+export const INDEX_START = "<!-- handoff-projects:start -->";
+export const INDEX_END = "<!-- handoff-projects:end -->";
+
+/** The index note location: `<Vault>/Handoff Projects.md`. */
+export function indexPathFor(vaultPath) {
+  return joinPath(vaultPath, INDEX_FILENAME);
+}
+
+/** The managed index entry for an alias: a wikilink to its context-map.md. */
+export function indexEntryFor(alias) {
+  return `- [[Projects/${alias}/context-map]]`;
+}
+
+/**
+ * Add or remove one entry in the managed index block, leaving all content
+ * outside the markers untouched. Creates the note when missing; appends the
+ * block when an existing note has no markers. Entries are deduplicated and
+ * sorted. The sensitive-data filter runs on the managed block content before
+ * the note is written; user content outside the markers is never rewritten.
+ */
+async function updateVaultIndex(io, vaultPath, alias, { add }) {
+  const indexPath = indexPathFor(vaultPath);
+  const entry = filterSensitive(indexEntryFor(alias));
+  const existing = await io.readFile(indexPath);
+  if (existing === null && !add) return; // nothing to remove; don't create the note
+  const eol = existing && existing.includes("\r\n") ? "\r\n" : "\n";
+  const lines = existing === null ? [] : existing.split(/\r?\n/);
+
+  const start = lines.findIndex((l) => l.trim() === INDEX_START);
+  const end = lines.findIndex((l) => l.trim() === INDEX_END);
+
+  let next;
+  if (start === -1 || end === -1 || end < start) {
+    // No managed block: append one at the end, preserving user content.
+    next = [...lines];
+    if (next.length && next[next.length - 1].trim() !== "") next.push("");
+    next.push(INDEX_START);
+    if (add) next.push(entry);
+    next.push(INDEX_END);
+    next.push("");
+  } else {
+    const entries = new Set(
+      lines
+        .slice(start + 1, end)
+        .filter((l) => l.trim() !== "")
+        .map((l) => filterSensitive(l))
+    );
+    if (add) entries.add(entry);
+    else entries.delete(entry);
+    next = [...lines.slice(0, start + 1), ...[...entries].sort(), ...lines.slice(end)];
+  }
+
+  const content = next.join(eol);
+  if (content === existing) return;
+  await io.writeFile(indexPath, content);
+}
+
 // ── Link ─────────────────────────────────────────────────────────────────────
 
 /**
@@ -210,6 +285,7 @@ export async function obsidianLink({ vaultPath, alias, projectDir, platform }, i
     if (existing.kind === "symlink") {
       const actual = await io.readlink(linkPath);
       if (sameTarget(actual, target)) {
+        await updateVaultIndex(io, vaultPath, alias, { add: true });
         return ok("already-linked", linkPath, target);
       }
       return fail(
@@ -239,6 +315,7 @@ export async function obsidianLink({ vaultPath, alias, projectDir, platform }, i
     }
     return fail("error", `Could not create the link: ${err.message || err}`, linkPath, target);
   }
+  await updateVaultIndex(io, vaultPath, alias, { add: true });
   return ok("linked", linkPath, target);
 }
 
@@ -275,7 +352,10 @@ export async function obsidianUnlink({ vaultPath, alias, projectDir, platform },
   const linkPath = linkPathFor(vaultPath, alias);
 
   const stat = await io.lstat(linkPath);
-  if (!stat) return ok("not-linked", linkPath, target);
+  if (!stat) {
+    await updateVaultIndex(io, vaultPath, alias, { add: false });
+    return ok("not-linked", linkPath, target);
+  }
   if (stat.kind !== "symlink") {
     return fail(
       "collision",
@@ -295,5 +375,6 @@ export async function obsidianUnlink({ vaultPath, alias, projectDir, platform },
     );
   }
   await io.unlink(linkPath);
+  await updateVaultIndex(io, vaultPath, alias, { add: false });
   return ok("unlinked", linkPath, target);
 }
