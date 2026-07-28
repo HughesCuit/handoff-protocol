@@ -10,6 +10,8 @@ Handoff Protocol is a standardized way to save, restore, and share work context 
 
 It manages a `.handoff/` directory - the **Agent Context Protocol** equivalent of `.git/` for AI agent collaboration.
 
+> **Versioning note:** the protocol *schema* version (`PROTOCOL_VERSION` in `scripts/context-map.mjs`, embedded in `context.json` and generated files) tracks the `.handoff/` data format — it is `2.0.0` for the whole v2 line. The *product* release version (`package.json`, release tags) tracks feature releases (v2.1, v2.2, v2.3, …). They advance independently: a v2.3.0 install still speaks schema 2.0.0.
+
 Since v2, `.handoff/context-map.md` is the canonical, human-editable source of
 all semantic state. `HANDOFF.md`, `tasks.md`, and `decisions.md` are
 deterministic views generated from the map (marked `do not edit`), and
@@ -252,9 +254,9 @@ When you run `/handoff load`, the skill:
 
 Legacy handoffs load read-only forever; the next `/handoff save` migrates them to v2 automatically:
 
-- Migration is **atomic**: outputs are written through temporary files, originals (including `.handoff.config.json`) are backed up to `.handoff/history/migrations/<UTC-timestamp>/`, and renames happen only after validation — the config version upgrade renames last. A failure before the rename phase leaves everything untouched.
+- Migration is **atomic**: outputs are written through temporary files, originals (including `.handoff.config.json`) are backed up to `.handoff/history/migrations/<UTC-timestamp>/`, and renames happen only after validation — the config version upgrade renames last. If any rename fails mid-phase, every file already replaced is rolled back, leaving the originals byte-identical.
 - Backups are **sensitive-data filtered**: if a legacy file contained credential-like content, its backup holds the filtered text, not the original bytes.
-- If a failure strikes **during** the rename phase, recovery is manual: copy the originals back from the backup directory and re-run `/handoff save`.
+- If a failure strikes **during** the rename phase, already-replaced files are rolled back automatically; the backup directory remains as an additional safety net.
 - Conflicting values are never silently dropped — superseded goal/status values stay visible under Open Questions → "Migration conflict", labeled with their source file.
 
 ### Obsidian Adapter (Optional UI)

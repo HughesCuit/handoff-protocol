@@ -67,9 +67,9 @@ Every save compares the map's semantic state against the latest snapshot under `
 Legacy handoffs remain readable forever — `load` handles them unchanged (read-only) and prints a note that migration is available. The next `/handoff save` migrates automatically and atomically:
 
 1. **Precedence:** explicit user instructions and direct map edits win over structured `context.json`, which wins over the human-readable files (`tasks.md`, `decisions.md`, `HANDOFF.md`). Singleton fields (goal, status) get exactly one winner; superseded values are never dropped — they stay visible as child nodes under an Open Questions "Migration conflict" node, each labeled with its source file, and are mirrored into `diagnostics.conflicts`.
-2. **Atomic write:** all outputs are written through temporary sibling files and validated; the originals (including `.handoff.config.json`) are backed up under `.handoff/history/migrations/<UTC-timestamp>/`; only then is each temp file renamed into place, with the config version upgrade renamed last. Any failure before the rename phase leaves the original files and configuration untouched.
+2. **Atomic write:** all outputs are written through temporary sibling files and validated; the originals (including `.handoff.config.json`) are backed up under `.handoff/history/migrations/<UTC-timestamp>/`; only then is each temp file renamed into place, with the config version upgrade renamed last.
 3. **Backups are sensitive-data filtered.** If a legacy file contained credential-like content, its backup copy holds the filtered text, not the original bytes — do not rely on the backup to recover secrets.
-4. **Rename-phase failure recovery is manual.** If a failure occurs after renames have begun, restore the originals by copying the files back from the backup directory `.handoff/history/migrations/<UTC-timestamp>/` (including `.handoff.config.json`), then re-run `/handoff save`.
+4. **Rename-phase failures roll back.** If any rename fails mid-phase, every file already replaced is restored from its pre-rename sibling, leaving the original files byte-identical; the migration can then be re-run safely. The backup directory remains as an additional safety net.
 
 Migration is idempotent: an already-migrated v2 handoff needs no migration and creates no second backup.
 
