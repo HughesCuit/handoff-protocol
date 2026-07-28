@@ -103,6 +103,7 @@ test("load auto: appends the auto-analysis block", () => {
   assertIncludes(out, "Current understanding:");
   assertIncludes(out, "Auto-analysis:");
   assertIncludes(out, "Last saved:");
+  assertIncludes(out, "Modified files:");
   assertIncludes(out, "Branch:");
 });
 

@@ -128,6 +128,7 @@ Deno.test("load auto: appends the auto-analysis block", async () => {
   assertIncludes(res.stdout, "Current understanding:");
   assertIncludes(res.stdout, "Auto-analysis:");
   assertIncludes(res.stdout, "Last saved:");
+  assertIncludes(res.stdout, "Modified files:");
   assertIncludes(res.stdout, "Branch:");
 });
 

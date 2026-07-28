@@ -341,7 +341,7 @@ try {
   lines.push("");
   if (result.risks.length) { lines.push("Potential risks:"); result.risks.forEach((r) => lines.push(`- ${r}`)); lines.push(""); }
   if (result.pendingTasks) lines.push(`Pending tasks: ${result.pendingTasks}`);
-  if (mode === "auto" && result.context) { lines.push("", "---", "Auto-analysis:", `  Project: ${result.context.project}`, `  Agent: ${result.context.agent}`, `  Last saved: ${result.context.timestamp}`, `  Branch: ${result.context.git.branch}`); }
+  if (mode === "auto" && result.context) { lines.push("", "---", "Auto-analysis:", `  Project: ${result.context.project}`, `  Agent: ${result.context.agent}`, `  Last saved: ${result.context.timestamp}`, `  Modified files: ${result.context.modified_files.length}`, `  Branch: ${result.context.git.branch}`); }
   if (result.compiled) {
     const c = result.compiled;
     lines.push("", "Context compiler:");
