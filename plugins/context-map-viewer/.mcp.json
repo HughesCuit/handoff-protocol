@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "context-map-viewer": {
+      "command": "node",
+      "args": ["./dist/server.bundle.mjs"],
+      "cwd": "."
+    }
+  }
+}
