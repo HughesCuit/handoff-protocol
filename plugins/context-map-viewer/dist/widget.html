@@ -7,21 +7,293 @@
     <style>:root {
   color-scheme: light dark;
   font-family: ui-sans-serif, system-ui, sans-serif;
+  --surface: #f7f8fb;
+  --panel: rgba(255, 255, 255, 0.92);
+  --text: #172033;
+  --muted: #697386;
+  --line: #a7b0c2;
+  --border: #dce1eb;
+  --accent: #667eea;
 }
 
 body {
   margin: 0;
+  overflow: hidden;
+  color: var(--text);
+  background: var(--surface);
 }
 
 #app {
-  min-height: 240px;
-  padding: 12px;
+  display: grid;
+  grid-template-rows: auto 1fr;
+  height: 100vh;
+  min-height: 280px;
+}
+
+.toolbar {
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  backdrop-filter: blur(10px);
+}
+
+.search {
+  display: flex;
+  flex: 1 1 180px;
+  align-items: center;
+  gap: 6px;
+  min-width: 100px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.search input {
+  width: 100%;
+  min-width: 0;
+  padding: 7px 0;
+  border: 0;
+  outline: 0;
+  color: inherit;
+  background: transparent;
+}
+
+.toolbar-group {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+button {
+  min-height: 32px;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: inherit;
+  background: var(--panel);
+  cursor: pointer;
+}
+
+button:hover,
+button:focus-visible {
+  border-color: var(--accent);
+}
+
+#zoom-value {
+  width: 42px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+.sync-status {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.sync-status::before {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: #e0a13b;
+  content: "";
+}
+
+.sync-status.synced::before {
+  background: #3aa675;
+}
+
+.sync-status.error::before {
+  background: #d45a62;
+}
+
+.stage {
+  position: relative;
+  min-height: 0;
+  overflow: hidden;
+  background-color: var(--surface);
+  background-image: radial-gradient(circle, color-mix(in srgb, var(--line) 35%, transparent) 1px, transparent 1px);
+  background-size: 18px 18px;
+}
+
+#canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  touch-action: none;
+  cursor: grab;
+  user-select: none;
+}
+
+#canvas.dragging {
+  cursor: grabbing;
+}
+
+.link {
+  fill: none;
+  stroke: var(--line);
+  stroke-width: 1.5;
+}
+
+.map-node {
+  cursor: pointer;
+  transition: opacity 120ms ease;
+}
+
+.map-node rect {
+  fill: var(--panel);
+  stroke: var(--border);
+  stroke-width: 1.25;
+}
+
+.map-node text {
+  fill: var(--text);
+  font-size: 13px;
+  pointer-events: none;
+}
+
+.map-node.root rect {
+  fill: #667eea;
+  stroke: #5266cc;
+}
+
+.map-node.root text {
+  fill: #fff;
+  font-weight: 700;
+}
+
+.map-node.section-goal rect,
+.map-node.section-status rect {
+  fill: #eef1ff;
+  stroke: #8692e8;
+}
+
+.map-node.section-tasks rect {
+  fill: #edf8f2;
+  stroke: #70b38e;
+}
+
+.map-node.section-decisions rect {
+  fill: #fff4df;
+  stroke: #d4a65a;
+}
+
+.map-node.section-questions rect {
+  fill: #f4efff;
+  stroke: #9b80d1;
+}
+
+.map-node.section-risks rect,
+.map-node.risk-high rect {
+  fill: #fff0f0;
+  stroke: #d66f76;
+}
+
+.map-node.section-excluded rect,
+.map-node.excluded rect {
+  fill: #f0f1f4;
+  stroke-dasharray: 4 3;
+}
+
+.map-node.done {
+  opacity: 0.65;
+}
+
+.map-node.match rect {
+  stroke: var(--accent);
+  stroke-width: 3;
+}
+
+.map-node.dim {
+  opacity: 0.22;
+}
+
+.fold-badge {
+  fill: var(--accent);
+}
+
+.fold-badge-text {
+  fill: #fff !important;
+  font-size: 10px !important;
+  font-weight: 700;
+}
+
+.empty-state {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  padding: 32px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.empty-state[hidden] {
+  display: none;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface: #161922;
+    --panel: rgba(35, 39, 51, 0.94);
+    --text: #edf0f7;
+    --muted: #a5adbd;
+    --line: #596174;
+    --border: #414858;
+  }
+
+  .map-node.section-goal rect,
+  .map-node.section-status rect,
+  .map-node.section-tasks rect,
+  .map-node.section-decisions rect,
+  .map-node.section-questions rect,
+  .map-node.section-risks rect,
+  .map-node.section-excluded rect,
+  .map-node.risk-high rect,
+  .map-node.excluded rect {
+    fill: var(--panel);
+  }
 }
 </style>
   </head>
   <body>
-    <main id="app" aria-live="polite">Loading Context Map…</main>
-    <script>(()=>{var a=document.getElementById("app"),r=new Map,i=1;function d(n,e){let t=i++;return window.parent.postMessage({jsonrpc:"2.0",id:t,method:n,params:e},"*"),new Promise((s,o)=>r.set(t,{resolve:s,reject:o}))}window.addEventListener("message",n=>{if(n.source!==window.parent)return;let e=n.data;if(!(!e||e.jsonrpc!=="2.0")){if(e.id!==void 0&&r.has(e.id)){let t=r.get(e.id);r.delete(e.id),e.error?t.reject(e.error):t.resolve(e.result);return}e.method==="ui/notifications/tool-result"&&(a.textContent=e.params?.structuredContent?.message??"Context Map ready")}});function u(){return d("tools/call",{name:"get_context_map",arguments:{}})}})();
+    <main id="app">
+      <header class="toolbar" aria-label="Context Map controls">
+        <label class="search">
+          <span aria-hidden="true">⌕</span>
+          <input id="search" type="search" placeholder="Search nodes" autocomplete="off">
+        </label>
+        <div class="toolbar-group">
+          <button id="zoom-out" type="button" aria-label="Zoom out">−</button>
+          <output id="zoom-value" aria-live="polite">100%</output>
+          <button id="zoom-in" type="button" aria-label="Zoom in">+</button>
+          <button id="fit" type="button">Fit</button>
+          <button id="expand" type="button">Expand</button>
+          <button id="collapse" type="button">Collapse</button>
+        </div>
+        <div id="sync-status" class="sync-status" role="status">Refreshing</div>
+      </header>
+      <section id="stage" class="stage" aria-label="Context Map canvas">
+        <svg id="canvas" role="img" aria-label="Handoff Context Map">
+          <g id="viewport">
+            <g id="links"></g>
+            <g id="nodes"></g>
+          </g>
+        </svg>
+        <div id="empty-state" class="empty-state" hidden></div>
+      </section>
+    </main>
+    <script>(()=>{function $(e,t,i=[]){t(e,i);for(let o of e.children??[])$(o,t,[...i,e])}function R(e){let t=new Set;return $(e,i=>t.add(i.id)),t}function A(e,t){let i=R(t);return new Set([...e].filter(o=>i.has(o)))}function Y(e){return new Set((e.children??[]).map(t=>t.id))}function O(e,t){let i=String(t).toLocaleLowerCase().trim().split(/\s+/).filter(Boolean),o=new Set,n=new Set;return i.length===0?{matches:o,ancestors:n}:($(e,(s,r)=>{let a=[...r,s].map(d=>d.text??"").join(" ").toLocaleLowerCase();if(i.every(d=>a.includes(d))){o.add(s.id);for(let d of r)n.add(d.id)}}),{matches:o,ancestors:n})}function B(e,t,i){let o=O(e,i);function n(s){let r=o.ancestors.has(s.id),a=t.has(s.id)&&!r;return{...s,children:a?[]:(s.children??[]).map(n),hasHiddenChildren:a&&(s.children?.length??0)>0}}return{root:n(e),...o}}function T(e,t={}){let i=t.horizontalGap??220,o=t.verticalGap??68,n=t.padding??48,s=[],r=[],a=n;function d(c,l,q=null){let I={...c,x:n+l*i,y:0,width:Math.max(112,Math.min(220,42+String(c.text??"").length*7)),height:42,depth:l};s.push(I),q&&r.push({sourceId:q.id,targetId:c.id});let C=c.children??[];if(C.length===0)I.y=a,a+=o;else{for(let b of C)d(b,l+1,I);let X=s.find(b=>b.id===C[0].id),D=s.find(b=>b.id===C.at(-1).id);I.y=(X.y+D.y)/2}return I}d(e,0);let x=Math.max(320,...s.map(c=>c.x+c.width+n)),g=Math.max(240,a-o+n);return{nodes:s,links:r,width:x,height:g}}async function H(e){if(typeof e?.requestDisplayMode!="function")return!1;try{return await Promise.resolve(e.requestDisplayMode({mode:"picture-in-picture"})),!0}catch{return!1}}var k=new Map,U=1,W=null,m=null,f=new Set,M="",u={x:36,y:36,scale:1},L=null,p=null,y=document.getElementById("stage"),h=document.getElementById("canvas"),J=document.getElementById("viewport"),F=document.getElementById("links"),G=document.getElementById("nodes"),N=document.getElementById("search"),V=document.getElementById("sync-status"),S=document.getElementById("empty-state"),K=document.getElementById("zoom-value"),Q="http://www.w3.org/2000/svg";function Z(e,t){let i=U++;return window.parent.postMessage({jsonrpc:"2.0",id:i,method:e,params:t},"*"),new Promise((o,n)=>k.set(i,{resolve:o,reject:n}))}function E(){J.setAttribute("transform",`translate(${u.x} ${u.y}) scale(${u.scale})`),K.textContent=`${Math.round(u.scale*100)}%`}function ee(e){return e.taskState==="done"?"\u2713 ":e.taskState==="open"?"\u25CB ":e.risk==="high"?"\u26A0 ":e.excluded?"\u2298 ":""}function te(e,t=28){let i=String(e);return i.length>t?`${i.slice(0,t-1)}\u2026`:i}function w(e,t={}){let i=document.createElementNS(Q,e);for(let[o,n]of Object.entries(t))i.setAttribute(o,String(n));return i}function ne(e){let t=new Map,i=o=>{t.set(o.id,o);for(let n of o.children??[])i(n)};return i(e),t}function v(){if(!m?.root)return;let e=B(m.root,f,M),t=T(e.root),i=new Map(t.nodes.map(n=>[n.id,n])),o=ne(m.root);F.replaceChildren(),G.replaceChildren();for(let n of t.links){let s=i.get(n.sourceId),r=i.get(n.targetId),a=s.x+s.width,d=s.y+s.height/2,x=r.x,g=r.y+r.height/2,c=(a+x)/2;F.append(w("path",{class:"link",d:`M ${a} ${d} C ${c} ${d}, ${c} ${g}, ${x} ${g}`}))}for(let n of t.nodes){let s=["map-node"];n.section==="root"?s.push("root"):s.push(`section-${n.section}`),n.taskState==="done"&&s.push("done"),n.risk==="high"&&s.push("risk-high"),n.excluded&&s.push("excluded"),M&&e.matches.has(n.id)&&s.push("match"),M&&!e.matches.has(n.id)&&!e.ancestors.has(n.id)&&s.push("dim");let r=w("g",{class:s.join(" "),transform:`translate(${n.x} ${n.y})`,tabindex:0,role:"button","aria-label":n.text});r.append(w("rect",{width:n.width,height:n.height,rx:9}));let a=w("text",{x:13,y:26});if(a.textContent=`${ee(n)}${te(n.text)}`,r.append(a),(o.get(n.id)?.children?.length??0)>0){let x=w("circle",{class:"fold-badge",cx:n.width,cy:n.height/2,r:8}),g=w("text",{class:"fold-badge-text",x:n.width,y:n.height/2+3.5,"text-anchor":"middle"});g.textContent=f.has(n.id)?"+":"\u2212",r.append(x,g);let c=()=>{let l=new Set(f);l.has(n.id)?l.delete(n.id):l.add(n.id),f=l,v()};r.addEventListener("click",c),r.addEventListener("keydown",l=>{(l.key==="Enter"||l.key===" ")&&(l.preventDefault(),c())})}G.append(r)}h.setAttribute("viewBox",`0 0 ${Math.max(y.clientWidth,320)} ${Math.max(y.clientHeight,240)}`),E()}function _(e){let t={synced:"Synced",refreshing:"Refreshing",missing:"Missing",empty:"Empty",invalid:"Parse error",too_large:"File too large",too_many_nodes:"Too many nodes",access_denied:"Access denied",watcher_unavailable:"Polling"};V.textContent=t[e]??"Unavailable",V.className=`sync-status ${e==="synced"?"synced":""} ${["invalid","too_large","too_many_nodes","access_denied"].includes(e)?"error":""}`}function ie(e){return{missing:"No .handoff/context-map.md yet. Run the Handoff save flow to create it.",empty:"The Context Map exists but has no semantic nodes yet.",invalid:"The Context Map could not be parsed. The last valid map remains visible.",too_large:"The Context Map exceeds the 2 MiB viewer limit.",too_many_nodes:"The Context Map exceeds the 2,000-node viewer limit.",access_denied:"The active workspace Context Map is not available to this read-only viewer."}[e]??"Waiting for a Context Map snapshot\u2026"}function z(e){if(!(!e||typeof e!="object")){if(W=e,_(e.status),e.tree?.root){f=A(f,e.tree.root),m=e.tree,S.hidden=!0,h.hidden=!1,v();return}if(m?.root){S.hidden=!0,h.hidden=!1,v();return}h.hidden=!0,S.hidden=!1,S.textContent=ie(e.status)}}function oe(e){return e?.structuredContent??e?.content?.structuredContent??e?.result?.structuredContent??null}async function P(){if(!document.hidden){_("refreshing");try{let e=await Z("tools/call",{name:"get_context_map",arguments:{}}),t=oe(e);t&&z(t)}catch{_(W?.status??"invalid")}}}function j(e,t=y.clientWidth/2,i=y.clientHeight/2){let o=Math.max(.35,Math.min(2.5,u.scale*e)),n=o/u.scale;u={x:t-(t-u.x)*n,y:i-(i-u.y)*n,scale:o},E()}function se(){if(!m?.root)return;let e=B(m.root,f,M),t=T(e.root),i=Math.max(200,y.clientWidth-40),o=Math.max(160,y.clientHeight-40);u={x:20,y:20,scale:Math.max(.35,Math.min(1.4,i/t.width,o/t.height))},E()}window.addEventListener("message",e=>{if(e.source!==window.parent)return;let t=e.data;if(!(!t||t.jsonrpc!=="2.0")){if(t.id!==void 0&&k.has(t.id)){let i=k.get(t.id);k.delete(t.id),t.error?i.reject(t.error):i.resolve(t.result);return}t.method==="ui/notifications/tool-result"&&z(t.params?.structuredContent)}});N.addEventListener("input",()=>{M=N.value,v()});document.getElementById("zoom-in").addEventListener("click",()=>j(1.2));document.getElementById("zoom-out").addEventListener("click",()=>j(1/1.2));document.getElementById("fit").addEventListener("click",se);document.getElementById("expand").addEventListener("click",()=>{f=new Set,v()});document.getElementById("collapse").addEventListener("click",()=>{m?.root&&(f=Y(m.root),v())});h.addEventListener("wheel",e=>{e.preventDefault();let t=y.getBoundingClientRect();j(e.deltaY<0?1.1:1/1.1,e.clientX-t.left,e.clientY-t.top)},{passive:!1});h.addEventListener("pointerdown",e=>{e.target.closest?.(".map-node")||(p={pointerId:e.pointerId,x:e.clientX,y:e.clientY},h.setPointerCapture(e.pointerId),h.classList.add("dragging"))});h.addEventListener("pointermove",e=>{!p||p.pointerId!==e.pointerId||(u.x+=e.clientX-p.x,u.y+=e.clientY-p.y,p={...p,x:e.clientX,y:e.clientY},E())});h.addEventListener("pointerup",e=>{p?.pointerId===e.pointerId&&(p=null,h.classList.remove("dragging"),h.releasePointerCapture(e.pointerId))});document.addEventListener("visibilitychange",()=>{document.hidden?(clearInterval(L),L=null):(P(),L??=setInterval(P,750))});window.addEventListener("resize",()=>E());E();window.openai?.toolOutput&&z(window.openai.toolOutput);H(window.openai);L=setInterval(P,750);})();
 </script>
   </body>
 </html>

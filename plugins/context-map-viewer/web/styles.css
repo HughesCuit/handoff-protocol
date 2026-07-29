@@ -1,13 +1,260 @@
 :root {
   color-scheme: light dark;
   font-family: ui-sans-serif, system-ui, sans-serif;
+  --surface: #f7f8fb;
+  --panel: rgba(255, 255, 255, 0.92);
+  --text: #172033;
+  --muted: #697386;
+  --line: #a7b0c2;
+  --border: #dce1eb;
+  --accent: #667eea;
 }
 
 body {
   margin: 0;
+  overflow: hidden;
+  color: var(--text);
+  background: var(--surface);
 }
 
 #app {
-  min-height: 240px;
-  padding: 12px;
+  display: grid;
+  grid-template-rows: auto 1fr;
+  height: 100vh;
+  min-height: 280px;
+}
+
+.toolbar {
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  backdrop-filter: blur(10px);
+}
+
+.search {
+  display: flex;
+  flex: 1 1 180px;
+  align-items: center;
+  gap: 6px;
+  min-width: 100px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.search input {
+  width: 100%;
+  min-width: 0;
+  padding: 7px 0;
+  border: 0;
+  outline: 0;
+  color: inherit;
+  background: transparent;
+}
+
+.toolbar-group {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+button {
+  min-height: 32px;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: inherit;
+  background: var(--panel);
+  cursor: pointer;
+}
+
+button:hover,
+button:focus-visible {
+  border-color: var(--accent);
+}
+
+#zoom-value {
+  width: 42px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+.sync-status {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.sync-status::before {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: #e0a13b;
+  content: "";
+}
+
+.sync-status.synced::before {
+  background: #3aa675;
+}
+
+.sync-status.error::before {
+  background: #d45a62;
+}
+
+.stage {
+  position: relative;
+  min-height: 0;
+  overflow: hidden;
+  background-color: var(--surface);
+  background-image: radial-gradient(circle, color-mix(in srgb, var(--line) 35%, transparent) 1px, transparent 1px);
+  background-size: 18px 18px;
+}
+
+#canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  touch-action: none;
+  cursor: grab;
+  user-select: none;
+}
+
+#canvas.dragging {
+  cursor: grabbing;
+}
+
+.link {
+  fill: none;
+  stroke: var(--line);
+  stroke-width: 1.5;
+}
+
+.map-node {
+  cursor: pointer;
+  transition: opacity 120ms ease;
+}
+
+.map-node rect {
+  fill: var(--panel);
+  stroke: var(--border);
+  stroke-width: 1.25;
+}
+
+.map-node text {
+  fill: var(--text);
+  font-size: 13px;
+  pointer-events: none;
+}
+
+.map-node.root rect {
+  fill: #667eea;
+  stroke: #5266cc;
+}
+
+.map-node.root text {
+  fill: #fff;
+  font-weight: 700;
+}
+
+.map-node.section-goal rect,
+.map-node.section-status rect {
+  fill: #eef1ff;
+  stroke: #8692e8;
+}
+
+.map-node.section-tasks rect {
+  fill: #edf8f2;
+  stroke: #70b38e;
+}
+
+.map-node.section-decisions rect {
+  fill: #fff4df;
+  stroke: #d4a65a;
+}
+
+.map-node.section-questions rect {
+  fill: #f4efff;
+  stroke: #9b80d1;
+}
+
+.map-node.section-risks rect,
+.map-node.risk-high rect {
+  fill: #fff0f0;
+  stroke: #d66f76;
+}
+
+.map-node.section-excluded rect,
+.map-node.excluded rect {
+  fill: #f0f1f4;
+  stroke-dasharray: 4 3;
+}
+
+.map-node.done {
+  opacity: 0.65;
+}
+
+.map-node.match rect {
+  stroke: var(--accent);
+  stroke-width: 3;
+}
+
+.map-node.dim {
+  opacity: 0.22;
+}
+
+.fold-badge {
+  fill: var(--accent);
+}
+
+.fold-badge-text {
+  fill: #fff !important;
+  font-size: 10px !important;
+  font-weight: 700;
+}
+
+.empty-state {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  padding: 32px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.empty-state[hidden] {
+  display: none;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface: #161922;
+    --panel: rgba(35, 39, 51, 0.94);
+    --text: #edf0f7;
+    --muted: #a5adbd;
+    --line: #596174;
+    --border: #414858;
+  }
+
+  .map-node.section-goal rect,
+  .map-node.section-status rect,
+  .map-node.section-tasks rect,
+  .map-node.section-decisions rect,
+  .map-node.section-questions rect,
+  .map-node.section-risks rect,
+  .map-node.section-excluded rect,
+  .map-node.risk-high rect,
+  .map-node.excluded rect {
+    fill: var(--panel);
+  }
 }
