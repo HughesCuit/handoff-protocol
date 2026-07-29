@@ -16,6 +16,7 @@ const ASSET_TYPES = {
 };
 
 const ROUTE_PATTERN = /^\/session\/([A-Za-z0-9_-]{22,})\/(|app\.mjs|model\.mjs|styles\.css|api\/context-map)$/;
+const ENCODED_PATH_CONTROL_PATTERN = /%(?:2e|2f|5c)/i;
 
 function listen(server, options) {
   return new Promise((resolve, reject) => {
@@ -45,6 +46,23 @@ function safe500(response) {
   response.end();
 }
 
+function parseRoute(requestTarget) {
+  if (typeof requestTarget !== "string" || ENCODED_PATH_CONTROL_PATTERN.test(requestTarget)) {
+    return null;
+  }
+  try {
+    const url = new URL(requestTarget, "http://127.0.0.1");
+    if (url.search || url.hash) return null;
+  } catch {
+    return null;
+  }
+  return ROUTE_PATTERN.exec(requestTarget);
+}
+
+function closedError() {
+  return new Error("The loopback viewer server is closed.");
+}
+
 export class LoopbackViewerServer {
   constructor({ sessionManager, assets, createServer = createHttpServer }) {
     this.sessionManager = sessionManager;
@@ -53,6 +71,8 @@ export class LoopbackViewerServer {
     this.httpServer = null;
     this.starting = null;
     this.closing = null;
+    this.lifecycle = "new";
+    this.creatingSessions = new Set();
   }
 
   address() {
@@ -62,15 +82,21 @@ export class LoopbackViewerServer {
   }
 
   async start() {
+    this.assertOpen();
     if (this.httpServer?.listening) return this.address();
     if (this.starting) return this.starting;
+    this.lifecycle = "starting";
     const server = this.createServer((request, response) =>
       this.handle(request, response).catch(() => safe500(response)));
     this.httpServer = server;
     this.starting = listen(server, { host: "127.0.0.1", port: 0 })
-      .then(() => this.address())
+      .then(() => {
+        if (this.lifecycle === "starting") this.lifecycle = "running";
+        return this.address();
+      })
       .catch((error) => {
         if (this.httpServer === server) this.httpServer = null;
+        if (this.lifecycle === "starting") this.lifecycle = "new";
         throw error;
       })
       .finally(() => {
@@ -80,8 +106,18 @@ export class LoopbackViewerServer {
   }
 
   async createSession(workspaceRoot) {
+    this.assertOpen();
     const { port } = await this.start();
-    const created = await this.sessionManager.create(workspaceRoot);
+    this.assertOpen();
+    const creation = Promise.resolve(this.sessionManager.create(workspaceRoot));
+    this.creatingSessions.add(creation);
+    let created;
+    try {
+      created = await creation;
+    } finally {
+      this.creatingSessions.delete(creation);
+    }
+    this.assertOpen();
     return {
       viewerUrl: `http://127.0.0.1:${port}/session/${created.token}/`,
       sessionId: created.sessionId,
@@ -93,13 +129,7 @@ export class LoopbackViewerServer {
     if (request.method !== "GET") {
       return this.reply(response, 405, "", { Allow: "GET" });
     }
-    let url;
-    try {
-      url = new URL(request.url, "http://127.0.0.1");
-    } catch {
-      return this.reply(response, 404);
-    }
-    const match = url.search ? null : ROUTE_PATTERN.exec(url.pathname);
+    const match = parseRoute(request.url);
     if (!match) return this.reply(response, 404);
 
     const [, token, resource] = match;
@@ -122,25 +152,39 @@ export class LoopbackViewerServer {
     response.end(body);
   }
 
+  assertOpen() {
+    if (this.lifecycle === "closing" || this.lifecycle === "closed") throw closedError();
+  }
+
   async close() {
     if (this.closing) return this.closing;
+    if (this.lifecycle === "closed") return;
+    this.lifecycle = "closing";
     this.closing = (async () => {
-      const starting = this.starting;
-      if (starting) {
+      try {
+        const starting = this.starting;
+        if (starting) {
+          try {
+            await starting;
+          } catch {
+            // Startup errors are reported to the caller that requested startup.
+          }
+        }
+        await Promise.allSettled([...this.creatingSessions]);
+        const server = this.httpServer;
+        if (server?.listening) {
+          const closed = closeServer(server);
+          server.closeIdleConnections?.();
+          server.closeAllConnections?.();
+          await closed;
+        }
+      } finally {
         try {
-          await starting;
-        } catch {
-          // Startup errors are reported to the caller that requested startup.
+          await this.sessionManager.close();
+        } finally {
+          this.lifecycle = "closed";
         }
       }
-      const server = this.httpServer;
-      if (server?.listening) {
-        const closed = closeServer(server);
-        server.closeIdleConnections?.();
-        server.closeAllConnections?.();
-        await closed;
-      }
-      await this.sessionManager.close();
     })();
     return this.closing;
   }
