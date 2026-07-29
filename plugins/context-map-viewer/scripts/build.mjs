@@ -15,6 +15,7 @@ await build({
   format: "esm",
   target: "node18",
   sourcemap: false,
+  minify: true,
 });
 
 const widget = await build({
