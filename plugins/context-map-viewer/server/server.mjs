@@ -226,35 +226,99 @@ export function createContextMapServer(options = {}) {
   return server;
 }
 
-export async function startServer() {
-  const [widgetHtml, html, app, model, styles] = await Promise.all([
+export function createServerLifecycle({
+  browserViewer,
+  mcpServer,
+  transport,
+  processObject = process,
+  exit = (code) => processObject.exit(code),
+}) {
+  let cleanupPromise = null;
+  let terminationPromise = null;
+  let exitRequested = false;
+  const signalHandlers = new Map();
+
+  function removeSignalHandlers() {
+    for (const [signal, handler] of signalHandlers) {
+      processObject.off(signal, handler);
+    }
+    signalHandlers.clear();
+  }
+
+  function close() {
+    cleanupPromise ??= Promise.resolve().then(async () => {
+      removeSignalHandlers();
+      const closeMcp = typeof mcpServer?.close === "function"
+        ? mcpServer.close()
+        : transport?.close?.();
+      await Promise.allSettled([
+        browserViewer?.close?.(),
+        closeMcp,
+      ]);
+    });
+    return cleanupPromise;
+  }
+
+  function handleSignal() {
+    terminationPromise ??= close().then(() => {
+      if (exitRequested) return;
+      exitRequested = true;
+      exit(0);
+    });
+    return terminationPromise;
+  }
+
+  const previousTransportClose = transport.onclose;
+  transport.onclose = () => {
+    previousTransportClose?.();
+    void close();
+  };
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    const handler = () => {
+      void handleSignal();
+    };
+    signalHandlers.set(signal, handler);
+    processObject.once(signal, handler);
+  }
+
+  return {
+    close,
+    handleSignal,
+    waitForShutdown() {
+      return terminationPromise ?? cleanupPromise ?? Promise.resolve();
+    },
+  };
+}
+
+export async function startServer(options = {}) {
+  const loadAssets = options.loadAssets ?? (async () => Promise.all([
     readFile(new URL("../dist/widget.html", import.meta.url), "utf8"),
     readFile(new URL("../dist/standalone/index.html", import.meta.url), "utf8"),
     readFile(new URL("../dist/standalone/app.mjs", import.meta.url), "utf8"),
     readFile(new URL("../dist/standalone/model.mjs", import.meta.url), "utf8"),
     readFile(new URL("../dist/standalone/styles.css", import.meta.url), "utf8"),
-  ]);
-  const browserViewer = new LoopbackViewerServer({
+  ]));
+  const [widgetHtml, html, app, model, styles] = await loadAssets();
+  const browserViewer = options.browserViewer ?? new LoopbackViewerServer({
     sessionManager: new BrowserSessionManager(),
     assets: { html, app, model, styles },
   });
-  const server = createContextMapServer({ widgetHtml, browserViewer });
-  const transport = new StdioServerTransport();
-  let closing;
-  const closeBrowserViewer = () => {
-    closing ??= browserViewer.close();
-    return closing;
-  };
-  transport.onclose = () => {
-    void closeBrowserViewer();
-  };
-  for (const signal of ["SIGINT", "SIGTERM"]) {
-    process.once(signal, async () => {
-      await closeBrowserViewer();
-      process.exitCode = 0;
-    });
+  const server = options.server ?? createContextMapServer({ widgetHtml, browserViewer });
+  const transport = options.transport ?? new StdioServerTransport();
+  const lifecycle = createServerLifecycle({
+    browserViewer,
+    mcpServer: server,
+    transport,
+    processObject: options.processObject,
+    exit: options.exit,
+  });
+  try {
+    await server.connect(transport);
+  } catch (error) {
+    await lifecycle.close();
+    throw error;
   }
-  await server.connect(transport);
+  return lifecycle;
 }
 
 if (process.argv[1] === new URL(import.meta.url).pathname) await startServer();

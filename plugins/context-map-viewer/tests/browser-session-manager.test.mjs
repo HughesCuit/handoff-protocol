@@ -1,7 +1,26 @@
 import assert from "node:assert/strict";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import { BrowserSessionManager } from "../server/browser-session-manager.mjs";
+
+const accessibleDirectoryFs = {
+  async realpath(path) {
+    return path;
+  },
+  async stat() {
+    return { isDirectory: () => true };
+  },
+};
 
 function fakeStore(calls = [], closed = []) {
   return {
@@ -21,6 +40,7 @@ function fakeStore(calls = [], closed = []) {
 function deterministicManager(options = {}) {
   let byte = 1;
   return new BrowserSessionManager({
+    fsApi: accessibleDirectoryFs,
     randomBytes: () => Buffer.alloc(24, byte++),
     createStore: () => fakeStore(),
     ...options,
@@ -31,6 +51,7 @@ test("creates an opaque session permanently bound to one workspace", async () =>
   const calls = [];
   const stores = [];
   const manager = new BrowserSessionManager({
+    fsApi: accessibleDirectoryFs,
     randomBytes: () => Buffer.alloc(24, 7),
     createStore: () => {
       const store = fakeStore(calls);
@@ -56,10 +77,93 @@ test("rejects a relative workspace before retaining a session", async () => {
   assert.equal(manager.size, 0);
 });
 
+test("rejects a nonexistent workspace before retaining a real store", async (t) => {
+  const parent = await mkdtemp(join(tmpdir(), "viewer-missing-root-"));
+  t.after(() => rm(parent, { recursive: true }));
+  const manager = new BrowserSessionManager();
+
+  await assert.rejects(() => manager.create(join(parent, "does-not-exist")));
+  assert.equal(manager.size, 0);
+  await manager.close();
+});
+
+test("rejects an inaccessible workspace before retaining a real store", async (t) => {
+  const parent = await mkdtemp(join(tmpdir(), "viewer-inaccessible-root-"));
+  const workspace = join(parent, "workspace");
+  await mkdir(workspace);
+  t.after(async () => {
+    await chmod(parent, 0o700);
+    await rm(parent, { recursive: true });
+  });
+  await chmod(parent, 0);
+  const manager = new BrowserSessionManager();
+
+  await assert.rejects(() => manager.create(workspace));
+  assert.equal(manager.size, 0);
+  await manager.close();
+});
+
+test("closes the new store when canonical root validation fails", async () => {
+  const closed = [];
+  const manager = new BrowserSessionManager({
+    fsApi: {
+      async realpath() {
+        const error = new Error("inaccessible");
+        error.code = "EACCES";
+        throw error;
+      },
+      async stat() {
+        assert.fail("stat must not run after realpath fails");
+      },
+    },
+    createStore: () => fakeStore([], closed),
+  });
+
+  await assert.rejects(() => manager.create("/workspace/inaccessible"));
+  assert.equal(manager.size, 0);
+  assert.equal(closed.length, 1);
+});
+
+test("keeps a real session on the original canonical workspace after a root symlink is retargeted", async (t) => {
+  const parent = await mkdtemp(join(tmpdir(), "viewer-canonical-root-"));
+  const original = join(parent, "original");
+  const replacement = join(parent, "replacement");
+  const workspaceLink = join(parent, "workspace");
+  for (const [root, label] of [
+    [original, "Original workspace"],
+    [replacement, "Replacement workspace"],
+  ]) {
+    await mkdir(join(root, ".handoff"), { recursive: true });
+    await writeFile(
+      join(root, ".handoff", "context-map.md"),
+      `# Context Map\n\n## Tasks\n\n- [ ] ${label}\n`,
+    );
+  }
+  await symlink(original, workspaceLink, "dir");
+  const manager = new BrowserSessionManager();
+  t.after(async () => {
+    await manager.close();
+    await rm(parent, { recursive: true });
+  });
+
+  const created = await manager.create(workspaceLink);
+  const beforeRetarget = await manager.snapshot(created.token);
+  await rm(workspaceLink);
+  await symlink(replacement, workspaceLink, "dir");
+  const afterRetarget = await manager.snapshot(created.token);
+
+  assert.match(JSON.stringify(beforeRetarget), /Original workspace/);
+  assert.match(JSON.stringify(afterRetarget), /Original workspace/);
+  assert.doesNotMatch(JSON.stringify(afterRetarget), /Replacement workspace/);
+  assert.doesNotMatch(JSON.stringify(created), new RegExp(original));
+  assert.doesNotMatch(JSON.stringify(afterRetarget), new RegExp(original));
+});
+
 test("expires idle sessions and closes their stores", async () => {
   let now = 1_000;
   const closed = [];
   const manager = new BrowserSessionManager({
+    fsApi: accessibleDirectoryFs,
     now: () => now,
     idleTtlMs: 100,
     createStore: () => fakeStore([], closed),
@@ -99,7 +203,10 @@ test("refreshes and returns a snapshot without exposing its store", async () => 
     },
     async close() {},
   };
-  const manager = new BrowserSessionManager({ createStore: () => store });
+  const manager = new BrowserSessionManager({
+    fsApi: accessibleDirectoryFs,
+    createStore: () => store,
+  });
   const { token } = await manager.create("/workspace/alpha");
 
   assert.deepEqual(await manager.snapshot(token), {
@@ -114,6 +221,7 @@ test("refreshes and returns a snapshot without exposing its store", async () => 
 test("closes every live store and clears its sessions", async () => {
   const closed = [];
   const manager = new BrowserSessionManager({
+    fsApi: accessibleDirectoryFs,
     createStore: () => fakeStore([], closed),
   });
   await manager.create("/workspace/one");
@@ -129,6 +237,7 @@ test("clamps session and idle limits to the hard maximums", async () => {
   let now = 0;
   const closed = [];
   const manager = new BrowserSessionManager({
+    fsApi: accessibleDirectoryFs,
     now: () => now,
     maxSessions: 99,
     idleTtlMs: 99 * 60 * 1000,
@@ -170,6 +279,7 @@ test("keeps a healthy session when a replacement store fails to bind", async () 
   };
   let storeCount = 0;
   const manager = new BrowserSessionManager({
+    fsApi: accessibleDirectoryFs,
     maxSessions: 1,
     createStore: () => (storeCount++ === 0 ? healthy : failing),
   });
@@ -184,6 +294,7 @@ test("keeps a healthy session when a replacement store fails to bind", async () 
 
 test("rejects random-byte providers that return fewer than 16 bytes", async () => {
   const manager = new BrowserSessionManager({
+    fsApi: accessibleDirectoryFs,
     randomBytes: () => Buffer.alloc(15),
     createStore: () => {
       assert.fail("a store must not be created for an invalid token source");
@@ -196,6 +307,7 @@ test("rejects random-byte providers that return fewer than 16 bytes", async () =
 
 test("rejects repeated token collisions after a bounded number of attempts", async () => {
   const manager = new BrowserSessionManager({
+    fsApi: accessibleDirectoryFs,
     randomBytes: () => Buffer.alloc(24, 7),
     createStore: () => fakeStore(),
   });

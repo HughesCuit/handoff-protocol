@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
 
+import * as serverModule from "../server/server.mjs";
 import {
   RESOURCE_URI,
   createContextMapServer,
@@ -149,6 +151,42 @@ test("browser session reports safe structured errors for invalid roots and unava
     assert.doesNotMatch(result.content[0].text, /\/private\/workspace/i);
     assert.doesNotMatch(JSON.stringify(result.structuredContent), /\/private\/workspace/i);
   }
+});
+
+test("the first termination signal closes browser and MCP ownership and requests exit exactly once", async () => {
+  assert.equal(typeof serverModule.createServerLifecycle, "function");
+  const processObject = new EventEmitter();
+  const calls = [];
+  const browserViewer = {
+    async close() {
+      calls.push("browser");
+    },
+  };
+  const mcpServer = {
+    async close() {
+      calls.push("mcp");
+    },
+  };
+  const transport = {};
+  const exits = [];
+  const lifecycle = serverModule.createServerLifecycle({
+    browserViewer,
+    mcpServer,
+    transport,
+    processObject,
+    exit: (code) => exits.push(code),
+  });
+
+  processObject.emit("SIGINT");
+  await lifecycle.waitForShutdown();
+  processObject.emit("SIGTERM");
+  await lifecycle.handleSignal();
+  await lifecycle.close();
+
+  assert.deepEqual(calls.sort(), ["browser", "mcp"]);
+  assert.deepEqual(exits, [0]);
+  assert.equal(processObject.listenerCount("SIGINT"), 0);
+  assert.equal(processObject.listenerCount("SIGTERM"), 0);
 });
 
 test("open binds an explicit Codex cwd when MCP roots are unavailable", async () => {

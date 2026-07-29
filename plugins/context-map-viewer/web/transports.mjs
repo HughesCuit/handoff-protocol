@@ -5,6 +5,73 @@ function unwrapToolResult(result) {
     null;
 }
 
+const SNAPSHOT_STATUSES = new Set([
+  "access_denied",
+  "empty",
+  "invalid",
+  "missing",
+  "refreshing",
+  "synced",
+  "too_large",
+  "too_many_nodes",
+]);
+const WATCH_MODES = new Set(["none", "polling", "watch"]);
+const NODE_SECTIONS = new Set([
+  "decisions",
+  "excluded",
+  "goal",
+  "knowledge",
+  "questions",
+  "risks",
+  "root",
+  "status",
+  "tasks",
+]);
+
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isNullableString(value) {
+  return value === null || typeof value === "string";
+}
+
+function isRenderNode(node) {
+  return isRecord(node) &&
+    typeof node.id === "string" &&
+    NODE_SECTIONS.has(node.section) &&
+    typeof node.text === "string" &&
+    (node.taskState === null || node.taskState === "open" || node.taskState === "done") &&
+    (node.risk === null || node.risk === "low" || node.risk === "medium" || node.risk === "high") &&
+    typeof node.excluded === "boolean" &&
+    (node.origin === "agent" || node.origin === "user") &&
+    Array.isArray(node.children) &&
+    node.children.every(isRenderNode);
+}
+
+function isSnapshot(snapshot) {
+  if (!isRecord(snapshot) || !SNAPSHOT_STATUSES.has(snapshot.status)) return false;
+  if (!isNullableString(snapshot.version) ||
+      !isNullableString(snapshot.diagnostic) ||
+      !isNullableString(snapshot.watchDiagnostic) ||
+      !isNullableString(snapshot.bindingId)) {
+    return false;
+  }
+  if (!Number.isSafeInteger(snapshot.nodeCount) || snapshot.nodeCount < 0) return false;
+  if (!WATCH_MODES.has(snapshot.watchMode)) return false;
+  if (snapshot.source !== ".handoff/context-map.md") return false;
+  if (snapshot.tree !== null &&
+      (!isRecord(snapshot.tree) ||
+        !isRenderNode(snapshot.tree.root) ||
+        !Number.isSafeInteger(snapshot.tree.nodeCount) ||
+        snapshot.tree.nodeCount < 0 ||
+        snapshot.tree.nodeCount !== snapshot.nodeCount)) {
+    return false;
+  }
+  return snapshot.status !== "synced" ||
+    (typeof snapshot.version === "string" && snapshot.tree !== null);
+}
+
 export function createMcpTransport({ parentWindow, windowObject, onSnapshot = () => {} }) {
   const pending = new Map();
   let requestId = 1;
@@ -70,7 +137,9 @@ export function createHttpTransport(options) {
     });
     if (response.status === 404) throw new Error("SESSION_EXPIRED");
     if (!response.ok) throw new Error(`HTTP_SNAPSHOT_${response.status}`);
-    return response.json();
+    const snapshot = await response.json();
+    if (!isSnapshot(snapshot)) throw new Error("INVALID_SNAPSHOT");
+    return snapshot;
   }
 
   return {
@@ -95,6 +164,7 @@ export function createPageLifecycle({
   let disposed = false;
   let expired = false;
   let pollTimer = null;
+  let refreshInFlight = null;
   let generation = 0;
 
   function active(requestGeneration) {
@@ -109,9 +179,7 @@ export function createPageLifecycle({
 
   function startPolling() {
     if (disposed || expired || isHidden() || pollTimer !== null) return;
-    pollTimer = setInterval(() => {
-      refreshSnapshot();
-    }, intervalMs);
+    pollTimer = setInterval(() => refreshSnapshot(), intervalMs);
   }
 
   function handleError(error, requestGeneration) {
@@ -126,16 +194,23 @@ export function createPageLifecycle({
     setStatus(fallbackStatus());
   }
 
-  async function refreshSnapshot() {
+  function refreshSnapshot() {
     if (disposed || expired || isHidden()) return;
+    if (refreshInFlight) return refreshInFlight.promise;
     const requestGeneration = ++generation;
     setStatus("refreshing");
-    try {
-      const snapshot = await refresh();
-      if (active(requestGeneration)) applySnapshot(snapshot);
-    } catch (error) {
-      handleError(error, requestGeneration);
-    }
+    const flight = {};
+    refreshInFlight = flight;
+    flight.promise = Promise.resolve()
+      .then(() => refresh())
+      .then((snapshot) => {
+        if (active(requestGeneration)) applySnapshot(snapshot);
+      })
+      .catch((error) => handleError(error, requestGeneration))
+      .finally(() => {
+        if (refreshInFlight === flight) refreshInFlight = null;
+      });
+    return flight.promise;
   }
 
   return {

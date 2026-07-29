@@ -27,6 +27,33 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
+function validSnapshot(overrides = {}) {
+  return {
+    status: "synced",
+    version: "v1",
+    tree: {
+      root: {
+        id: "context-map",
+        section: "root",
+        text: "Context Map",
+        taskState: null,
+        risk: null,
+        excluded: false,
+        origin: "user",
+        children: [],
+      },
+      nodeCount: 1,
+    },
+    nodeCount: 1,
+    diagnostic: null,
+    watchMode: "watch",
+    watchDiagnostic: null,
+    bindingId: "binding-1",
+    source: ".handoff/context-map.md",
+    ...overrides,
+  };
+}
+
 function lifecycleHarness(overrides = {}) {
   const timers = new Map();
   let nextTimerId = 1;
@@ -36,7 +63,10 @@ function lifecycleHarness(overrides = {}) {
   const lifecycle = createPageLifecycle({
     initialSnapshot: async () => ({ status: "initial" }),
     refresh: async () => ({ status: "synced" }),
-    applySnapshot: (snapshot) => snapshots.push(snapshot),
+    applySnapshot: (snapshot) => {
+      snapshots.push(snapshot);
+      statuses.push(snapshot.status);
+    },
     setStatus: (status) => statuses.push(status),
     terminal: (message) => terminals.push(message),
     fallbackStatus: () => "invalid",
@@ -54,18 +84,16 @@ function lifecycleHarness(overrides = {}) {
 
 test("HTTP transport reads only the same-origin session API", async () => {
   const calls = [];
+  const expected = validSnapshot();
   const transport = createHttpTransport({
     location: new URL("http://127.0.0.1:4312/session/token/"),
     fetch: async (url, options) => {
       calls.push([String(url), options]);
-      return new Response(JSON.stringify({ status: "synced", version: "v1" }));
+      return new Response(JSON.stringify(expected));
     },
   });
 
-  assert.deepEqual(await transport.initialSnapshot(), {
-    status: "synced",
-    version: "v1",
-  });
+  assert.deepEqual(await transport.initialSnapshot(), expected);
   assert.equal(calls[0][0], "http://127.0.0.1:4312/session/token/api/context-map");
   assert.deepEqual(calls[0][1], {
     method: "GET",
@@ -73,6 +101,48 @@ test("HTTP transport reads only the same-origin session API", async () => {
     credentials: "omit",
     redirect: "error",
   });
+});
+
+test("HTTP transport accepts the parser's production semantic sections", async () => {
+  const expected = validSnapshot({
+    tree: {
+      root: {
+        id: "context-map",
+        section: "root",
+        text: "Context Map",
+        taskState: null,
+        risk: null,
+        excluded: false,
+        origin: "user",
+        children: [{
+          id: "section-goal",
+          section: "goal",
+          text: "Current Goal",
+          taskState: null,
+          risk: null,
+          excluded: false,
+          origin: "user",
+          children: [{
+            id: "goal-item",
+            section: "goal",
+            text: "Keep the session bound",
+            taskState: null,
+            risk: null,
+            excluded: false,
+            origin: "user",
+            children: [],
+          }],
+        }],
+      },
+      nodeCount: 1,
+    },
+  });
+  const transport = createHttpTransport({
+    location: new URL("http://127.0.0.1:4312/session/token/"),
+    fetch: async () => new Response(JSON.stringify(expected)),
+  });
+
+  assert.deepEqual(await transport.refresh(), expected);
 });
 
 test("HTTP transport reports an expired session without changing endpoint", async () => {
@@ -87,6 +157,63 @@ test("HTTP transport reports an expired session without changing endpoint", asyn
 
   await assert.rejects(() => transport.refresh(), /SESSION_EXPIRED/);
   assert.deepEqual(calls, ["http://127.0.0.1:4312/session/token/api/context-map"]);
+});
+
+test("HTTP transport rejects primitive and structurally invalid snapshot payloads", async () => {
+  const invalidPayloads = [
+    null,
+    7,
+    "synced",
+    [],
+    {},
+    validSnapshot({ status: "unknown" }),
+    validSnapshot({ version: 1 }),
+    validSnapshot({ tree: [] }),
+    validSnapshot({ tree: null }),
+    validSnapshot({ nodeCount: "1" }),
+    validSnapshot({ diagnostic: {} }),
+    validSnapshot({ watchMode: "filesystem" }),
+    validSnapshot({ source: "/private/workspace/.handoff/context-map.md" }),
+  ];
+
+  for (const payload of invalidPayloads) {
+    const transport = createHttpTransport({
+      location: new URL("http://127.0.0.1:4312/session/token/"),
+      fetch: async () => new Response(JSON.stringify(payload)),
+    });
+    await assert.rejects(
+      () => transport.refresh(),
+      /INVALID_SNAPSHOT/,
+      `accepted malformed payload: ${JSON.stringify(payload)}`,
+    );
+  }
+});
+
+test("malformed HTTP refresh retains the last valid map and restores its status", async () => {
+  const expected = validSnapshot();
+  const responses = [expected, 42];
+  const transport = createHttpTransport({
+    location: new URL("http://127.0.0.1:4312/session/token/"),
+    fetch: async () => new Response(JSON.stringify(responses.shift())),
+  });
+  let lastValid = null;
+  const harness = lifecycleHarness({
+    initialSnapshot: () => transport.initialSnapshot(),
+    refresh: () => transport.refresh(),
+    applySnapshot(snapshot) {
+      lastValid = snapshot;
+      harness.snapshots.push(snapshot);
+      harness.statuses.push(snapshot.status);
+    },
+    fallbackStatus: () => lastValid?.status ?? "invalid",
+  });
+
+  await harness.lifecycle.start();
+  await harness.lifecycle.refresh();
+
+  assert.deepEqual(harness.snapshots, [expected]);
+  assert.equal(lastValid.tree.root.text, "Context Map");
+  assert.equal(harness.statuses.at(-1), "synced");
 });
 
 test("MCP transport unwraps tool results and accepts replies only from its parent", async () => {
@@ -169,25 +296,52 @@ test("page transport accepts only the explicit MCP and HTTP mode markers", () =>
   );
 });
 
-test("page lifecycle never applies an older refresh after a newer session expiry", async () => {
-  const first = deferred();
-  const second = deferred();
-  let reads = 0;
+test("page lifecycle never applies an in-flight refresh over a newer incoming snapshot", async () => {
+  const pending = deferred();
   const harness = lifecycleHarness({
-    refresh: () => (++reads === 1 ? first.promise : second.promise),
+    refresh: () => pending.promise,
   });
   await harness.lifecycle.start();
 
-  const olderRefresh = harness.lifecycle.refresh();
-  const expiringRefresh = harness.lifecycle.refresh();
-  second.reject(new Error("SESSION_EXPIRED"));
-  await expiringRefresh;
-  first.resolve({ status: "synced", version: "stale" });
-  await olderRefresh;
+  const refresh = harness.lifecycle.refresh();
+  harness.lifecycle.applyIncomingSnapshot({ status: "synced", version: "newer" });
+  pending.resolve({ status: "synced", version: "stale" });
+  await refresh;
 
-  assert.deepEqual(harness.snapshots, [{ status: "initial" }]);
-  assert.equal(harness.terminals.length, 1);
-  assert.equal(harness.timers.size, 0);
+  assert.deepEqual(harness.snapshots, [
+    { status: "initial" },
+    { status: "synced", version: "newer" },
+  ]);
+});
+
+test("page lifecycle keeps refresh polling single-flight and continues after a slow response", async () => {
+  const slow = deferred();
+  let reads = 0;
+  const harness = lifecycleHarness({
+    refresh() {
+      reads += 1;
+      return reads === 1
+        ? slow.promise
+        : Promise.resolve({ status: "synced", version: "next" });
+    },
+  });
+  await harness.lifecycle.start();
+
+  const first = harness.lifecycle.refresh();
+  const overlapping = harness.lifecycle.refresh();
+  await Promise.resolve();
+  assert.equal(reads, 1);
+  assert.equal(harness.statuses.at(-1), "refreshing");
+
+  slow.resolve({ status: "synced", version: "slow" });
+  await Promise.all([first, overlapping]);
+  assert.deepEqual(harness.snapshots.at(-1), { status: "synced", version: "slow" });
+
+  const poll = [...harness.timers.values()][0];
+  await poll();
+  assert.equal(reads, 2);
+  assert.deepEqual(harness.snapshots.at(-1), { status: "synced", version: "next" });
+  assert.equal(harness.statuses.at(-1), "synced");
 });
 
 test("page lifecycle keeps one poll timer when visibility returns during initialization", async () => {

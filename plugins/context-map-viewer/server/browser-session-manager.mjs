@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -18,6 +19,7 @@ export class BrowserSessionManager {
   constructor(options = {}) {
     this.createStore = options.createStore ?? (() => new ContextMapStore());
     this.randomBytes = options.randomBytes ?? randomBytes;
+    this.fsApi = options.fsApi ?? { realpath, stat };
     this.now = options.now ?? Date.now;
     this.idleTtlMs = clamp(options.idleTtlMs ?? MAX_IDLE_TTL_MS, 0, MAX_IDLE_TTL_MS);
     this.maxSessions = clamp(options.maxSessions ?? MAX_SESSIONS, 1, MAX_SESSIONS);
@@ -54,7 +56,12 @@ export class BrowserSessionManager {
     }
     const store = this.createStore();
     try {
-      await store.bind(pathToFileURL(resolve(workspaceRoot)).href);
+      const canonicalRoot = await this.fsApi.realpath(resolve(workspaceRoot));
+      const rootInfo = await this.fsApi.stat(canonicalRoot);
+      if (!rootInfo.isDirectory()) {
+        throw new TypeError("Workspace root must be an accessible directory.");
+      }
+      await store.bind(pathToFileURL(canonicalRoot).href);
       await this.prune();
       await this.evictForCapacity();
     } catch (error) {
