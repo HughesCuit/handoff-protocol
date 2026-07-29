@@ -949,6 +949,47 @@ export function defineUnitTests(test, readFixture) {
     }
   });
 
+  test("migrate: a rollback-cleanup failure after commit must NOT roll back the migration", async () => {
+    const inputs = await readHandoffInputs("legacy-1x");
+    const plan = planMigration(inputs);
+    const seed = seedFromInputs(inputs);
+    const io = makeFakeIo(seed);
+
+    // Inject a failure on the SECOND rollback-sibling remove. By then every
+    // new file is renamed into place — the migration is committed — so this
+    // failure must not trigger the transactional rollback.
+    const baseRemove = io.remove;
+    let rollbackRemoves = 0;
+    io.remove = async (p) => {
+      if (p.endsWith(".migration-rollback")) {
+        rollbackRemoves += 1;
+        if (rollbackRemoves === 2) throw new Error("injected cleanup failure");
+      }
+      return baseRemove(p);
+    };
+
+    const result = await applyMigration(
+      plan,
+      { handoffDir: MIGRATE_HANDOFF_DIR, configPath: MIGRATE_CONFIG_PATH },
+      io,
+      { timestamp: "2026-07-26T00:00:00.000Z" }
+    );
+    assert(result.migrated, "cleanup failure must not fail a committed migration");
+
+    // Every new v2 output is in place with its planned content (nothing rolled back).
+    for (const [name, content] of Object.entries(plan.outputs)) {
+      const finalPath = name === ".handoff.config.json" ? MIGRATE_CONFIG_PATH : `${MIGRATE_HANDOFF_DIR}/${name}`;
+      assertEqual(io.store.get(finalPath), content, `committed output missing or rolled back: ${name}`);
+    }
+    // No temp residue; leftover rollback siblings are tolerated but originals
+    // must not reappear in place of the committed outputs (no mixed state).
+    for (const key of io.store.keys()) {
+      assert(!key.includes("migration-tmp"), `temp file left behind: ${key}`);
+    }
+    const json = JSON.parse(io.store.get(`${MIGRATE_HANDOFF_DIR}/context.json`));
+    assertEqual(json.version, PROTOCOL_VERSION, "context.json was rolled back to legacy");
+  });
+
   test("migrate: repeated migration is idempotent", async () => {
     const inputs = await readHandoffInputs("legacy-1x");
     const io = makeFakeIo(seedFromInputs(inputs));

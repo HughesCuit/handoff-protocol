@@ -637,7 +637,9 @@ function validateOutputs(plan) {
  * `<final>.migration-rollback` sibling; on ANY rename-phase failure every
  * already-replaced file is restored from its sibling (files without an
  * original are removed), so originals end up byte-identical and no mixed
- * legacy/v2 state remains. Rollback siblings are removed on success.
+ * legacy/v2 state remains. Once every rename has succeeded the migration is
+ * COMMITTED; dropping the rollback siblings afterwards is best-effort and
+ * can never trigger the rollback (leftover siblings may remain).
  * Returns `{ migrated, backupDir?, written?, reason? }`.
  */
 export async function applyMigration(plan, paths, io, options = {}) {
@@ -703,10 +705,6 @@ export async function applyMigration(plan, paths, io, options = {}) {
       replaced.push(entry);
       await io.rename(temp.tempPath, temp.finalPath);
     }
-    // Success: drop the rollback siblings.
-    for (const entry of replaced) {
-      if (entry.rollbackPath) await io.remove(entry.rollbackPath);
-    }
   } catch (err) {
     // Roll back the rename phase: restore every replaced original and drop
     // new files that had no original, so no mixed legacy/v2 state survives.
@@ -728,6 +726,21 @@ export async function applyMigration(plan, paths, io, options = {}) {
       }
     }
     throw err;
+  }
+
+  // Every new file is renamed into place: the migration is COMMITTED.
+  // Dropping the rollback siblings is best-effort — a failure here must never
+  // re-enter the catch above (it would delete committed files and restore
+  // already-removed originals). Leftover `*.migration-rollback` files are
+  // harmless and may be removed manually.
+  for (const entry of replaced) {
+    if (entry.rollbackPath) {
+      try {
+        await io.remove(entry.rollbackPath);
+      } catch {
+        // Cleanup failed; the committed state stays untouched.
+      }
+    }
   }
 
   return { migrated: true, backupDir, written: Object.keys(outputs) };
