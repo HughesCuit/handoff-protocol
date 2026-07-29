@@ -18,6 +18,8 @@ import {
   resolveContextMap,
 } from "./context-source.mjs";
 import { ContextMapStore } from "./context-store.mjs";
+import { BrowserSessionManager } from "./browser-session-manager.mjs";
+import { LoopbackViewerServer } from "./loopback-viewer-server.mjs";
 
 export const RESOURCE_URI = "ui://context-map/viewer.html";
 
@@ -51,6 +53,21 @@ function rootError() {
     content: [{
       type: "text",
       text: "Context Map Viewer requires one unambiguous workspace root containing a Context Map.",
+    }],
+  };
+}
+
+function browserSessionError(diagnostic) {
+  return {
+    isError: true,
+    structuredContent: {
+      status: "unavailable",
+      diagnostic,
+      fallback: "open_context_map",
+    },
+    content: [{
+      type: "text",
+      text: "Context Map browser session is unavailable. Use the Context Map tool instead.",
     }],
   };
 }
@@ -99,6 +116,7 @@ export function createContextMapServer(options = {}) {
   });
   const store = options.store ?? new ContextMapStore();
   const widgetHtml = options.widgetHtml ?? "";
+  const browserViewer = options.browserViewer;
   const rootProvider = options.rootProvider ??
     (async () => (await server.server.listRoots()).roots ?? []);
   const rootSelector = options.rootSelector ?? selectActiveRoot;
@@ -178,13 +196,65 @@ export function createContextMapServer(options = {}) {
     refreshHandler,
   );
 
+  server.registerTool(
+    "create_context_map_browser_session",
+    {
+      title: "Open Context Map in Browser",
+      description:
+        "Create a read-only loopback Viewer session. Pass the current Codex task's absolute cwd as workspaceRoot.",
+      inputSchema: z.object({ workspaceRoot: z.string().min(1) }),
+      annotations: TOOL_ANNOTATIONS,
+    },
+    async ({ workspaceRoot }) => {
+      if (!isAbsolute(workspaceRoot)) return browserSessionError("WORKSPACE_ROOT_REQUIRED");
+      try {
+        const session = await browserViewer.createSession(resolve(workspaceRoot));
+        return {
+          structuredContent: {
+            status: "ready",
+            ...session,
+            fallback: "open_context_map",
+          },
+          content: [{ type: "text", text: "Context Map browser session is ready." }],
+        };
+      } catch {
+        return browserSessionError("BROWSER_SESSION_UNAVAILABLE");
+      }
+    },
+  );
+
   return server;
 }
 
 export async function startServer() {
-  const widgetHtml = await readFile(new URL("../dist/widget.html", import.meta.url), "utf8");
-  const server = createContextMapServer({ widgetHtml });
-  await server.connect(new StdioServerTransport());
+  const [widgetHtml, html, app, model, styles] = await Promise.all([
+    readFile(new URL("../dist/widget.html", import.meta.url), "utf8"),
+    readFile(new URL("../dist/standalone/index.html", import.meta.url), "utf8"),
+    readFile(new URL("../dist/standalone/app.mjs", import.meta.url), "utf8"),
+    readFile(new URL("../dist/standalone/model.mjs", import.meta.url), "utf8"),
+    readFile(new URL("../dist/standalone/styles.css", import.meta.url), "utf8"),
+  ]);
+  const browserViewer = new LoopbackViewerServer({
+    sessionManager: new BrowserSessionManager(),
+    assets: { html, app, model, styles },
+  });
+  const server = createContextMapServer({ widgetHtml, browserViewer });
+  const transport = new StdioServerTransport();
+  let closing;
+  const closeBrowserViewer = () => {
+    closing ??= browserViewer.close();
+    return closing;
+  };
+  transport.onclose = () => {
+    void closeBrowserViewer();
+  };
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    process.once(signal, async () => {
+      await closeBrowserViewer();
+      process.exitCode = 0;
+    });
+  }
+  await server.connect(transport);
 }
 
 if (process.argv[1] === new URL(import.meta.url).pathname) await startServer();

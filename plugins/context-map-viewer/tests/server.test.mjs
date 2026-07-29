@@ -31,13 +31,21 @@ test("plugin manifest launches the bundled MCP server", async () => {
 });
 
 test("build emits a self-contained MCP Apps widget", async () => {
-  const html = await readFile(new URL("dist/widget.html", pluginRoot), "utf8");
+  const [widgetHtml, standaloneHtml, standaloneApp] = await Promise.all([
+    readFile(new URL("dist/widget.html", pluginRoot), "utf8"),
+    readFile(new URL("dist/standalone/index.html", pluginRoot), "utf8"),
+    readFile(new URL("dist/standalone/app.mjs", pluginRoot), "utf8"),
+  ]);
 
-  assert.match(html, /ui\/notifications\/tool-result/);
-  assert.match(html, /tools\/call/);
-  assert.match(html, /arguments:\{bindingId:/);
-  assert.doesNotMatch(html, /<script[^>]+src=/);
-  assert.doesNotMatch(html, /<link[^>]+href=/);
+  assert.match(widgetHtml, /ui\/notifications\/tool-result/);
+  assert.match(widgetHtml, /tools\/call/);
+  assert.match(widgetHtml, /arguments:\{bindingId:/);
+  assert.doesNotMatch(widgetHtml, /<script[^>]+src=/);
+  assert.doesNotMatch(widgetHtml, /<link[^>]+href=/);
+  assert.match(standaloneHtml, /content="http/);
+  assert.match(standaloneHtml, /src="\.\/app\.mjs"/);
+  assert.match(standaloneApp, /api\/context-map/);
+  assert.doesNotMatch(standaloneApp, /tools\/call/);
 });
 
 test("registers explicit workspace binding and opaque refresh inputs", () => {
@@ -63,6 +71,56 @@ test("registers explicit workspace binding and opaque refresh inputs", () => {
     assert.equal(tool.annotations.readOnlyHint, true);
     assert.equal(tool.annotations.destructiveHint, false);
     assert.equal(tool.annotations.openWorldHint, false);
+  }
+});
+
+test("registers a read-only browser session tool with an explicit cwd", async () => {
+  const calls = [];
+  const browserViewer = {
+    createSession: async (root) => {
+      calls.push(root);
+      return {
+        viewerUrl: "http://127.0.0.1:4312/session/token/",
+        sessionId: "session-1",
+        source: ".handoff/context-map.md",
+      };
+    },
+    close: async () => {},
+  };
+  const server = createContextMapServer({ browserViewer, widgetHtml: "<main/>" });
+  const tool = server._registeredTools.create_context_map_browser_session;
+  const result = await tool.handler({ workspaceRoot: "/workspace/project" });
+
+  assert.deepEqual(calls, ["/workspace/project"]);
+  assert.equal(result.structuredContent.status, "ready");
+  assert.equal(result.structuredContent.fallback, "open_context_map");
+  assert.equal(tool.annotations.readOnlyHint, true);
+  assert.equal(tool._meta?.ui, undefined);
+});
+
+test("browser session reports safe structured errors for invalid roots and unavailable viewers", async () => {
+  const unavailable = createContextMapServer({
+    browserViewer: {
+      createSession: async () => {
+        throw new Error("/private/workspace must remain private");
+      },
+      close: async () => {},
+    },
+    widgetHtml: "<main/>",
+  });
+  const tool = unavailable._registeredTools.create_context_map_browser_session;
+
+  for (const [workspaceRoot, diagnostic] of [
+    ["relative/project", "WORKSPACE_ROOT_REQUIRED"],
+    ["/workspace/project", "BROWSER_SESSION_UNAVAILABLE"],
+  ]) {
+    const result = await tool.handler({ workspaceRoot });
+    assert.equal(result.isError, true);
+    assert.equal(result.structuredContent.status, "unavailable");
+    assert.equal(result.structuredContent.diagnostic, diagnostic);
+    assert.equal(result.structuredContent.fallback, "open_context_map");
+    assert.doesNotMatch(result.content[0].text, /\/private\/workspace/i);
+    assert.doesNotMatch(JSON.stringify(result.structuredContent), /\/private\/workspace/i);
   }
 });
 
