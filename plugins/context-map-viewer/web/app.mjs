@@ -7,9 +7,8 @@ import {
   reconcileFoldState,
   requestPictureInPicture,
 } from "./model.mjs";
+import { createPageTransport } from "./transports.mjs";
 
-const pending = new Map();
-let requestId = 1;
 let snapshot = null;
 let lastTree = null;
 let folded = new Set();
@@ -18,6 +17,7 @@ let transform = { x: 36, y: 36, scale: 1 };
 let pollTimer = null;
 let dragging = null;
 let bindingId = null;
+let sessionExpired = false;
 
 const stage = document.getElementById("stage");
 const canvas = document.getElementById("canvas");
@@ -29,12 +29,6 @@ const statusElement = document.getElementById("sync-status");
 const emptyState = document.getElementById("empty-state");
 const zoomValue = document.getElementById("zoom-value");
 const SVG_NS = "http://www.w3.org/2000/svg";
-
-function request(method, params) {
-  const id = requestId++;
-  window.parent.postMessage({ jsonrpc: "2.0", id, method, params }, "*");
-  return new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
-}
 
 function setTransform() {
   viewport.setAttribute(
@@ -185,10 +179,11 @@ function setStatus(status) {
     too_many_nodes: "Too many nodes",
     access_denied: "Access denied",
     watcher_unavailable: "Polling",
+    expired: "Session expired",
   };
   statusElement.textContent = labels[status] ?? "Unavailable";
   statusElement.className = `sync-status ${status === "synced" ? "synced" : ""} ${
-    ["invalid", "too_large", "too_many_nodes", "access_denied"].includes(status)
+    ["invalid", "too_large", "too_many_nodes", "access_denied", "expired"].includes(status)
       ? "error"
       : ""
   }`;
@@ -236,24 +231,35 @@ function applySnapshot(next) {
   emptyState.textContent = emptyMessage(next.status);
 }
 
-function unwrapToolResult(result) {
-  return result?.structuredContent ??
-    result?.content?.structuredContent ??
-    result?.result?.structuredContent ??
-    null;
+function showTerminalEmptyState(message) {
+  sessionExpired = true;
+  clearInterval(pollTimer);
+  pollTimer = null;
+  lastTree = null;
+  canvas.hidden = true;
+  emptyState.hidden = false;
+  emptyState.textContent = message;
+  setStatus("expired");
 }
 
+const transport = createPageTransport(document, {
+  parentWindow: window.parent,
+  windowObject: window,
+  fetch: window.fetch.bind(window),
+  location: window.location,
+  onSnapshot: applySnapshot,
+});
+
 async function refresh() {
-  if (document.hidden) return;
+  if (document.hidden || sessionExpired) return;
   setStatus("refreshing");
   try {
-    const result = await request("tools/call", {
-      name: "get_context_map",
-      arguments: { bindingId: snapshot?.bindingId },
-    });
-    const next = unwrapToolResult(result);
-    if (next) applySnapshot(next);
-  } catch {
+    applySnapshot(await transport.refresh(snapshot?.bindingId));
+  } catch (error) {
+    if (error.message === "SESSION_EXPIRED") {
+      showTerminalEmptyState("This Viewer session expired. Reopen Context Map Viewer.");
+      return;
+    }
     setStatus(snapshot?.status ?? "invalid");
   }
 }
@@ -282,22 +288,6 @@ function fitView() {
   transform = { x: 20, y: 20, scale };
   setTransform();
 }
-
-window.addEventListener("message", (event) => {
-  if (event.source !== window.parent) return;
-  const message = event.data;
-  if (!message || message.jsonrpc !== "2.0") return;
-  if (message.id !== undefined && pending.has(message.id)) {
-    const handler = pending.get(message.id);
-    pending.delete(message.id);
-    if (message.error) handler.reject(message.error);
-    else handler.resolve(message.result);
-    return;
-  }
-  if (message.method === "ui/notifications/tool-result") {
-    applySnapshot(message.params?.structuredContent);
-  }
-});
 
 searchInput.addEventListener("input", () => {
   query = searchInput.value;
@@ -350,13 +340,32 @@ document.addEventListener("visibilitychange", () => {
     clearInterval(pollTimer);
     pollTimer = null;
   } else {
-    refresh();
-    pollTimer ??= setInterval(refresh, 750);
+    if (!sessionExpired) {
+      refresh();
+      pollTimer ??= setInterval(refresh, 750);
+    }
   }
 });
 
 window.addEventListener("resize", () => setTransform());
+window.addEventListener("pagehide", () => {
+  clearInterval(pollTimer);
+  pollTimer = null;
+  transport.dispose();
+}, { once: true });
 setTransform();
-if (window.openai?.toolOutput) applySnapshot(window.openai.toolOutput);
-requestPictureInPicture(window.openai);
-pollTimer = setInterval(refresh, 750);
+if (document.querySelector('meta[name="context-map-viewer-transport"]')?.content === "mcp") {
+  requestPictureInPicture(window.openai);
+}
+(async () => {
+  try {
+    applySnapshot(await transport.initialSnapshot());
+  } catch (error) {
+    if (error.message === "SESSION_EXPIRED") {
+      showTerminalEmptyState("This Viewer session expired. Reopen Context Map Viewer.");
+      return;
+    }
+    setStatus(snapshot?.status ?? "invalid");
+  }
+  if (!sessionExpired) pollTimer = setInterval(refresh, 750);
+})();
