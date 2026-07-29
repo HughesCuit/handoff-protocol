@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -88,5 +88,22 @@ test("checks the size of the same opened object that is read", async () => {
   await assert.rejects(
     readContextMapSource(source),
     (error) => error instanceof ContextSourceError && error.code === "TOO_LARGE",
+  );
+});
+
+test("rejects a parent directory replaced by an escaping symlink after resolution", async () => {
+  const root = await workspace();
+  const handoff = join(root, ".handoff");
+  const file = join(handoff, "context-map.md");
+  await writeFile(file, "safe");
+  const source = await resolveContextMap(pathToFileURL(root).href);
+  const outside = await mkdtemp(join(tmpdir(), "viewer-parent-race-"));
+  await writeFile(join(outside, "context-map.md"), "outside secret");
+  await rename(handoff, `${handoff}-original`);
+  await symlink(outside, handoff);
+
+  await assert.rejects(
+    readContextMapSource(source),
+    (error) => error instanceof ContextSourceError && error.code === "ACCESS_DENIED",
   );
 });

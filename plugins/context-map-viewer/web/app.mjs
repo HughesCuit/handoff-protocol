@@ -1,5 +1,6 @@
 import {
   buildVisibleTree,
+  bindingChanged,
   collapseAll,
   focusNodeTransform,
   layoutTree,
@@ -16,6 +17,7 @@ let query = "";
 let transform = { x: 36, y: 36, scale: 1 };
 let pollTimer = null;
 let dragging = null;
+let bindingId = null;
 
 const stage = document.getElementById("stage");
 const canvas = document.getElementById("canvas");
@@ -206,6 +208,13 @@ function emptyMessage(status) {
 
 function applySnapshot(next) {
   if (!next || typeof next !== "object") return;
+  if (bindingChanged(bindingId, next.bindingId)) {
+    lastTree = null;
+    folded = new Set();
+    query = "";
+    searchInput.value = "";
+  }
+  bindingId = next.bindingId ?? bindingId;
   snapshot = next;
   setStatus(next.status);
   if (next.tree?.root) {

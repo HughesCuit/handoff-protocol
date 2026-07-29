@@ -30,6 +30,7 @@ function emptyState() {
     diagnostic: null,
     watchMode: "none",
     watchDiagnostic: null,
+    bindingId: null,
   };
 }
 
@@ -63,7 +64,7 @@ export class ContextMapStore {
       return;
     }
     await this.close();
-    this.state = emptyState();
+    this.state = { ...emptyState(), bindingId: digest(rootUri).slice(0, 16) };
     this.rootUri = rootUri;
     this.source = await this.resolveSource(rootUri);
     await this.refresh();

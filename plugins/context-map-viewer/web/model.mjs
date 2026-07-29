@@ -110,6 +110,10 @@ export function focusNodeTransform(layout, nodeId, stage, current) {
   };
 }
 
+export function bindingChanged(previous, next) {
+  return Boolean(previous && next && previous !== next);
+}
+
 export async function requestPictureInPicture(host) {
   if (typeof host?.requestDisplayMode !== "function") return false;
   try {

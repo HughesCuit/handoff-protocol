@@ -5,6 +5,7 @@ import {
   buildVisibleTree,
   collapseAll,
   focusNodeTransform,
+  bindingChanged,
   layoutTree,
   matchSearch,
   reconcileFoldState,
@@ -96,6 +97,12 @@ test("search focus centers the first matching node without changing zoom", () =>
   assert.equal(next.scale, 1.25);
   assert.equal(next.x + (node.x + node.width / 2) * next.scale, 400);
   assert.equal(next.y + (node.y + node.height / 2) * next.scale, 300);
+});
+
+test("binding changes distinguish workspace switches from same-workspace refreshes", () => {
+  assert.equal(bindingChanged(null, "workspace-a"), false);
+  assert.equal(bindingChanged("workspace-a", "workspace-a"), false);
+  assert.equal(bindingChanged("workspace-a", "workspace-b"), true);
 });
 
 test("picture-in-picture request tolerates missing, synchronous, and rejected hosts", async () => {
