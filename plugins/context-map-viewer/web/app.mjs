@@ -249,7 +249,7 @@ async function refresh() {
   try {
     const result = await request("tools/call", {
       name: "get_context_map",
-      arguments: {},
+      arguments: { bindingId: snapshot?.bindingId },
     });
     const next = unwrapToolResult(result);
     if (next) applySnapshot(next);

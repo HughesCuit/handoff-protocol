@@ -9,7 +9,9 @@ Use the Context Map Viewer MCP tools to display the active workspace's map.
 
 ## Open the viewer
 
-1. Call `open_context_map` with no arguments.
+1. Call `open_context_map` with `workspaceRoot` set to the current Codex task's
+   absolute working directory (`cwd`). Do not ask the user to provide it when
+   Codex already supplies it in the task environment.
 2. Let the returned MCP App render the map. It requests picture-in-picture when
    the host supports it and otherwise remains inline.
 3. Tell the user when the file is missing or invalid using the tool's safe
@@ -23,7 +25,8 @@ update an already open viewer.
 - Treat the viewer as read-only.
 - Never claim that folding, searching, zooming, or opening the viewer modifies
   Handoff state.
-- Do not accept or invent another file path. The tool always reads the active
-  workspace's `.handoff/context-map.md`.
+- Pass only the active task's absolute `cwd` as `workspaceRoot`; never accept or
+  invent another path. The tool always appends the fixed
+  `.handoff/context-map.md` path.
 - Use the separate Handoff skill when the user wants to save, load, or edit
   project context.

@@ -17,6 +17,12 @@ Handoff Protocol. It renders the active workspace's
 The viewer never writes Handoff files and does not run `save`, `load`, or
 `diff`.
 
+In Codex, the bundled skill passes the active task's absolute `cwd` when it
+opens the viewer. The server appends only the fixed
+`.handoff/context-map.md` path. Live widget refreshes use an opaque binding ID,
+not the local workspace path. MCP Roots remain a fallback for hosts that
+support them.
+
 ## Install from this repository
 
 Add the repository marketplace once:

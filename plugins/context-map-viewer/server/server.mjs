@@ -1,4 +1,6 @@
 import { readFile } from "node:fs/promises";
+import { isAbsolute, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 import {
   RESOURCE_MIME_TYPE,
@@ -53,6 +55,18 @@ function rootError() {
   };
 }
 
+function resultFor(snapshot) {
+  return {
+    structuredContent: snapshot,
+    content: [{ type: "text", text: safeSummary(snapshot) }],
+  };
+}
+
+function explicitRoot(workspaceRoot) {
+  if (!workspaceRoot || !isAbsolute(workspaceRoot)) return null;
+  return { uri: pathToFileURL(resolve(workspaceRoot)).href };
+}
+
 export async function selectActiveRoot(
   roots,
   options = {},
@@ -104,19 +118,26 @@ export function createContextMapServer(options = {}) {
     }),
   );
 
-  async function snapshotHandler() {
-    const roots = await rootProvider();
-    const root = await rootSelector(roots);
+  async function openHandler({ workspaceRoot } = {}) {
+    let root = explicitRoot(workspaceRoot);
+    if (!root) root = await rootSelector(await rootProvider());
     if (!root) return rootError();
     await store.bind(root.uri);
     const snapshot = {
       ...store.snapshot(),
       source: CONTEXT_MAP_RELATIVE_PATH,
     };
-    return {
-      structuredContent: snapshot,
-      content: [{ type: "text", text: safeSummary(snapshot) }],
-    };
+    return resultFor(snapshot);
+  }
+
+  async function refreshHandler({ bindingId } = {}) {
+    const current = store.snapshot();
+    if (!bindingId || current.bindingId !== bindingId) return rootError();
+    await store.refresh();
+    return resultFor({
+      ...store.snapshot(),
+      source: CONTEXT_MAP_RELATIVE_PATH,
+    });
   }
 
   registerAppTool(
@@ -124,8 +145,10 @@ export function createContextMapServer(options = {}) {
     "open_context_map",
     {
       title: "Open Context Map",
-      description: "Open the current workspace's read-only Handoff Context Map viewer.",
-      inputSchema: z.object({}),
+      description: "Open a read-only Handoff Context Map. In Codex, pass the current task's absolute cwd as workspaceRoot.",
+      inputSchema: z.object({
+        workspaceRoot: z.string().min(1).optional(),
+      }),
       annotations: TOOL_ANNOTATIONS,
       _meta: {
         ui: { resourceUri: RESOURCE_URI },
@@ -134,7 +157,7 @@ export function createContextMapServer(options = {}) {
         "openai/toolInvocation/invoked": "Context Map opened.",
       },
     },
-    snapshotHandler,
+    openHandler,
   );
 
   registerAppTool(
@@ -142,15 +165,17 @@ export function createContextMapServer(options = {}) {
     "get_context_map",
     {
       title: "Refresh Context Map",
-      description: "Read the latest snapshot for an already open Context Map viewer.",
-      inputSchema: z.object({}),
+      description: "Refresh an open Context Map using its opaque bindingId.",
+      inputSchema: z.object({
+        bindingId: z.string().min(1).optional(),
+      }),
       annotations: TOOL_ANNOTATIONS,
       _meta: {
         "openai/toolInvocation/invoking": "Refreshing Context Map…",
         "openai/toolInvocation/invoked": "Context Map refreshed.",
       },
     },
-    snapshotHandler,
+    refreshHandler,
   );
 
   return server;

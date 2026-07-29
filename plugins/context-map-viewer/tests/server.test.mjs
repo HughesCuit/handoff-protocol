@@ -35,11 +35,12 @@ test("build emits a self-contained MCP Apps widget", async () => {
 
   assert.match(html, /ui\/notifications\/tool-result/);
   assert.match(html, /tools\/call/);
+  assert.match(html, /arguments:\{bindingId:/);
   assert.doesNotMatch(html, /<script[^>]+src=/);
   assert.doesNotMatch(html, /<link[^>]+href=/);
 });
 
-test("registers a render tool and a headless refresh tool with no path input", () => {
+test("registers explicit workspace binding and opaque refresh inputs", () => {
   const store = {
     bind: async () => {},
     refresh: async () => {},
@@ -56,13 +57,71 @@ test("registers a render tool and a headless refresh tool with no path input", (
   assert.equal(open._meta.ui.resourceUri, RESOURCE_URI);
   assert.equal(open._meta["openai/outputTemplate"], RESOURCE_URI);
   assert.equal(refresh._meta?.ui, undefined);
-  assert.deepEqual(Object.keys(open.inputSchema.shape), []);
-  assert.deepEqual(Object.keys(refresh.inputSchema.shape), []);
+  assert.deepEqual(Object.keys(open.inputSchema.shape), ["workspaceRoot"]);
+  assert.deepEqual(Object.keys(refresh.inputSchema.shape), ["bindingId"]);
   for (const tool of [open, refresh]) {
     assert.equal(tool.annotations.readOnlyHint, true);
     assert.equal(tool.annotations.destructiveHint, false);
     assert.equal(tool.annotations.openWorldHint, false);
   }
+});
+
+test("open binds an explicit Codex cwd when MCP roots are unavailable", async () => {
+  const calls = [];
+  const store = {
+    bind: async (uri) => calls.push(["bind", uri]),
+    refresh: async () => calls.push(["refresh"]),
+    snapshot: () => ({
+      status: "synced",
+      version: "v1",
+      tree: { root: { id: "context-map", text: "Context Map", children: [] } },
+      nodeCount: 0,
+      bindingId: "binding-1",
+    }),
+  };
+  const server = createContextMapServer({
+    store,
+    rootProvider: async () => [],
+    widgetHtml: "<main>viewer</main>",
+  });
+
+  const result = await server._registeredTools.open_context_map.handler({
+    workspaceRoot: "/workspace/project",
+  });
+
+  assert.deepEqual(calls, [["bind", "file:///workspace/project"]]);
+  assert.equal(result.structuredContent.bindingId, "binding-1");
+});
+
+test("refresh accepts only the currently bound opaque id", async () => {
+  const calls = [];
+  const store = {
+    bind: async () => {},
+    refresh: async () => calls.push(["refresh"]),
+    snapshot: () => ({
+      status: "synced",
+      version: "v1",
+      tree: { root: { id: "context-map", text: "Context Map", children: [] } },
+      nodeCount: 0,
+      bindingId: "binding-1",
+    }),
+  };
+  const server = createContextMapServer({
+    store,
+    rootProvider: async () => [],
+    widgetHtml: "<main>viewer</main>",
+  });
+
+  const current = await server._registeredTools.get_context_map.handler({
+    bindingId: "binding-1",
+  });
+  const stale = await server._registeredTools.get_context_map.handler({
+    bindingId: "binding-old",
+  });
+
+  assert.deepEqual(calls, [["refresh"]]);
+  assert.equal(current.structuredContent.status, "synced");
+  assert.equal(stale.isError, true);
 });
 
 test("tools bind the single MCP root and return structured snapshots", async () => {
