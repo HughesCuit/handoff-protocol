@@ -1,6 +1,7 @@
 import {
   buildVisibleTree,
   collapseAll,
+  focusNodeTransform,
   layoutTree,
   reconcileFoldState,
   requestPictureInPicture,
@@ -72,7 +73,7 @@ function fullNodeMap(root) {
   return map;
 }
 
-function renderTree() {
+function renderTree(focusFirstMatch = false) {
   if (!lastTree?.root) return;
   const visible = buildVisibleTree(lastTree.root, folded, query);
   const layout = layoutTree(visible.root);
@@ -160,6 +161,14 @@ function renderTree() {
     "viewBox",
     `0 0 ${Math.max(stage.clientWidth, 320)} ${Math.max(stage.clientHeight, 240)}`,
   );
+  if (focusFirstMatch && visible.matches.size > 0) {
+    transform = focusNodeTransform(
+      layout,
+      visible.matches.values().next().value,
+      { width: stage.clientWidth, height: stage.clientHeight },
+      transform,
+    );
+  }
   setTransform();
 }
 
@@ -283,7 +292,7 @@ window.addEventListener("message", (event) => {
 
 searchInput.addEventListener("input", () => {
   query = searchInput.value;
-  renderTree();
+  renderTree(Boolean(query.trim()));
 });
 document.getElementById("zoom-in").addEventListener("click", () => zoomAt(1.2));
 document.getElementById("zoom-out").addEventListener("click", () => zoomAt(1 / 1.2));

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, realpath, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -56,6 +56,35 @@ test("reports missing and oversized sources without returning source content", a
   const file = join(root, ".handoff", "context-map.md");
   await writeFile(file, Buffer.alloc(MAX_SOURCE_BYTES + 1, "x"));
   const source = await resolveContextMap(pathToFileURL(root).href);
+  await assert.rejects(
+    readContextMapSource(source),
+    (error) => error instanceof ContextSourceError && error.code === "TOO_LARGE",
+  );
+});
+
+test("rejects a source replaced by an escaping symlink after resolution", async () => {
+  const root = await workspace();
+  const file = join(root, ".handoff", "context-map.md");
+  await writeFile(file, "safe");
+  const source = await resolveContextMap(pathToFileURL(root).href);
+  const outside = join(await mkdtemp(join(tmpdir(), "viewer-race-")), "secret.md");
+  await writeFile(outside, "secret");
+  await rm(file);
+  await symlink(outside, file);
+
+  await assert.rejects(
+    readContextMapSource(source),
+    (error) => error instanceof ContextSourceError && error.code === "ACCESS_DENIED",
+  );
+});
+
+test("checks the size of the same opened object that is read", async () => {
+  const root = await workspace();
+  const file = join(root, ".handoff", "context-map.md");
+  await writeFile(file, "safe");
+  const source = await resolveContextMap(pathToFileURL(root).href);
+  await writeFile(file, Buffer.alloc(MAX_SOURCE_BYTES + 1, "x"));
+
   await assert.rejects(
     readContextMapSource(source),
     (error) => error instanceof ContextSourceError && error.code === "TOO_LARGE",

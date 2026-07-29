@@ -1,4 +1,5 @@
-import { realpath, readFile, stat } from "node:fs/promises";
+import { constants } from "node:fs";
+import { open, realpath } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -56,21 +57,32 @@ export async function resolveContextMap(rootUri, fsApi = { realpath }) {
 
 export async function readContextMapSource(
   source,
-  fsApi = { readFile, stat },
+  fsApi = { open },
 ) {
-  let info;
+  let handle;
   try {
-    info = await fsApi.stat(source.filePath);
+    handle = await fsApi.open(
+      source.filePath,
+      constants.O_RDONLY | constants.O_NOFOLLOW,
+    );
   } catch (error) {
     if (error?.code === "ENOENT") throw new ContextSourceError("MISSING");
     throw new ContextSourceError("ACCESS_DENIED");
   }
-  if (!info.isFile()) throw new ContextSourceError("ACCESS_DENIED");
-  if (info.size > MAX_SOURCE_BYTES) throw new ContextSourceError("TOO_LARGE");
 
   try {
-    return await fsApi.readFile(source.filePath, "utf8");
-  } catch {
+    const info = await handle.stat();
+    if (!info.isFile()) throw new ContextSourceError("ACCESS_DENIED");
+    if (info.size > MAX_SOURCE_BYTES) throw new ContextSourceError("TOO_LARGE");
+    const bytes = await handle.readFile();
+    if (bytes.byteLength > MAX_SOURCE_BYTES) {
+      throw new ContextSourceError("TOO_LARGE");
+    }
+    return bytes.toString("utf8");
+  } catch (error) {
+    if (error instanceof ContextSourceError) throw error;
     throw new ContextSourceError("ACCESS_DENIED");
+  } finally {
+    await handle.close().catch(() => {});
   }
 }

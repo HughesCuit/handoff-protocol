@@ -84,3 +84,49 @@ test("rebinding disposes the old watcher and unchanged content keeps its version
   await new Promise((resolve) => setTimeout(resolve, 120));
   assert.equal(store.snapshot().tree.root.children[0].children[0].text, "Second");
 });
+
+test("switching workspaces clears the previous tree before a missing source is reported", async (t) => {
+  const first = await fixture();
+  const second = await fixture();
+  await writeFile(first.file, FIRST);
+  const store = new ContextMapStore({ debounceMs: 30 });
+  t.after(() => store.close());
+
+  await store.bind(first.uri);
+  assert.equal(store.snapshot().tree.root.children[0].children[0].text, "First");
+
+  await store.bind(second.uri);
+  assert.equal(store.snapshot().status, "missing");
+  assert.equal(store.snapshot().tree, null);
+  assert.equal(store.snapshot().version, null);
+  assert.equal(store.snapshot().nodeCount, 0);
+});
+
+test("polling fallback preserves content status and does not rebind the same root", async (t) => {
+  const item = await fixture();
+  let resolveCount = 0;
+  let watchCount = 0;
+  const store = new ContextMapStore({
+    pollIntervalMs: 10_000,
+    resolveSource: async (...args) => {
+      resolveCount += 1;
+      const { resolveContextMap } = await import("../server/context-source.mjs");
+      return resolveContextMap(...args);
+    },
+    watch: () => {
+      watchCount += 1;
+      throw new Error("watch unavailable");
+    },
+  });
+  t.after(() => store.close());
+
+  await store.bind(item.uri);
+  assert.equal(store.snapshot().status, "missing");
+  assert.equal(store.snapshot().watchMode, "polling");
+  assert.equal(store.snapshot().watchDiagnostic, "WATCHER_UNAVAILABLE");
+
+  await store.bind(item.uri);
+  assert.equal(watchCount, 1);
+  assert.equal(resolveCount, 3);
+  assert.equal(store.snapshot().status, "missing");
+});

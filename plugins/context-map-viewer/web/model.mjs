@@ -99,6 +99,17 @@ export function layoutTree(root, options = {}) {
   return { nodes, links, width, height };
 }
 
+export function focusNodeTransform(layout, nodeId, stage, current) {
+  const node = layout.nodes.find((item) => item.id === nodeId);
+  if (!node) return current;
+  const scale = current.scale;
+  return {
+    x: stage.width / 2 - (node.x + node.width / 2) * scale,
+    y: stage.height / 2 - (node.y + node.height / 2) * scale,
+    scale,
+  };
+}
+
 export async function requestPictureInPicture(host) {
   if (typeof host?.requestDisplayMode !== "function") return false;
   try {

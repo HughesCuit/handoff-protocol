@@ -21,6 +21,18 @@ const STATUS_BY_CODE = {
   ACCESS_DENIED: "access_denied",
 };
 
+function emptyState() {
+  return {
+    status: "missing",
+    version: null,
+    tree: null,
+    nodeCount: 0,
+    diagnostic: null,
+    watchMode: "none",
+    watchDiagnostic: null,
+  };
+}
+
 function digest(content) {
   return createHash("sha256").update(content).digest("hex");
 }
@@ -38,13 +50,7 @@ export class ContextMapStore {
     this.watcher = null;
     this.timer = null;
     this.pollTimer = null;
-    this.state = {
-      status: "missing",
-      version: null,
-      tree: null,
-      nodeCount: 0,
-      diagnostic: null,
-    };
+    this.state = emptyState();
   }
 
   snapshot() {
@@ -52,11 +58,12 @@ export class ContextMapStore {
   }
 
   async bind(rootUri) {
-    if (this.rootUri === rootUri && this.watcher) {
+    if (this.rootUri === rootUri && (this.watcher || this.pollTimer)) {
       await this.refresh();
       return;
     }
     await this.close();
+    this.state = emptyState();
     this.rootUri = rootUri;
     this.source = await this.resolveSource(rootUri);
     await this.refresh();
@@ -66,13 +73,18 @@ export class ContextMapStore {
   startWatcher() {
     try {
       this.watcher = this.watch(this.source.handoffDir, () => this.scheduleRefresh());
+      this.state = {
+        ...this.state,
+        watchMode: "watch",
+        watchDiagnostic: null,
+      };
       this.watcher.on?.("error", () => {
         this.watcher?.close();
         this.watcher = null;
         this.state = {
           ...this.state,
-          status: "watcher_unavailable",
-          diagnostic: "WATCHER_UNAVAILABLE",
+          watchMode: "polling",
+          watchDiagnostic: "WATCHER_UNAVAILABLE",
         };
         this.startPolling();
       });
@@ -80,8 +92,8 @@ export class ContextMapStore {
       this.watcher = null;
       this.state = {
         ...this.state,
-        status: "watcher_unavailable",
-        diagnostic: "WATCHER_UNAVAILABLE",
+        watchMode: "polling",
+        watchDiagnostic: "WATCHER_UNAVAILABLE",
       };
       this.startPolling();
     }
@@ -115,6 +127,7 @@ export class ContextMapStore {
       }
       const tree = this.parse(content);
       this.state = {
+        ...this.state,
         status: "synced",
         version,
         tree,

@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   buildVisibleTree,
   collapseAll,
+  focusNodeTransform,
   layoutTree,
   matchSearch,
   reconcileFoldState,
@@ -80,6 +81,21 @@ test("horizontal layout is deterministic and preserves child order", () => {
     first.nodes.find((node) => node.id === "build").x);
   assert(first.nodes.find((node) => node.id === "docs").y >
     first.nodes.find((node) => node.id === "build").y);
+});
+
+test("search focus centers the first matching node without changing zoom", () => {
+  const layout = layoutTree(TREE);
+  const next = focusNodeTransform(
+    layout,
+    "svg",
+    { width: 800, height: 600 },
+    { x: 10, y: 20, scale: 1.25 },
+  );
+  const node = layout.nodes.find((item) => item.id === "svg");
+
+  assert.equal(next.scale, 1.25);
+  assert.equal(next.x + (node.x + node.width / 2) * next.scale, 400);
+  assert.equal(next.y + (node.y + node.height / 2) * next.scale, 300);
 });
 
 test("picture-in-picture request tolerates missing, synchronous, and rejected hosts", async () => {
