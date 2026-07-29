@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 
 import {
   RESOURCE_URI,
   createContextMapServer,
+  selectActiveRoot,
 } from "../server/server.mjs";
 
 const pluginRoot = new URL("../", import.meta.url);
@@ -108,6 +112,41 @@ test("zero or ambiguous MCP roots return actionable read-only errors", async () 
     assert.equal(result.structuredContent.bindingId, "no-workspace");
     assert.match(result.content[0].text, /workspace root/i);
   }
+});
+
+test("multiple roots select the unique workspace containing a Context Map", async () => {
+  const project = await mkdtemp(join(tmpdir(), "viewer-project-"));
+  const visualization = await mkdtemp(join(tmpdir(), "viewer-visualization-"));
+  await mkdir(join(project, ".handoff"));
+  await writeFile(
+    join(project, ".handoff", "context-map.md"),
+    "# Context Map\n\n## Tasks\n\n- [ ] Render map\n",
+  );
+  const projectRoot = { uri: pathToFileURL(project).href, name: "project" };
+  const visualizationRoot = {
+    uri: pathToFileURL(visualization).href,
+    name: "visualization",
+  };
+
+  assert.deepEqual(
+    await selectActiveRoot([projectRoot, visualizationRoot]),
+    projectRoot,
+  );
+});
+
+test("multiple roots stay ambiguous when more than one contains a Context Map", async () => {
+  const roots = [];
+  for (const name of ["first", "second"]) {
+    const root = await mkdtemp(join(tmpdir(), `viewer-${name}-`));
+    await mkdir(join(root, ".handoff"));
+    await writeFile(
+      join(root, ".handoff", "context-map.md"),
+      "# Context Map\n\n## Tasks\n\n- [ ] Item\n",
+    );
+    roots.push({ uri: pathToFileURL(root).href, name });
+  }
+
+  assert.equal(await selectActiveRoot(roots), null);
 });
 
 test("registers an MCP Apps HTML resource", async () => {
