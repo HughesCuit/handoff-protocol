@@ -35,6 +35,9 @@ yarn-error.log*
 # remain trackable.
 /.handoff/
 
+# Local Superpowers brainstorming companion artifacts
+/.superpowers/
+
 # Local tooling (Deno for tests)
 .tools/
 
