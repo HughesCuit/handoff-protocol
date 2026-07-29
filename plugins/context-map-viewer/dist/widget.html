@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Context Map Viewer</title>
+    <style>:root {
+  color-scheme: light dark;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+}
+
+#app {
+  min-height: 240px;
+  padding: 12px;
+}
+</style>
+  </head>
+  <body>
+    <main id="app" aria-live="polite">Loading Context Map…</main>
+    <script>(()=>{var a=document.getElementById("app"),r=new Map,i=1;function d(n,e){let t=i++;return window.parent.postMessage({jsonrpc:"2.0",id:t,method:n,params:e},"*"),new Promise((s,o)=>r.set(t,{resolve:s,reject:o}))}window.addEventListener("message",n=>{if(n.source!==window.parent)return;let e=n.data;if(!(!e||e.jsonrpc!=="2.0")){if(e.id!==void 0&&r.has(e.id)){let t=r.get(e.id);r.delete(e.id),e.error?t.reject(e.error):t.resolve(e.result);return}e.method==="ui/notifications/tool-result"&&(a.textContent=e.params?.structuredContent?.message??"Context Map ready")}});function u(){return d("tools/call",{name:"get_context_map",arguments:{}})}})();
+</script>
+  </body>
+</html>

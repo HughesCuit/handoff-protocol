@@ -8,6 +8,10 @@ dist/
 build/
 *.tsbuildinfo
 
+# Context Map Viewer is distributed as a prebuilt local Codex plugin.
+!/plugins/context-map-viewer/dist/
+!/plugins/context-map-viewer/dist/**
+
 # IDE
 .vscode/
 .idea/
