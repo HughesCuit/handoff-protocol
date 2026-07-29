@@ -38,6 +38,7 @@ function rootError() {
       tree: null,
       nodeCount: 0,
       diagnostic: "WORKSPACE_ROOT_REQUIRED",
+      bindingId: "no-workspace",
       source: CONTEXT_MAP_RELATIVE_PATH,
     },
     content: [{

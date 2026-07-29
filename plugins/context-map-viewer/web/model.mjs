@@ -111,7 +111,7 @@ export function focusNodeTransform(layout, nodeId, stage, current) {
 }
 
 export function bindingChanged(previous, next) {
-  return Boolean(previous && next && previous !== next);
+  return previous !== null && previous !== next;
 }
 
 export async function requestPictureInPicture(host) {

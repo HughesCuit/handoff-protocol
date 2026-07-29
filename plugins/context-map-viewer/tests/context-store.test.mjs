@@ -130,3 +130,18 @@ test("polling fallback preserves content status and does not rebind the same roo
   assert.equal(resolveCount, 3);
   assert.equal(store.snapshot().status, "missing");
 });
+
+test("an inaccessible replacement root returns a cleared bound snapshot", async (t) => {
+  const item = await fixture();
+  await writeFile(item.file, FIRST);
+  const store = new ContextMapStore();
+  t.after(() => store.close());
+  await store.bind(item.uri);
+
+  await store.bind("file:///definitely-not-a-context-map-workspace");
+
+  assert.equal(store.snapshot().status, "access_denied");
+  assert.equal(store.snapshot().tree, null);
+  assert.equal(store.snapshot().diagnostic, "ACCESS_DENIED");
+  assert.notEqual(store.snapshot().bindingId, null);
+});

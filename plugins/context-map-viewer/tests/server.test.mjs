@@ -105,6 +105,7 @@ test("zero or ambiguous MCP roots return actionable read-only errors", async () 
     const result = await server._registeredTools.open_context_map.handler({});
     assert.equal(result.isError, true);
     assert.equal(result.structuredContent.status, "access_denied");
+    assert.equal(result.structuredContent.bindingId, "no-workspace");
     assert.match(result.content[0].text, /workspace root/i);
   }
 });

@@ -66,7 +66,16 @@ export class ContextMapStore {
     await this.close();
     this.state = { ...emptyState(), bindingId: digest(rootUri).slice(0, 16) };
     this.rootUri = rootUri;
-    this.source = await this.resolveSource(rootUri);
+    try {
+      this.source = await this.resolveSource(rootUri);
+    } catch {
+      this.state = {
+        ...this.state,
+        status: "access_denied",
+        diagnostic: "ACCESS_DENIED",
+      };
+      return;
+    }
     await this.refresh();
     this.startWatcher();
   }

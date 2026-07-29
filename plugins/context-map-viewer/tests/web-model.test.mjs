@@ -103,6 +103,8 @@ test("binding changes distinguish workspace switches from same-workspace refresh
   assert.equal(bindingChanged(null, "workspace-a"), false);
   assert.equal(bindingChanged("workspace-a", "workspace-a"), false);
   assert.equal(bindingChanged("workspace-a", "workspace-b"), true);
+  assert.equal(bindingChanged("workspace-a", null), true);
+  assert.equal(bindingChanged("workspace-a", "no-workspace"), true);
 });
 
 test("picture-in-picture request tolerates missing, synchronous, and rejected hosts", async () => {
