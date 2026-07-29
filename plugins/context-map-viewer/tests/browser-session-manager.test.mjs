@@ -124,3 +124,84 @@ test("closes every live store and clears its sessions", async () => {
   assert.equal(manager.size, 0);
   assert.equal(closed.length, 2);
 });
+
+test("clamps session and idle limits to the hard maximums", async () => {
+  let now = 0;
+  const closed = [];
+  const manager = new BrowserSessionManager({
+    now: () => now,
+    maxSessions: 99,
+    idleTtlMs: 99 * 60 * 1000,
+    createStore: () => fakeStore([], closed),
+  });
+  const { token } = await manager.create("/workspace/alpha");
+
+  assert.equal(manager.maxSessions, 8);
+  assert.equal(manager.idleTtlMs, 30 * 60 * 1000);
+  now = 30 * 60 * 1000;
+  assert.equal(await manager.touch(token), null);
+  assert.equal(closed.length, 1);
+});
+
+test("serializes concurrent creation at the hard session cap", async () => {
+  const closed = [];
+  const manager = deterministicManager({
+    maxSessions: 99,
+    createStore: () => fakeStore([], closed),
+  });
+
+  await Promise.all(
+    Array.from({ length: 9 }, (_, index) => manager.create(`/workspace/${index}`)),
+  );
+
+  assert.equal(manager.size, 8);
+  assert.equal(closed.length, 1);
+  await manager.close();
+});
+
+test("keeps a healthy session when a replacement store fails to bind", async () => {
+  const closed = [];
+  const healthy = fakeStore([], closed);
+  const failing = {
+    ...fakeStore([], closed),
+    async bind() {
+      throw new Error("bind failed");
+    },
+  };
+  let storeCount = 0;
+  const manager = new BrowserSessionManager({
+    maxSessions: 1,
+    createStore: () => (storeCount++ === 0 ? healthy : failing),
+  });
+  const first = await manager.create("/workspace/one");
+
+  await assert.rejects(() => manager.create("/workspace/two"), /bind failed/);
+  assert.ok(await manager.touch(first.token));
+  assert.equal(manager.size, 1);
+  assert.equal(closed.length, 1);
+  await manager.close();
+});
+
+test("rejects random-byte providers that return fewer than 16 bytes", async () => {
+  const manager = new BrowserSessionManager({
+    randomBytes: () => Buffer.alloc(15),
+    createStore: () => {
+      assert.fail("a store must not be created for an invalid token source");
+    },
+  });
+
+  await assert.rejects(() => manager.create("/workspace/alpha"), /at least 16 bytes/i);
+  assert.equal(manager.size, 0);
+});
+
+test("rejects repeated token collisions after a bounded number of attempts", async () => {
+  const manager = new BrowserSessionManager({
+    randomBytes: () => Buffer.alloc(24, 7),
+    createStore: () => fakeStore(),
+  });
+  await manager.create("/workspace/one");
+
+  await assert.rejects(() => manager.create("/workspace/two"), /unique session token/i);
+  assert.equal(manager.size, 1);
+  await manager.close();
+});

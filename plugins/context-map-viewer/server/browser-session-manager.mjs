@@ -5,14 +5,24 @@ import { pathToFileURL } from "node:url";
 import { CONTEXT_MAP_RELATIVE_PATH } from "./constants.mjs";
 import { ContextMapStore } from "./context-store.mjs";
 
+const MAX_IDLE_TTL_MS = 30 * 60 * 1000;
+const MAX_SESSIONS = 8;
+const MAX_TOKEN_ATTEMPTS = 32;
+
+function clamp(value, minimum, maximum) {
+  if (!Number.isFinite(value)) return maximum;
+  return Math.max(minimum, Math.min(value, maximum));
+}
+
 export class BrowserSessionManager {
   constructor(options = {}) {
     this.createStore = options.createStore ?? (() => new ContextMapStore());
     this.randomBytes = options.randomBytes ?? randomBytes;
     this.now = options.now ?? Date.now;
-    this.idleTtlMs = options.idleTtlMs ?? 30 * 60 * 1000;
-    this.maxSessions = options.maxSessions ?? 8;
+    this.idleTtlMs = clamp(options.idleTtlMs ?? MAX_IDLE_TTL_MS, 0, MAX_IDLE_TTL_MS);
+    this.maxSessions = clamp(options.maxSessions ?? MAX_SESSIONS, 1, MAX_SESSIONS);
     this.sessions = new Map();
+    this.createTail = Promise.resolve();
   }
 
   get size() {
@@ -23,15 +33,30 @@ export class BrowserSessionManager {
     if (!isAbsolute(workspaceRoot)) {
       throw new TypeError("An absolute workspace root is required.");
     }
-    await this.prune();
-    await this.evictForCapacity();
+    const creation = this.createTail.then(() => this.createSession(workspaceRoot));
+    this.createTail = creation.catch(() => {});
+    return creation;
+  }
+
+  async createSession(workspaceRoot) {
     let token;
-    do {
-      token = this.randomBytes(24).toString("base64url");
-    } while (this.sessions.has(token));
+    for (let attempt = 0; attempt < MAX_TOKEN_ATTEMPTS; attempt += 1) {
+      const bytes = this.randomBytes(24);
+      if (!(bytes instanceof Uint8Array) || bytes.byteLength < 16) {
+        throw new TypeError("The random byte provider must return at least 16 bytes.");
+      }
+      token = Buffer.from(bytes).toString("base64url");
+      if (!this.sessions.has(token)) break;
+      token = undefined;
+    }
+    if (!token) {
+      throw new Error("Unable to generate a unique session token.");
+    }
     const store = this.createStore();
     try {
       await store.bind(pathToFileURL(resolve(workspaceRoot)).href);
+      await this.prune();
+      await this.evictForCapacity();
     } catch (error) {
       await store.close();
       throw error;
