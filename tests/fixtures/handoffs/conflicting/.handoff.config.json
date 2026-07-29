@@ -1,0 +1,7 @@
+{
+  "version": "1.5.0",
+  "storage": {
+    "mode": "direct",
+    "path": ".handoff"
+  }
+}

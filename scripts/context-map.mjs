@@ -28,7 +28,7 @@
  * reconciliation never silently discards user content.
  */
 
-export const PROTOCOL_VERSION = "1.5.0";
+export const PROTOCOL_VERSION = "2.0.0";
 export const CONTEXT_MAP_FILE = "context-map.md";
 /** Alias kept for callers that use the shorter name. */
 export const MAP_FILENAME = CONTEXT_MAP_FILE;

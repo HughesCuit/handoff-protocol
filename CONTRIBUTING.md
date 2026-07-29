@@ -55,6 +55,21 @@ deno test --allow-read --allow-write --allow-run --allow-env tests/deno/
 node --test "tests/node/**/*.test.mjs"
 ```
 
+### Evaluation Runner
+
+`scripts/evaluate.mjs` measures save quality against a synthetic project built
+in a temporary directory (source fixtures are never modified). It reports the
+duplicate rate and map growth across repeated saves, user-edit retention, and
+Node/Deno runtime parity:
+
+```bash
+node scripts/evaluate.mjs                          # parity leg skipped if deno is not in PATH
+node scripts/evaluate.mjs --deno /path/to/deno     # explicit deno binary
+```
+
+The runner exits non-zero when duplicates appear, user edits are lost, or the
+runtimes diverge.
+
 ## Code of Conduct
 
 Please be respectful and inclusive in all interactions.

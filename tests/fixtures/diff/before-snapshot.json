@@ -1,0 +1,83 @@
+{
+  "version": "2.0.0",
+  "captured_at": "2026-07-28T00:00:00.000Z",
+  "digest": "c17b1135",
+  "state": {
+    "sections": {
+      "goal": [
+        {
+          "text": "Ship semantic context diff",
+          "depth": 0,
+          "origin": "user"
+        }
+      ],
+      "status": [
+        {
+          "text": "Diff core sketched",
+          "depth": 0,
+          "origin": "user"
+        }
+      ],
+      "tasks": [
+        {
+          "text": "Design snapshot layout",
+          "depth": 0,
+          "origin": "agent",
+          "checked": true
+        },
+        {
+          "text": "Implement diff command",
+          "depth": 0,
+          "origin": "agent",
+          "checked": false
+        },
+        {
+          "text": "Update user docs",
+          "depth": 0,
+          "origin": "user",
+          "checked": true
+        }
+      ],
+      "decisions": [
+        {
+          "text": "Compare normalized snapshots, not rendered markdown",
+          "depth": 0,
+          "origin": "agent"
+        },
+        {
+          "text": "Compare rendered markdown line by line",
+          "depth": 0,
+          "origin": "user"
+        }
+      ],
+      "questions": [],
+      "risks": [
+        {
+          "text": "Moved nodes could be misread as remove+add",
+          "depth": 0,
+          "origin": "user"
+        }
+      ],
+      "knowledge": [
+        {
+          "text": "Snapshot ids embed a short content digest",
+          "depth": 0,
+          "origin": "user"
+        },
+        {
+          "text": "Old note to drop",
+          "depth": 0,
+          "origin": "user"
+        }
+      ],
+      "excluded": [
+        {
+          "text": "node_modules/",
+          "depth": 0,
+          "origin": "user"
+        }
+      ]
+    },
+    "extras": []
+  }
+}

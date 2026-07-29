@@ -25,7 +25,7 @@
  */
 
 import { execSync } from "node:child_process";
-import { mkdirSync, writeFileSync, readFileSync, readdirSync, statSync, existsSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, statSync, existsSync, renameSync, rmSync } from "node:fs";
 import { join, extname, relative } from "node:path";
 import { createInterface } from "node:readline";
 import {
@@ -38,6 +38,20 @@ import {
   reconcileContextMap,
   renderContextMap,
 } from "./context-map.mjs";
+import {
+  buildContextJson,
+  generateViews,
+  sha256Hex,
+  viewTamperWarnings,
+} from "../views.mjs";
+import {
+  extractTodoComments,
+  SCAN_EXCLUDED_DIRS,
+  SOURCE_EXTENSIONS,
+} from "../source-comments.mjs";
+import { CONFIG_FILENAME, validateProjectConfig } from "../config.mjs";
+import { applyMigration, planMigration } from "../migrate.mjs";
+import { writeSnapshot } from "../snapshots.mjs";
 
 // ── Security ─────────────────────────────────────────────────────────────────
 // SENSITIVE_PATTERNS and filterSensitive live in ./context-map.mjs (shared with
@@ -69,6 +83,19 @@ function readStorageConfig(cwd) {
 
 function writeStorageConfig(cwd, config) {
   writeFileSync(join(cwd, ".handoff.config.json"), JSON.stringify(config, null, 2) + "\n");
+}
+
+// Every operation that reads or writes .handoff.config.json goes through the
+// shared validator: the file is portable project configuration, so absolute
+// paths, home paths, Vault paths, and credential-like values are rejected
+// (storage.remote submodule URLs excepted).
+function validateConfigOrExit(config) {
+  const result = validateProjectConfig(config);
+  if (result.valid) return result.config;
+  console.error("Error: invalid .handoff.config.json:");
+  for (const err of result.errors) console.error(`  - ${err}`);
+  console.error("Fix the file, or remove it and run `/handoff init` to reconfigure storage.");
+  process.exit(1);
 }
 
 function isSubmoduleInitialized(cwd) {
@@ -173,6 +200,7 @@ async function initStorage(cwd, mode) {
       version: PROTOCOL_VERSION,
       storage: { mode: "direct", path: ".handoff" },
     };
+    validateConfigOrExit(config);
     writeStorageConfig(cwd, config);
 
     if (hasRemote(cwd)) {
@@ -229,6 +257,7 @@ async function initStorage(cwd, mode) {
       version: PROTOCOL_VERSION,
       storage: { mode: "submodule", path: ".handoff", remote: remoteUrl },
     };
+    validateConfigOrExit(config);
     writeStorageConfig(cwd, config);
 
     console.log(`Initialized submodule storage mode.`);
@@ -241,18 +270,8 @@ async function initStorage(cwd, mode) {
 
 // ── Auto-Analysis ────────────────────────────────────────────────────────────
 
-const SOURCE_EXTENSIONS = new Set([
-  ".ts", ".tsx", ".js", ".jsx", ".py", ".rs", ".go", ".java",
-  ".c", ".cpp", ".h", ".hpp", ".rb", ".php", ".swift", ".kt",
-]);
-
-const SKIP_DIRS = new Set([
-  "node_modules", ".git", ".handoff", "dist", "build", "vendor", "__pycache__",
-]);
-
 function scanTodos(dir, maxFiles = 200) {
   const todos = [];
-  const todoPattern = /\b(TODO|FIXME|HACK|XXX)\b[:\s]+(.+)/gi;
   let fileCount = 0;
 
   function walkDir(currentDir) {
@@ -263,20 +282,15 @@ function scanTodos(dir, maxFiles = 200) {
     for (const entry of entries) {
       if (fileCount > maxFiles) break;
       const fullPath = join(currentDir, entry.name);
-      if (entry.isDirectory()) { if (!SKIP_DIRS.has(entry.name)) walkDir(fullPath); continue; }
-      if (!entry.isFile() || !SOURCE_EXTENSIONS.has(extname(entry.name))) continue;
+      if (entry.isDirectory()) { if (!SCAN_EXCLUDED_DIRS.has(entry.name)) walkDir(fullPath); continue; }
+      const ext = extname(entry.name);
+      if (!entry.isFile() || !SOURCE_EXTENSIONS.has(ext)) continue;
 
       try {
         const content = readFileSync(fullPath, "utf-8");
-        const lines = content.split("\n");
-        for (let i = 0; i < lines.length; i++) {
-          let match;
-          todoPattern.lastIndex = 0;
-          while ((match = todoPattern.exec(lines[i])) !== null) {
-            const tag = match[1].toUpperCase();
-            const priority = (tag === "FIXME" || tag === "HACK") ? "high" : "medium";
-            todos.push({ task: `${match[2].trim()} (${relative(dir, fullPath)}:${i + 1})`, priority, status: "pending" });
-          }
+        for (const hit of extractTodoComments(content, ext)) {
+          const priority = (hit.tag === "FIXME" || hit.tag === "HACK") ? "high" : "medium";
+          todos.push({ task: `${hit.text} (${relative(dir, fullPath)}:${hit.line})`, priority, status: "pending" });
         }
       } catch {}
     }
@@ -305,6 +319,70 @@ function readProjectInfo() {
   return { name: "unknown", language: "unknown" };
 }
 
+// ── Legacy migration ─────────────────────────────────────────────────────────
+
+// Filesystem adapter for the shared, runtime-agnostic migration core.
+const migrationIo = {
+  readFile: async (p) => readFileSync(p, "utf-8"),
+  writeFile: async (p, content) => writeFileSync(p, content),
+  rename: async (from, to) => renameSync(from, to),
+  mkdir: async (p) => mkdirSync(p, { recursive: true }),
+  exists: async (p) => existsSync(p),
+  remove: async (p) => rmSync(p, { force: true }),
+};
+
+// Filesystem adapter for the shared, runtime-agnostic snapshot core.
+const snapshotIo = {
+  readFile: async (p) => readFileSync(p, "utf-8"),
+  writeFile: async (p, content) => writeFileSync(p, content),
+  mkdir: async (p) => mkdirSync(p, { recursive: true }),
+  listDir: async (p) => {
+    try {
+      return readdirSync(p);
+    } catch {
+      return [];
+    }
+  },
+  remove: async (p) => rmSync(p, { force: true }),
+};
+
+/**
+ * Migrate a legacy (pre-v2) handoff into the canonical model before the save
+ * proceeds. The migration is atomic: originals are backed up under
+ * .handoff/history/migrations/<UTC-timestamp>/ and only replaced after every
+ * temporary output validates. Migrated nodes enter the map as user-owned
+ * content, so they always win over this save's fresh inference. Returns the
+ * migration diagnostics (recorded in context.json), or null when the handoff
+ * is already v2.
+ */
+async function migrateLegacyHandoff(cwd, handoffDir) {
+  const readIfExists = (p) => {
+    try {
+      return readFileSync(p, "utf-8");
+    } catch {
+      return undefined;
+    }
+  };
+  const plan = planMigration({
+    config: readIfExists(join(cwd, CONFIG_FILENAME)),
+    contextJson: readIfExists(join(handoffDir, "context.json")),
+    handoffMd: readIfExists(join(handoffDir, "HANDOFF.md")),
+    tasksMd: readIfExists(join(handoffDir, "tasks.md")),
+    decisionsMd: readIfExists(join(handoffDir, "decisions.md")),
+    contextMapMd: readIfExists(join(handoffDir, MAP_FILENAME)),
+  });
+  if (!plan.needed) return null;
+
+  const result = await applyMigration(plan, { handoffDir, configPath: join(cwd, CONFIG_FILENAME) }, migrationIo);
+  console.log(`Legacy handoff detected — migrated to Handoff Protocol v${PROTOCOL_VERSION}.`);
+  console.log(`Backup: ${result.backupDir}`);
+  for (const entry of plan.diagnostics.migration) console.log(`  - ${entry}`);
+  if (plan.diagnostics.conflicts.length > 0) {
+    console.log(`  - ${plan.diagnostics.conflicts.length} conflict(s) preserved under Open Questions > Migration conflict`);
+  }
+  return plan.diagnostics;
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 async function save(mode, lang, verbosity) {
@@ -315,6 +393,8 @@ async function save(mode, lang, verbosity) {
   if (!storageConfig) {
     storageConfig = await initStorage(cwd);
     if (!storageConfig) { console.error("Error: Storage initialization failed."); process.exit(1); }
+  } else {
+    validateConfigOrExit(storageConfig);
   }
 
   const storageMode = storageConfig.storage.mode;
@@ -324,6 +404,10 @@ async function save(mode, lang, verbosity) {
   } else {
     mkdirSync(handoffDir, { recursive: true });
   }
+
+  // Legacy (pre-v2) handoffs migrate atomically into the canonical model
+  // before inference reconciles into the map below.
+  const migrationDiagnostics = await migrateLegacyHandoff(cwd, handoffDir);
 
   const { name, language } = readProjectInfo();
   const gitBranch = runCommand("git branch --show-current") || "unknown";
@@ -357,15 +441,12 @@ async function save(mode, lang, verbosity) {
     lang: lang || language, verbosity,
   };
 
-  const handoffMd = `# Project Handoff\n\n**Saved**: ${ctx.timestamp}\n**Agent**: ${ctx.agent}\n**Project**: ${ctx.project}\n**Branch**: ${ctx.git.branch}\n**Commit**: ${ctx.git.latest_commit} - ${ctx.git.commit_message}\n\n## Current Goal\n\n${ctx.current_goal || "No explicit goal set."}\n\n## Current Status\n\n${ctx.status}\n\n## Completed Work\n\n${completed.map((i) => `- ${i}`).join("\n") || "None"}\n\n## Modified Files\n\n${modifiedFiles.map((f) => `- \`${f.path}\` [${f.change_type}]`).join("\n") || "None"}\n\n## TODO\n\n${todos.map((t) => `- [ ] **${t.priority}** ${t.task}`).join("\n") || "None"}\n\n---\n\n*Generated by Handoff Protocol v${ctx.version}*\n`;
-  const tasksMd = `# Pending Tasks\n\n## High Priority\n${todos.filter((t) => t.priority === "high").map((t) => `- [ ] ${t.task}`).join("\n") || "None"}\n\n## Medium Priority\n${todos.filter((t) => t.priority === "medium").map((t) => `- [ ] ${t.task}`).join("\n") || "None"}\n\n## Low Priority\n${todos.filter((t) => t.priority === "low").map((t) => `- [ ] ${t.task}`).join("\n") || "None"}\n`;
-  const decisionsMd = "# Architecture Decisions\n\nNo decisions recorded.\n";
-
-  // Context Map: generated or reconciled on every save, at every mode and
-  // verbosity level. User-edited nodes always win over agent inference;
-  // agent-managed nodes are refreshed only by non-empty inference, so a
-  // low-verbosity save never degrades the map. The sensitive-data filter is
-  // applied before any map content is written.
+  // Context Map: the only writable semantic source. Inference reconciles
+  // into context-map.md on every save, at every mode and verbosity level;
+  // user-edited nodes always win over agent inference, and agent-managed
+  // nodes are refreshed only by non-empty inference, so a low-verbosity save
+  // never degrades the map. The sensitive-data filter is applied before any
+  // content is written.
   const inferred = buildInferredSections(ctx);
   const mapPath = join(handoffDir, MAP_FILENAME);
   let existingMap = null;
@@ -374,14 +455,78 @@ async function save(mode, lang, verbosity) {
   } catch {
     // Absent or unreadable: start from a fresh map.
   }
-  const contextMap = renderContextMap(reconcileContextMap(existingMap, inferred), { lang: lang || undefined });
+  const reconciled = reconcileContextMap(existingMap, inferred);
+  const mapContent = filterSensitive(renderContextMap(reconciled, { lang: lang || undefined }));
 
-  writeFileSync(join(handoffDir, "HANDOFF.md"), filterSensitive(handoffMd));
-  writeFileSync(join(handoffDir, "context.json"), filterSensitive(JSON.stringify(ctx, null, 2)));
-  writeFileSync(mapPath, filterSensitive(contextMap));
-  if (verbosity !== "low") {
-    writeFileSync(join(handoffDir, "tasks.md"), filterSensitive(tasksMd));
-    writeFileSync(join(handoffDir, "decisions.md"), filterSensitive(decisionsMd));
+  // HANDOFF.md / tasks.md / decisions.md are deterministic views generated
+  // from the reconciled map plus save-time machine metadata — never from
+  // inference directly.
+  const metadata = {
+    timestamp: ctx.timestamp,
+    agent: ctx.agent,
+    project: ctx.project,
+    lang: ctx.lang,
+    verbosity,
+    git: ctx.git,
+    completed,
+    modifiedFiles,
+    blockers: ctx.blockers,
+    nextSteps: ctx.next_steps,
+  };
+  const views = {};
+  for (const [name, content] of Object.entries(generateViews(reconciled, metadata, { verbosity }))) {
+    views[name] = filterSensitive(content);
+  }
+
+  // Manual edits to generated views are overwritten, never imported. Warn
+  // when the on-disk view no longer matches the hash stored by the last save.
+  let previousViews = null;
+  try {
+    previousViews = JSON.parse(readFileSync(join(handoffDir, "context.json"), "utf-8")).views;
+  } catch {
+    // No readable previous context.json: nothing to compare against.
+  }
+  const currentContents = {};
+  if (previousViews) {
+    for (const name of Object.keys(previousViews)) {
+      try {
+        currentContents[name] = readFileSync(join(handoffDir, name), "utf-8");
+      } catch {
+        // Missing views are regenerated silently.
+      }
+    }
+    for (const warning of viewTamperWarnings(previousViews, currentContents)) {
+      console.error(warning);
+    }
+  }
+
+  writeFileSync(mapPath, mapContent);
+  for (const [name, content] of Object.entries(views)) {
+    writeFileSync(join(handoffDir, name), content);
+  }
+  // context.json v2: metadata + Git state + hashes of the views just written.
+  const viewHashes = {};
+  for (const [name, content] of Object.entries(views)) {
+    viewHashes[name] = sha256Hex(content);
+  }
+  // Low-verbosity saves do not rewrite tasks.md/decisions.md; carry their
+  // stored hashes forward so tamper detection keeps covering them. Views
+  // deleted on disk are dropped instead of haunting future saves.
+  for (const [name, hash] of Object.entries(previousViews || {})) {
+    if (!(name in viewHashes) && currentContents[name] != null) {
+      viewHashes[name] = hash;
+    }
+  }
+  const contextJson = buildContextJson(metadata, viewHashes, migrationDiagnostics || undefined);
+  writeFileSync(join(handoffDir, "context.json"), filterSensitive(JSON.stringify(contextJson, null, 2)));
+
+  // Semantic snapshot (v2.3): record the reconciled map after a successful
+  // canonical save. Best-effort — a failed snapshot never fails the save.
+  try {
+    const snapshot = await writeSnapshot(reconciled, { handoffDir }, snapshotIo);
+    if (snapshot.written) console.log(`Snapshot: ${snapshot.path}`);
+  } catch (err) {
+    console.error(`Warning: snapshot failed: ${err.message}`);
   }
 
   if (storageMode === "submodule") {
@@ -425,6 +570,7 @@ if (arg === "init") {
   const config = readStorageConfig(process.cwd());
   if (!config) { console.log("Handoff storage is not configured.\nRun `/handoff init` to set up storage."); }
   else {
+    validateConfigOrExit(config);
     console.log("Handoff storage:");
     console.log(`  mode: ${config.storage.mode}`);
     console.log(`  path: ${config.storage.path}`);

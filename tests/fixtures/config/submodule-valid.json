@@ -1,0 +1,8 @@
+{
+  "version": "1.5.1",
+  "storage": {
+    "mode": "submodule",
+    "path": ".handoff",
+    "remote": "git@github.com:USER/PROJECT-handoff.git"
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "version": "1.5.0",
+  "timestamp": "2026-07-25T09:00:00.000Z",
+  "agent": "opencode",
+  "project": "conflicting-fixture",
+  "current_goal": "JSON draft goal superseded by the map",
+  "status": "json status superseded by the map",
+  "completed": [],
+  "modified_files": [],
+  "todos": [
+    { "task": "Wire the context compiler into load", "priority": "high", "status": "completed" },
+    { "task": "Legacy-only task from context.json", "priority": "medium", "status": "pending" }
+  ],
+  "blockers": [],
+  "decisions": [],
+  "next_steps": [],
+  "git": {
+    "branch": "feature/conflict",
+    "latest_commit": "aaa1111",
+    "commit_message": "wip",
+    "is_dirty": true
+  },
+  "risks": ["JSON-only risk"],
+  "notes": "JSON-only note",
+  "lang": "en",
+  "verbosity": "med"
+}
