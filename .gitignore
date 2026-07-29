@@ -8,6 +8,10 @@ dist/
 build/
 *.tsbuildinfo
 
+# Context Map Viewer is distributed as a prebuilt local Codex plugin.
+!/plugins/context-map-viewer/dist/
+!/plugins/context-map-viewer/dist/**
+
 # IDE
 .vscode/
 .idea/
@@ -34,6 +38,9 @@ yarn-error.log*
 # Anchored to the repo root so test fixtures under tests/fixtures/**/.handoff
 # remain trackable.
 /.handoff/
+
+# Local Superpowers brainstorming companion artifacts
+/.superpowers/
 
 # Local tooling (Deno for tests)
 .tools/

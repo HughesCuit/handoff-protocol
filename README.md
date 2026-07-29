@@ -130,6 +130,21 @@ A config that passes validation contains no machine-specific paths and no secret
 
 ## Installation
 
+### Context Map Viewer for Codex
+
+This repository also contains the optional
+[`context-map-viewer`](plugins/context-map-viewer/) Codex plugin. It opens the
+current project's `.handoff/context-map.md` as a live, read-only mind map with
+search, folding, pan, zoom, and picture-in-picture presentation when supported.
+
+```bash
+codex plugin marketplace add /absolute/path/to/handoff-protocol
+codex plugin add context-map-viewer@handoff-protocol
+```
+
+Restart the ChatGPT desktop app, start a new Codex task, and ask to open the
+Context Map viewer. The plugin never modifies Handoff state.
+
 ### Project-Level Install (Recommended)
 
 Clone the repo into your project, then run the install script. It creates symlinks so all supported agents share the same skill — no per-agent duplication.

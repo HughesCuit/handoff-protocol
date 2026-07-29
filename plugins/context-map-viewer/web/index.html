@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Context Map Viewer</title>
+    <style>/*__STYLES__*/</style>
+  </head>
+  <body>
+    <main id="app">
+      <header class="toolbar" aria-label="Context Map controls">
+        <label class="search">
+          <span aria-hidden="true">⌕</span>
+          <input id="search" type="search" placeholder="Search nodes" autocomplete="off">
+        </label>
+        <div class="toolbar-group">
+          <button id="zoom-out" type="button" aria-label="Zoom out">−</button>
+          <output id="zoom-value" aria-live="polite">100%</output>
+          <button id="zoom-in" type="button" aria-label="Zoom in">+</button>
+          <button id="fit" type="button">Fit</button>
+          <button id="expand" type="button">Expand</button>
+          <button id="collapse" type="button">Collapse</button>
+        </div>
+        <div id="sync-status" class="sync-status" role="status">Refreshing</div>
+      </header>
+      <section id="stage" class="stage" aria-label="Context Map canvas">
+        <svg id="canvas" role="img" aria-label="Handoff Context Map">
+          <g id="viewport">
+            <g id="links"></g>
+            <g id="nodes"></g>
+          </g>
+        </svg>
+        <div id="empty-state" class="empty-state" hidden></div>
+      </section>
+    </main>
+    <script>/*__APP__*/</script>
+  </body>
+</html>
