@@ -135,7 +135,9 @@ A config that passes validation contains no machine-specific paths and no secret
 This repository also contains the optional
 [`context-map-viewer`](plugins/context-map-viewer/) Codex plugin. It opens the
 current project's `.handoff/context-map.md` as a live, read-only mind map with
-search, folding, pan, zoom, and picture-in-picture presentation when supported.
+search, folding, pan, zoom, and side-browser presentation by default in Codex.
+The inline MCP App remains a compatibility fallback and requests
+picture-in-picture when the host supports it.
 
 ```bash
 codex plugin marketplace add /absolute/path/to/handoff-protocol
@@ -143,7 +145,14 @@ codex plugin add context-map-viewer@handoff-protocol
 ```
 
 Restart the ChatGPT desktop app, start a new Codex task, and ask to open the
-Context Map viewer. The plugin never modifies Handoff state.
+Context Map viewer. Codex creates a local temporary browser session and opens
+its returned URL in the side browser. The URL listens only on `127.0.0.1` at a
+random port, is scoped by an opaque token, and exists only in memory; do not
+copy, persist, reconstruct, or reuse it in another task. The viewer polls for
+updates every 750 ms and expires after 30 minutes of idle time. If it has
+expired, ask to open the viewer again for a new URL. If the side browser is not
+available, Codex uses the inline MCP App fallback. This presentation layer does
+not change the Handoff storage format or modify Handoff state.
 
 ### Project-Level Install (Recommended)
 

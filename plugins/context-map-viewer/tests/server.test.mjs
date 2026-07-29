@@ -30,6 +30,33 @@ test("plugin manifest launches the bundled MCP server", async () => {
   });
 });
 
+test("skill prefers the side browser and retains inline fallback", async () => {
+  const skill = await readFile(
+    new URL("../skills/context-map-viewer/SKILL.md", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(skill, /create_context_map_browser_session/);
+  assert.match(skill, /in-app browser/i);
+  assert.match(skill, /open_context_map/);
+  assert.match(skill, /fallback/i);
+  assert.match(skill, /absolute.*cwd/i);
+  assert.match(
+    skill,
+    /create_context_map_browser_session[\s\S]*?exact absolute `cwd`[\s\S]*?Open the returned `viewerUrl` with the Codex in-app browser tool/i,
+  );
+  assert.match(
+    skill,
+    /Do not[\s\S]*?transform, reconstruct, persist, or reuse `viewerUrl` in another task/i,
+  );
+  assert.match(
+    skill,
+    /If session creation or in-app browser navigation is unavailable[\s\S]*?fallback: call `open_context_map` with the same `workspaceRoot`/i,
+  );
+  assert.match(skill, /Do not repeatedly reopen either view/i);
+  assert.match(skill, /Treat the viewer as read-only/i);
+});
+
 test("build emits a self-contained MCP Apps widget", async () => {
   const [widgetHtml, standaloneHtml, standaloneApp] = await Promise.all([
     readFile(new URL("dist/widget.html", pluginRoot), "utf8"),
