@@ -7,17 +7,15 @@ import {
   reconcileFoldState,
   requestPictureInPicture,
 } from "./model.mjs";
-import { createPageTransport } from "./transports.mjs";
+import { createPageLifecycle, createPageTransport } from "./transports.mjs";
 
 let snapshot = null;
 let lastTree = null;
 let folded = new Set();
 let query = "";
 let transform = { x: 36, y: 36, scale: 1 };
-let pollTimer = null;
 let dragging = null;
 let bindingId = null;
-let sessionExpired = false;
 
 const stage = document.getElementById("stage");
 const canvas = document.getElementById("canvas");
@@ -232,9 +230,6 @@ function applySnapshot(next) {
 }
 
 function showTerminalEmptyState(message) {
-  sessionExpired = true;
-  clearInterval(pollTimer);
-  pollTimer = null;
   lastTree = null;
   canvas.hidden = true;
   emptyState.hidden = false;
@@ -242,27 +237,25 @@ function showTerminalEmptyState(message) {
   setStatus("expired");
 }
 
+let lifecycle;
 const transport = createPageTransport(document, {
   parentWindow: window.parent,
   windowObject: window,
   fetch: window.fetch.bind(window),
   location: window.location,
-  onSnapshot: applySnapshot,
+  onSnapshot: (next) => lifecycle?.applyIncomingSnapshot(next),
 });
-
-async function refresh() {
-  if (document.hidden || sessionExpired) return;
-  setStatus("refreshing");
-  try {
-    applySnapshot(await transport.refresh(snapshot?.bindingId));
-  } catch (error) {
-    if (error.message === "SESSION_EXPIRED") {
-      showTerminalEmptyState("This Viewer session expired. Reopen Context Map Viewer.");
-      return;
-    }
-    setStatus(snapshot?.status ?? "invalid");
-  }
-}
+lifecycle = createPageLifecycle({
+  initialSnapshot: () => transport.initialSnapshot(),
+  refresh: () => transport.refresh(snapshot?.bindingId),
+  applySnapshot,
+  setStatus,
+  terminal: () => showTerminalEmptyState("This Viewer session expired. Reopen Context Map Viewer."),
+  fallbackStatus: () => snapshot?.status ?? "invalid",
+  isHidden: () => document.hidden,
+  setInterval: window.setInterval.bind(window),
+  clearInterval: window.clearInterval.bind(window),
+});
 
 function zoomAt(factor, centerX = stage.clientWidth / 2, centerY = stage.clientHeight / 2) {
   const nextScale = Math.max(0.35, Math.min(2.5, transform.scale * factor));
@@ -336,36 +329,16 @@ canvas.addEventListener("pointerup", (event) => {
 });
 
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden) {
-    clearInterval(pollTimer);
-    pollTimer = null;
-  } else {
-    if (!sessionExpired) {
-      refresh();
-      pollTimer ??= setInterval(refresh, 750);
-    }
-  }
+  lifecycle.visibilityChanged(document.hidden);
 });
 
 window.addEventListener("resize", () => setTransform());
 window.addEventListener("pagehide", () => {
-  clearInterval(pollTimer);
-  pollTimer = null;
+  lifecycle.dispose();
   transport.dispose();
 }, { once: true });
 setTransform();
 if (document.querySelector('meta[name="context-map-viewer-transport"]')?.content === "mcp") {
   requestPictureInPicture(window.openai);
 }
-(async () => {
-  try {
-    applySnapshot(await transport.initialSnapshot());
-  } catch (error) {
-    if (error.message === "SESSION_EXPIRED") {
-      showTerminalEmptyState("This Viewer session expired. Reopen Context Map Viewer.");
-      return;
-    }
-    setStatus(snapshot?.status ?? "invalid");
-  }
-  if (!sessionExpired) pollTimer = setInterval(refresh, 750);
-})();
+lifecycle.start();

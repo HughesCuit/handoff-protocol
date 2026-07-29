@@ -80,6 +80,101 @@ export function createHttpTransport(options) {
   };
 }
 
+export function createPageLifecycle({
+  initialSnapshot,
+  refresh,
+  applySnapshot,
+  setStatus,
+  terminal,
+  fallbackStatus,
+  isHidden,
+  setInterval,
+  clearInterval,
+  intervalMs = 750,
+}) {
+  let disposed = false;
+  let expired = false;
+  let pollTimer = null;
+  let generation = 0;
+
+  function active(requestGeneration) {
+    return !disposed && !expired && generation === requestGeneration;
+  }
+
+  function stopPolling() {
+    if (pollTimer === null) return;
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+
+  function startPolling() {
+    if (disposed || expired || isHidden() || pollTimer !== null) return;
+    pollTimer = setInterval(() => {
+      refreshSnapshot();
+    }, intervalMs);
+  }
+
+  function handleError(error, requestGeneration) {
+    if (!active(requestGeneration)) return;
+    if (error?.message === "SESSION_EXPIRED") {
+      expired = true;
+      generation += 1;
+      stopPolling();
+      terminal();
+      return;
+    }
+    setStatus(fallbackStatus());
+  }
+
+  async function refreshSnapshot() {
+    if (disposed || expired || isHidden()) return;
+    const requestGeneration = ++generation;
+    setStatus("refreshing");
+    try {
+      const snapshot = await refresh();
+      if (active(requestGeneration)) applySnapshot(snapshot);
+    } catch (error) {
+      handleError(error, requestGeneration);
+    }
+  }
+
+  return {
+    async start() {
+      if (disposed || expired) return;
+      const requestGeneration = ++generation;
+      try {
+        const snapshot = await initialSnapshot();
+        if (active(requestGeneration)) applySnapshot(snapshot);
+      } catch (error) {
+        handleError(error, requestGeneration);
+      }
+      if (active(requestGeneration)) startPolling();
+    },
+    refresh: refreshSnapshot,
+    applyIncomingSnapshot(snapshot) {
+      if (disposed || expired) return;
+      generation += 1;
+      applySnapshot(snapshot);
+    },
+    visibilityChanged(hidden) {
+      if (hidden) {
+        stopPolling();
+        return Promise.resolve();
+      }
+      if (disposed || expired) return Promise.resolve();
+      const result = refreshSnapshot();
+      startPolling();
+      return result;
+    },
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      generation += 1;
+      stopPolling();
+    },
+  };
+}
+
 export function createPageTransport(document, dependencies) {
   const mode = document
     .querySelector('meta[name="context-map-viewer-transport"]')

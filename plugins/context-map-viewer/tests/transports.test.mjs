@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   createHttpTransport,
   createMcpTransport,
+  createPageLifecycle,
   createPageTransport,
 } from "../web/transports.mjs";
 
@@ -14,6 +15,41 @@ function messageEvent(source, data) {
     data: { value: data },
   });
   return event;
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((nextResolve, nextReject) => {
+    resolve = nextResolve;
+    reject = nextReject;
+  });
+  return { promise, resolve, reject };
+}
+
+function lifecycleHarness(overrides = {}) {
+  const timers = new Map();
+  let nextTimerId = 1;
+  const snapshots = [];
+  const statuses = [];
+  const terminals = [];
+  const lifecycle = createPageLifecycle({
+    initialSnapshot: async () => ({ status: "initial" }),
+    refresh: async () => ({ status: "synced" }),
+    applySnapshot: (snapshot) => snapshots.push(snapshot),
+    setStatus: (status) => statuses.push(status),
+    terminal: (message) => terminals.push(message),
+    fallbackStatus: () => "invalid",
+    isHidden: () => false,
+    setInterval: (callback) => {
+      const id = nextTimerId++;
+      timers.set(id, callback);
+      return id;
+    },
+    clearInterval: (id) => timers.delete(id),
+    ...overrides,
+  });
+  return { lifecycle, snapshots, statuses, terminals, timers };
 }
 
 test("HTTP transport reads only the same-origin session API", async () => {
@@ -131,4 +167,54 @@ test("page transport accepts only the explicit MCP and HTTP mode markers", () =>
     () => createPageTransport({ querySelector: () => ({ content: "https://example.com" }) }, dependencies),
     /Unsupported context-map viewer transport/,
   );
+});
+
+test("page lifecycle never applies an older refresh after a newer session expiry", async () => {
+  const first = deferred();
+  const second = deferred();
+  let reads = 0;
+  const harness = lifecycleHarness({
+    refresh: () => (++reads === 1 ? first.promise : second.promise),
+  });
+  await harness.lifecycle.start();
+
+  const olderRefresh = harness.lifecycle.refresh();
+  const expiringRefresh = harness.lifecycle.refresh();
+  second.reject(new Error("SESSION_EXPIRED"));
+  await expiringRefresh;
+  first.resolve({ status: "synced", version: "stale" });
+  await olderRefresh;
+
+  assert.deepEqual(harness.snapshots, [{ status: "initial" }]);
+  assert.equal(harness.terminals.length, 1);
+  assert.equal(harness.timers.size, 0);
+});
+
+test("page lifecycle keeps one poll timer when visibility returns during initialization", async () => {
+  const initial = deferred();
+  const harness = lifecycleHarness({
+    initialSnapshot: () => initial.promise,
+    refresh: async () => ({ status: "synced", version: "refresh" }),
+  });
+
+  const starting = harness.lifecycle.start();
+  await harness.lifecycle.visibilityChanged(false);
+  initial.resolve({ status: "synced", version: "initial" });
+  await starting;
+
+  assert.deepEqual(harness.snapshots, [{ status: "synced", version: "refresh" }]);
+  assert.equal(harness.timers.size, 1);
+});
+
+test("page lifecycle cannot start polling after disposal while initialization is pending", async () => {
+  const initial = deferred();
+  const harness = lifecycleHarness({ initialSnapshot: () => initial.promise });
+
+  const starting = harness.lifecycle.start();
+  harness.lifecycle.dispose();
+  initial.resolve({ status: "synced" });
+  await starting;
+
+  assert.deepEqual(harness.snapshots, []);
+  assert.equal(harness.timers.size, 0);
 });
