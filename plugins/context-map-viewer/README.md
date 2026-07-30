@@ -53,6 +53,19 @@ Codex opens the map in its side browser by default. If that presentation is not
 available, the inline MCP App requests picture-in-picture when the host exposes
 that capability and otherwise remains inline.
 
+### Navigate large maps
+
+The Viewer opens in **Both** mode with an equivalent tree navigator beside the
+mind map. Use **Tree**, **Map**, or **Both** in the toolbar to change the current
+presentation. Folding is shared between the tree and map.
+
+Selecting a tree item expands its ancestors and centers the matching map node
+without changing zoom. Long labels stay compact in the map; select a node to
+open the read-only full-text details drawer.
+
+Live refreshes from the same workspace preserve the current mode, folds,
+selection, details, search, and viewport when the selected node still exists.
+
 ## Browser session security and lifecycle
 
 The side-browser `viewerUrl` is a local, temporary URL. It listens only on
