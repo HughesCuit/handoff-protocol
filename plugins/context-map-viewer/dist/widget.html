@@ -71,6 +71,17 @@ body {
   gap: 3px;
 }
 
+.view-modes {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.view-modes [aria-checked="true"] {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, var(--panel));
+}
+
 button {
   min-height: 32px;
   padding: 5px 8px;
@@ -120,11 +131,67 @@ button:focus-visible {
 
 .stage {
   position: relative;
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
   min-height: 0;
   overflow: hidden;
   background-color: var(--surface);
   background-image: radial-gradient(circle, color-mix(in srgb, var(--line) 35%, transparent) 1px, transparent 1px);
   background-size: 18px 18px;
+}
+
+.stage[data-mode="tree"] { grid-template-columns: minmax(0, 1fr); }
+.stage[data-mode="map"] { grid-template-columns: minmax(0, 1fr); }
+.stage[data-mode="tree"] .map-pane,
+.stage[data-mode="map"] .tree-pane { display: none; }
+
+.tree-pane {
+  min-width: 0;
+  overflow: auto;
+  border-right: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.tree-root {
+  padding: 6px;
+}
+
+.tree-item {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  align-items: center;
+  width: 100%;
+}
+
+.tree-disclosure,
+.tree-label {
+  min-width: 0;
+  border-color: transparent;
+  background: transparent;
+}
+
+.tree-disclosure {
+  padding: 5px;
+}
+
+.tree-label {
+  padding-left: calc(8px + var(--tree-depth) * 14px);
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tree-item[aria-selected="true"],
+.map-node.selected rect {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.map-pane {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
 }
 
 #canvas {
@@ -243,6 +310,21 @@ button:focus-visible {
   display: none;
 }
 
+@media (max-width: 559px) and (min-width: 420px) {
+  .stage[data-mode="split"] { grid-template-columns: 180px minmax(0, 1fr); }
+}
+
+@media (max-width: 419px) {
+  .stage[data-mode="split"] {
+    grid-template-columns: 1fr;
+    grid-template-rows: 40% 60%;
+  }
+  .stage[data-mode="split"] .tree-pane {
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+}
+
 @media (prefers-color-scheme: dark) {
   :root {
     --surface: #161922;
@@ -274,6 +356,11 @@ button:focus-visible {
           <span aria-hidden="true">⌕</span>
           <input id="search" type="search" placeholder="Search nodes" autocomplete="off">
         </label>
+        <div id="view-modes" class="view-modes" role="radiogroup" aria-label="View mode">
+          <button id="mode-tree" type="button" role="radio" aria-checked="false" data-mode="tree">Tree</button>
+          <button id="mode-map" type="button" role="radio" aria-checked="false" data-mode="map">Map</button>
+          <button id="mode-split" type="button" role="radio" aria-checked="true" data-mode="split">Both</button>
+        </div>
         <div class="toolbar-group">
           <button id="zoom-out" type="button" aria-label="Zoom out">−</button>
           <output id="zoom-value" aria-live="polite">100%</output>
@@ -284,17 +371,29 @@ button:focus-visible {
         </div>
         <div id="sync-status" class="sync-status" role="status">Refreshing</div>
       </header>
-      <section id="stage" class="stage" aria-label="Context Map canvas">
-        <svg id="canvas" role="img" aria-label="Handoff Context Map">
-          <g id="viewport">
-            <g id="links"></g>
-            <g id="nodes"></g>
-          </g>
-        </svg>
+      <section id="stage" class="stage" data-mode="split">
+        <div id="tree-pane" class="tree-pane">
+          <div id="tree-root" class="tree-root" role="tree" aria-label="Context Map tree"></div>
+        </div>
+        <section id="map-pane" class="map-pane" aria-label="Context Map canvas">
+          <svg id="canvas" role="img" aria-label="Handoff Context Map">
+            <g id="viewport">
+              <g id="links"></g>
+              <g id="nodes"></g>
+            </g>
+          </svg>
+        </section>
+        <aside id="details-drawer" class="details-drawer" aria-labelledby="details-title" hidden>
+          <button id="details-close" type="button" aria-label="Close node details">×</button>
+          <h2 id="details-title" tabindex="-1">Node details</h2>
+          <div id="details-path" class="details-path"></div>
+          <p id="details-text" class="details-text"></p>
+          <dl id="details-meta" class="details-meta"></dl>
+        </aside>
         <div id="empty-state" class="empty-state" hidden></div>
       </section>
     </main>
-    <script>(()=>{function B(e,t,o=[]){t(e,o);for(let i of e.children??[])B(i,t,[...o,e])}function Z(e){let t=new Set;return B(e,o=>t.add(o.id)),t}function ee(e,t){let o=Z(t);return new Set([...e].filter(i=>o.has(i)))}function j(e){return new Set((e.children??[]).map(t=>t.id))}function te(e){return new Set((e?.children??[]).filter(t=>(t.children?.length??0)>0).map(t=>t.id))}function ne(e,t,o,i){return!!(e&&i&&t&&o==="synced")}function re(e,t){let o=String(t).toLocaleLowerCase().trim().split(/\s+/).filter(Boolean),i=new Set,s=new Set;return o.length===0?{matches:i,ancestors:s}:(B(e,(n,a)=>{let l=[...a,n].map(u=>u.text??"").join(" ").toLocaleLowerCase();if(o.every(u=>l.includes(u))){i.add(n.id);for(let u of a)s.add(u.id)}}),{matches:i,ancestors:s})}function $(e,t,o){let i=re(e,o);function s(n){let a=i.ancestors.has(n.id),l=t.has(n.id)&&!a;return{...n,children:l?[]:(n.children??[]).map(s),hasHiddenChildren:l&&(n.children?.length??0)>0}}return{root:s(e),...i}}function N(e,t,o,i){let s=$(e,t,o),n=q(s.root),a=Math.max(200,i.width-40),l=Math.max(160,i.height-40);return{x:20,y:20,scale:Math.max(.35,Math.min(1.4,a/n.width,l/n.height))}}function z(){return{bindingId:null,tree:null,folded:new Set,query:"",transform:{x:36,y:36,scale:1},overviewPending:!0}}function W(e,t,o){if(!t||typeof t!="object")return e;let i=t.bindingId??e.bindingId,s=ie(e.bindingId,i)?{...e,bindingId:i,tree:null,folded:new Set,query:"",overviewPending:!0}:{...e,bindingId:i},n=t.tree?.root;if(!n)return s;if(ne(s.overviewPending,i,t.status,n)){let a=te(n);return{...s,tree:t.tree,folded:a,transform:N(n,a,s.query,o),overviewPending:!1}}return t.status!=="synced"&&s.tree?.root?s:{...s,tree:t.tree,folded:ee(s.folded,n)}}function q(e,t={}){let o=t.horizontalGap??220,i=t.verticalGap??68,s=t.padding??48,n=[],a=[],l=s;function u(c,h,f=null){let p={...c,x:s+h*o,y:0,width:Math.max(112,Math.min(220,42+String(c.text??"").length*7)),height:42,depth:h};n.push(p),f&&a.push({sourceId:f.id,targetId:c.id});let S=c.children??[];if(S.length===0)p.y=l,l+=i;else{for(let I of S)u(I,h+1,p);let T=n.find(I=>I.id===S[0].id),k=n.find(I=>I.id===S.at(-1).id);p.y=(T.y+k.y)/2}return p}u(e,0);let m=Math.max(320,...n.map(c=>c.x+c.width+s)),d=Math.max(240,l-i+s);return{nodes:n,links:a,width:m,height:d}}function G(e,t,o,i){let s=e.nodes.find(a=>a.id===t);if(!s)return i;let n=i.scale;return{x:o.width/2-(s.x+s.width/2)*n,y:o.height/2-(s.y+s.height/2)*n,scale:n}}function ie(e,t){return e!==null&&e!==t}async function X(e){if(typeof e?.requestDisplayMode!="function")return!1;try{return await Promise.resolve(e.requestDisplayMode({mode:"picture-in-picture"})),!0}catch{return!1}}function Y(e){return e?.structuredContent??e?.content?.structuredContent??e?.result?.structuredContent??null}function F({parentWindow:e,windowObject:t,onSnapshot:o=()=>{}}){let i=new Map,s=1,n=!1;function a(m,d){if(n)return Promise.reject(new Error("MCP_TRANSPORT_DISPOSED"));let c=s++,h=new Promise((f,p)=>i.set(c,{resolve:f,reject:p}));return e.postMessage({jsonrpc:"2.0",id:c,method:m,params:d},"*"),h}async function l(m){return Y(await a("tools/call",{name:"get_context_map",arguments:{bindingId:m}}))}function u(m){if(m.source!==e)return;let d=m.data;if(!(!d||d.jsonrpc!=="2.0")){if(d.id!==void 0&&i.has(d.id)){let c=i.get(d.id);i.delete(d.id),d.error?c.reject(d.error):c.resolve(d.result);return}if(d.method==="ui/notifications/tool-result"){let c=Y(d.params);c&&o(c)}}}return t.addEventListener("message",u),{initialSnapshot(){return t.openai?.toolOutput??l()},refresh:l,dispose(){if(!n){n=!0,t.removeEventListener("message",u);for(let{reject:m}of i.values())m(new Error("MCP_TRANSPORT_DISPOSED"));i.clear()}}}}function A({initialSnapshot:e,refresh:t,applySnapshot:o,setStatus:i,terminal:s,fallbackStatus:n,isHidden:a,setInterval:l,clearInterval:u,intervalMs:m=750}){let d=!1,c=!1,h=null,f=null,p=0;function S(g){return!d&&!c&&p===g}function T(){h!==null&&(u(h),h=null)}function k(){d||c||a()||h!==null||(h=l(()=>_(),m))}function I(g,y){if(S(y)){if(g?.message==="SESSION_EXPIRED"){c=!0,p+=1,T(),s();return}i(n())}}function _(){if(d||c||a())return;if(f)return f.promise;let g=++p;i("refreshing");let y={};return f=y,y.promise=Promise.resolve().then(()=>t()).then(L=>{S(g)&&o(L)}).catch(L=>I(L,g)).finally(()=>{f===y&&(f=null)}),y.promise}return{async start(){if(d||c)return;let g=++p;try{let y=await e();S(g)&&o(y)}catch(y){I(y,g)}S(g)&&k()},refresh:_,applyIncomingSnapshot(g){d||c||(p+=1,o(g))},visibilityChanged(g){if(g)return T(),Promise.resolve();if(d||c)return Promise.resolve();let y=_();return k(),y},dispose(){d||(d=!0,p+=1,T())}}}function U(e,t){return F(t)}var O=null,r=z(),v=null,oe="initial-overview:sync-gated-transition:v2",x=document.getElementById("stage"),w=document.getElementById("canvas"),se=document.getElementById("viewport"),K=document.getElementById("links"),J=document.getElementById("nodes"),R=document.getElementById("search"),Q=document.getElementById("sync-status"),C=document.getElementById("empty-state"),ae=document.getElementById("zoom-value"),ce="http://www.w3.org/2000/svg";function b(){se.setAttribute("transform",`translate(${r.transform.x} ${r.transform.y}) scale(${r.transform.scale})`),ae.textContent=`${Math.round(r.transform.scale*100)}%`}function de(e){return e.taskState==="done"?"\u2713 ":e.taskState==="open"?"\u25CB ":e.risk==="high"?"\u26A0 ":e.excluded?"\u2298 ":""}function le(e,t=28){let o=String(e);return o.length>t?`${o.slice(0,t-1)}\u2026`:o}function E(e,t={}){let o=document.createElementNS(ce,e);for(let[i,s]of Object.entries(t))o.setAttribute(i,String(s));return o}function ue(e){let t=new Map,o=i=>{t.set(i.id,i);for(let s of i.children??[])o(s)};return o(e),t}function M(e=!1){if(!r.tree?.root)return;let t=$(r.tree.root,r.folded,r.query),o=q(t.root),i=new Map(o.nodes.map(n=>[n.id,n])),s=ue(r.tree.root);K.replaceChildren(),J.replaceChildren();for(let n of o.links){let a=i.get(n.sourceId),l=i.get(n.targetId),u=a.x+a.width,m=a.y+a.height/2,d=l.x,c=l.y+l.height/2,h=(u+d)/2;K.append(E("path",{class:"link",d:`M ${u} ${m} C ${h} ${m}, ${h} ${c}, ${d} ${c}`}))}for(let n of o.nodes){let a=["map-node"];n.section==="root"?a.push("root"):a.push(`section-${n.section}`),n.taskState==="done"&&a.push("done"),n.risk==="high"&&a.push("risk-high"),n.excluded&&a.push("excluded"),r.query&&t.matches.has(n.id)&&a.push("match"),r.query&&!t.matches.has(n.id)&&!t.ancestors.has(n.id)&&a.push("dim");let l=E("g",{class:a.join(" "),transform:`translate(${n.x} ${n.y})`,tabindex:0,role:"button","aria-label":n.text});l.append(E("rect",{width:n.width,height:n.height,rx:9}));let u=E("text",{x:13,y:26});if(u.textContent=`${de(n)}${le(n.text)}`,l.append(u),(s.get(n.id)?.children?.length??0)>0){let d=E("circle",{class:"fold-badge",cx:n.width,cy:n.height/2,r:8}),c=E("text",{class:"fold-badge-text",x:n.width,y:n.height/2+3.5,"text-anchor":"middle"});c.textContent=r.folded.has(n.id)?"+":"\u2212",l.append(d,c);let h=()=>{let f=new Set(r.folded);f.has(n.id)?f.delete(n.id):f.add(n.id),r={...r,folded:f},M()};l.addEventListener("click",h),l.addEventListener("keydown",f=>{(f.key==="Enter"||f.key===" ")&&(f.preventDefault(),h())})}J.append(l)}w.setAttribute("viewBox",`0 0 ${Math.max(x.clientWidth,320)} ${Math.max(x.clientHeight,240)}`),e&&t.matches.size>0&&(r={...r,transform:G(o,t.matches.values().next().value,{width:x.clientWidth,height:x.clientHeight},r.transform)}),b()}function H(e){let t={synced:"Synced",refreshing:"Refreshing",missing:"Missing",empty:"Empty",invalid:"Parse error",too_large:"File too large",too_many_nodes:"Too many nodes",access_denied:"Access denied",watcher_unavailable:"Polling",expired:"Session expired"};Q.textContent=t[e]??"Unavailable",Q.className=`sync-status ${e==="synced"?"synced":""} ${["invalid","too_large","too_many_nodes","access_denied","expired"].includes(e)?"error":""}`}function fe(e){return{missing:"No .handoff/context-map.md yet. Run the Handoff save flow to create it.",empty:"The Context Map exists but has no semantic nodes yet.",invalid:"The Context Map could not be parsed. The last valid map remains visible.",too_large:"The Context Map exceeds the 2 MiB viewer limit.",too_many_nodes:"The Context Map exceeds the 2,000-node viewer limit.",access_denied:"The active workspace Context Map is not available to this read-only viewer."}[e]??"Waiting for a Context Map snapshot\u2026"}function he(e){if(!(!e||typeof e!="object")){if(O=e,H(e.status),r=W(r,e,{width:x.clientWidth,height:x.clientHeight}),R.value=r.query,r.tree?.root){C.hidden=!0,w.hidden=!1,M();return}w.hidden=!0,C.hidden=!1,C.textContent=fe(e.status)}}function me(e){r={...r,tree:null},w.hidden=!0,C.hidden=!1,C.textContent=e,H("expired")}var P,D=U(document,{parentWindow:window.parent,windowObject:window,fetch:window.fetch.bind(window),location:window.location,onSnapshot:e=>P?.applyIncomingSnapshot(e)});P=A({initialSnapshot:()=>D.initialSnapshot(),refresh:()=>D.refresh(O?.bindingId),applySnapshot:he,setStatus:H,terminal:()=>me("This Viewer session expired. Reopen Context Map Viewer."),fallbackStatus:()=>O?.status??"invalid",isHidden:()=>document.hidden,setInterval:window.setInterval.bind(window),clearInterval:window.clearInterval.bind(window)});function V(e,t=x.clientWidth/2,o=x.clientHeight/2){let i=Math.max(.35,Math.min(2.5,r.transform.scale*e)),s=i/r.transform.scale;r={...r,transform:{x:t-(t-r.transform.x)*s,y:o-(o-r.transform.y)*s,scale:i}},b()}function pe(){r.tree?.root&&(r={...r,transform:N(r.tree.root,r.folded,r.query,{width:x.clientWidth,height:x.clientHeight})},b())}R.addEventListener("input",()=>{r={...r,query:R.value},M(!!r.query.trim())});document.getElementById("zoom-in").addEventListener("click",()=>V(1.2));document.getElementById("zoom-out").addEventListener("click",()=>V(1/1.2));document.getElementById("fit").addEventListener("click",pe);document.getElementById("expand").addEventListener("click",()=>{r={...r,folded:new Set},M()});document.getElementById("collapse").addEventListener("click",()=>{r.tree?.root&&(r={...r,folded:j(r.tree.root)},M())});w.addEventListener("wheel",e=>{e.preventDefault();let t=x.getBoundingClientRect();V(e.deltaY<0?1.1:1/1.1,e.clientX-t.left,e.clientY-t.top)},{passive:!1});w.addEventListener("pointerdown",e=>{e.target.closest?.(".map-node")||(v={pointerId:e.pointerId,x:e.clientX,y:e.clientY},w.setPointerCapture(e.pointerId),w.classList.add("dragging"))});w.addEventListener("pointermove",e=>{!v||v.pointerId!==e.pointerId||(r={...r,transform:{...r.transform,x:r.transform.x+e.clientX-v.x,y:r.transform.y+e.clientY-v.y}},v={...v,x:e.clientX,y:e.clientY},b())});w.addEventListener("pointerup",e=>{v?.pointerId===e.pointerId&&(v=null,w.classList.remove("dragging"),w.releasePointerCapture(e.pointerId))});document.addEventListener("visibilitychange",()=>{P.visibilityChanged(document.hidden)});window.addEventListener("resize",()=>b());window.addEventListener("pagehide",()=>{P.dispose(),D.dispose()},{once:!0});document.documentElement.dataset.initialOverviewBehavior=oe;b();document.querySelector('meta[name="context-map-viewer-transport"]')?.content==="mcp"&&X(window.openai);P.start();})();
+    <script>(()=>{function P(e,t,o=[]){t(e,o);for(let i of e.children??[])P(i,t,[...o,e])}function Y(e){let t=new Set;return P(e,o=>t.add(o.id)),t}function _(e){let t=new Map;return P(e,(o,i)=>{t.set(o.id,{node:o,ancestors:i})}),t}function X(e,t){return!e||!t?null:Y(t).has(e)?e:null}function ce(e,t){let o=Y(t);return new Set([...e].filter(i=>o.has(i)))}function U(e){return new Set((e.children??[]).map(t=>t.id))}function de(e){return new Set((e?.children??[]).filter(t=>(t.children?.length??0)>0).map(t=>t.id))}function le(e,t,o,i){return!!(e&&i&&t&&o==="synced")}function ue(e,t){let o=String(t).toLocaleLowerCase().trim().split(/\s+/).filter(Boolean),i=new Set,s=new Set;return o.length===0?{matches:i,ancestors:s}:(P(e,(n,a)=>{let c=[...a,n].map(u=>u.text??"").join(" ").toLocaleLowerCase();if(o.every(u=>c.includes(u))){i.add(n.id);for(let u of a)s.add(u.id)}}),{matches:i,ancestors:s})}function N(e,t,o){let i=ue(e,o);function s(n){let a=i.ancestors.has(n.id),c=t.has(n.id)&&!a;return{...n,children:c?[]:(n.children??[]).map(s),hasHiddenChildren:c&&(n.children?.length??0)>0}}return{root:s(e),...i}}function O(e,t,o,i){let s=N(e,t,o),n=D(s.root),a=Math.max(200,i.width-40),c=Math.max(160,i.height-40);return{x:20,y:20,scale:Math.max(.35,Math.min(1.4,a/n.width,c/n.height))}}function K(){return{bindingId:null,tree:null,folded:new Set,query:"",transform:{x:36,y:36,scale:1},overviewPending:!0,displayMode:"split",selectedNodeId:null,detailOpen:!1}}function J(e,t,o){if(!t||typeof t!="object")return e;let i=t.bindingId??e.bindingId,s=fe(e.bindingId,i)?{...e,bindingId:i,tree:null,folded:new Set,query:"",overviewPending:!0,displayMode:"split",selectedNodeId:null,detailOpen:!1}:{...e,bindingId:i},n=t.tree?.root;if(!n)return s;if(le(s.overviewPending,i,t.status,n)){let c=de(n),u=X(s.selectedNodeId,n);return{...s,tree:t.tree,folded:c,transform:O(n,c,s.query,o),overviewPending:!1,selectedNodeId:u,detailOpen:u?s.detailOpen:!1}}if(t.status!=="synced"&&s.tree?.root)return s;let a=X(s.selectedNodeId,n);return{...s,tree:t.tree,folded:ce(s.folded,n),selectedNodeId:a,detailOpen:a?s.detailOpen:!1}}function D(e,t={}){let o=t.horizontalGap??220,i=t.verticalGap??68,s=t.padding??48,n=[],a=[],c=s;function u(d,h,w=null){let p={...d,x:s+h*o,y:0,width:Math.max(112,Math.min(220,42+String(d.text??"").length*7)),height:42,depth:h};n.push(p),w&&a.push({sourceId:w.id,targetId:d.id});let x=d.children??[];if(x.length===0)p.y=c,c+=i;else{for(let E of x)u(E,h+1,p);let T=n.find(E=>E.id===x[0].id),L=n.find(E=>E.id===x.at(-1).id);p.y=(T.y+L.y)/2}return p}u(e,0);let f=Math.max(320,...n.map(d=>d.x+d.width+s)),l=Math.max(240,c-i+s);return{nodes:n,links:a,width:f,height:l}}function Q(e,t,o,i){let s=e.nodes.find(a=>a.id===t);if(!s)return i;let n=i.scale;return{x:o.width/2-(s.x+s.width/2)*n,y:o.height/2-(s.y+s.height/2)*n,scale:n}}function fe(e,t){return e!==null&&e!==t}async function Z(e){if(typeof e?.requestDisplayMode!="function")return!1;try{return await Promise.resolve(e.requestDisplayMode({mode:"picture-in-picture"})),!0}catch{return!1}}function ee(e){return e?.structuredContent??e?.content?.structuredContent??e?.result?.structuredContent??null}function te({parentWindow:e,windowObject:t,onSnapshot:o=()=>{}}){let i=new Map,s=1,n=!1;function a(f,l){if(n)return Promise.reject(new Error("MCP_TRANSPORT_DISPOSED"));let d=s++,h=new Promise((w,p)=>i.set(d,{resolve:w,reject:p}));return e.postMessage({jsonrpc:"2.0",id:d,method:f,params:l},"*"),h}async function c(f){return ee(await a("tools/call",{name:"get_context_map",arguments:{bindingId:f}}))}function u(f){if(f.source!==e)return;let l=f.data;if(!(!l||l.jsonrpc!=="2.0")){if(l.id!==void 0&&i.has(l.id)){let d=i.get(l.id);i.delete(l.id),l.error?d.reject(l.error):d.resolve(l.result);return}if(l.method==="ui/notifications/tool-result"){let d=ee(l.params);d&&o(d)}}}return t.addEventListener("message",u),{initialSnapshot(){return t.openai?.toolOutput??c()},refresh:c,dispose(){if(!n){n=!0,t.removeEventListener("message",u);for(let{reject:f}of i.values())f(new Error("MCP_TRANSPORT_DISPOSED"));i.clear()}}}}function R({initialSnapshot:e,refresh:t,applySnapshot:o,setStatus:i,terminal:s,fallbackStatus:n,isHidden:a,setInterval:c,clearInterval:u,intervalMs:f=750}){let l=!1,d=!1,h=null,w=null,p=0;function x(m){return!l&&!d&&p===m}function T(){h!==null&&(u(h),h=null)}function L(){l||d||a()||h!==null||(h=c(()=>B(),f))}function E(m,g){if(x(g)){if(m?.message==="SESSION_EXPIRED"){d=!0,p+=1,T(),s();return}i(n())}}function B(){if(l||d||a())return;if(w)return w.promise;let m=++p;i("refreshing");let g={};return w=g,g.promise=Promise.resolve().then(()=>t()).then(q=>{x(m)&&o(q)}).catch(q=>E(q,m)).finally(()=>{w===g&&(w=null)}),g.promise}return{async start(){if(l||d)return;let m=++p;try{let g=await e();x(m)&&o(g)}catch(g){E(g,m)}x(m)&&L()},refresh:B,applyIncomingSnapshot(m){l||d||(p+=1,o(m))},visibilityChanged(m){if(m)return T(),Promise.resolve();if(l||d)return Promise.resolve();let g=B();return L(),g},dispose(){l||(l=!0,p+=1,T())}}}function ne(e,t){return te(t)}var V=null,r=K(),S=null,he="initial-overview:sync-gated-transition:v2",v=document.getElementById("stage"),y=document.getElementById("canvas"),pe=document.getElementById("viewport"),re=document.getElementById("links"),ie=document.getElementById("nodes"),H=document.getElementById("tree-pane"),$=document.getElementById("tree-root"),A=document.getElementById("map-pane"),j=document.getElementById("search"),oe=document.getElementById("sync-status"),C=document.getElementById("empty-state"),me=document.getElementById("zoom-value"),ge="http://www.w3.org/2000/svg";function M(){pe.setAttribute("transform",`translate(${r.transform.x} ${r.transform.y}) scale(${r.transform.scale})`),me.textContent=`${Math.round(r.transform.scale*100)}%`}function se(e){return e.taskState==="done"?"\u2713 ":e.taskState==="open"?"\u25CB ":e.risk==="high"?"\u26A0 ":e.excluded?"\u2298 ":""}function ye(e,t=28){let o=String(e);return o.length>t?`${o.slice(0,t-1)}\u2026`:o}function b(e,t={}){let o=document.createElementNS(ge,e);for(let[i,s]of Object.entries(t))o.setAttribute(i,String(s));return o}function z(e){let t=new Set(r.folded);t.has(e)?t.delete(e):t.add(e),r={...r,folded:t},I()}function we(e){r.tree?.root&&_(r.tree.root).has(e)&&(r={...r,selectedNodeId:e},I())}function xe(){if($.replaceChildren(),!r.tree?.root)return;let e=N(r.tree.root,r.folded,r.query),t=_(r.tree.root),o=(i,s)=>{let n=document.createElement("div");n.className="tree-item",n.setAttribute("role","treeitem"),n.setAttribute("aria-level",String(s)),n.setAttribute("aria-selected",String(r.selectedNodeId===i.id)),n.style.setProperty("--tree-depth",String(s-1));let a=(t.get(i.id)?.node.children?.length??0)>0;a&&n.setAttribute("aria-expanded",String(!r.folded.has(i.id)));let c=document.createElement("button");c.type="button",c.className="tree-disclosure",c.textContent=a?r.folded.has(i.id)?"+":"\u2212":"",c.disabled=!a,c.setAttribute("aria-label",`${r.folded.has(i.id)?"Expand":"Collapse"} ${i.text}`),c.addEventListener("click",()=>z(i.id));let u=document.createElement("button");u.type="button",u.className="tree-label",u.textContent=`${se(i)}${i.text}`,u.addEventListener("click",()=>we(i.id)),n.append(c,u),$.append(n);for(let f of i.children??[])o(f,s+1)};o(e.root,1)}function ae(e=!1){if(!r.tree?.root)return;let t=N(r.tree.root,r.folded,r.query),o=D(t.root),i=new Map(o.nodes.map(n=>[n.id,n])),s=_(r.tree.root);re.replaceChildren(),ie.replaceChildren();for(let n of o.links){let a=i.get(n.sourceId),c=i.get(n.targetId),u=a.x+a.width,f=a.y+a.height/2,l=c.x,d=c.y+c.height/2,h=(u+l)/2;re.append(b("path",{class:"link",d:`M ${u} ${f} C ${h} ${f}, ${h} ${d}, ${l} ${d}`}))}for(let n of o.nodes){let a=["map-node"];n.section==="root"?a.push("root"):a.push(`section-${n.section}`),n.taskState==="done"&&a.push("done"),n.risk==="high"&&a.push("risk-high"),n.excluded&&a.push("excluded"),r.selectedNodeId===n.id&&a.push("selected"),r.query&&t.matches.has(n.id)&&a.push("match"),r.query&&!t.matches.has(n.id)&&!t.ancestors.has(n.id)&&a.push("dim");let c=b("g",{class:a.join(" "),transform:`translate(${n.x} ${n.y})`,tabindex:0,role:"button","aria-label":n.text});c.append(b("rect",{width:n.width,height:n.height,rx:9}));let u=b("text",{x:13,y:26});if(u.textContent=`${se(n)}${ye(n.text)}`,c.append(u),(s.get(n.id)?.node.children?.length??0)>0){let l=b("circle",{class:"fold-badge",cx:n.width,cy:n.height/2,r:8}),d=b("text",{class:"fold-badge-text",x:n.width,y:n.height/2+3.5,"text-anchor":"middle"});d.textContent=r.folded.has(n.id)?"+":"\u2212",c.append(l,d),c.addEventListener("click",()=>z(n.id)),c.addEventListener("keydown",h=>{(h.key==="Enter"||h.key===" ")&&(h.preventDefault(),z(n.id))})}ie.append(c)}y.setAttribute("viewBox",`0 0 ${Math.max(A.clientWidth,320)} ${Math.max(A.clientHeight,240)}`),e&&t.matches.size>0&&(r={...r,transform:Q(o,t.matches.values().next().value,{width:A.clientWidth,height:A.clientHeight},r.transform)}),M()}function Se(){let e=r.displayMode;v.dataset.mode=e;for(let t of document.querySelectorAll("[data-mode]"))t.setAttribute("aria-checked",String(t.dataset.mode===e))}function I({focusFirstMatch:e=!1}={}){xe(),ae(e),Se()}function ve(e){if(["tree","map","split"].includes(e)){r={...r,displayMode:e},v.dataset.mode=e;for(let t of document.querySelectorAll("[data-mode]"))t.setAttribute("aria-checked",String(t.dataset.mode===e));I()}}function F(e){let t={synced:"Synced",refreshing:"Refreshing",missing:"Missing",empty:"Empty",invalid:"Parse error",too_large:"File too large",too_many_nodes:"Too many nodes",access_denied:"Access denied",watcher_unavailable:"Polling",expired:"Session expired"};oe.textContent=t[e]??"Unavailable",oe.className=`sync-status ${e==="synced"?"synced":""} ${["invalid","too_large","too_many_nodes","access_denied","expired"].includes(e)?"error":""}`}function Ee(e){return{missing:"No .handoff/context-map.md yet. Run the Handoff save flow to create it.",empty:"The Context Map exists but has no semantic nodes yet.",invalid:"The Context Map could not be parsed. The last valid map remains visible.",too_large:"The Context Map exceeds the 2 MiB viewer limit.",too_many_nodes:"The Context Map exceeds the 2,000-node viewer limit.",access_denied:"The active workspace Context Map is not available to this read-only viewer."}[e]??"Waiting for a Context Map snapshot\u2026"}function Ie(e){if(!(!e||typeof e!="object")){if(V=e,F(e.status),r=J(r,e,{width:v.clientWidth,height:v.clientHeight}),j.value=r.query,r.tree?.root){C.hidden=!0,y.hidden=!1,H.hidden=!1,I();return}y.hidden=!0,H.hidden=!0,$.replaceChildren(),C.hidden=!1,C.textContent=Ee(e.status)}}function be(e){r={...r,tree:null},y.hidden=!0,H.hidden=!0,$.replaceChildren(),C.hidden=!1,C.textContent=e,F("expired")}var k,W=ne(document,{parentWindow:window.parent,windowObject:window,fetch:window.fetch.bind(window),location:window.location,onSnapshot:e=>k?.applyIncomingSnapshot(e)});k=R({initialSnapshot:()=>W.initialSnapshot(),refresh:()=>W.refresh(V?.bindingId),applySnapshot:Ie,setStatus:F,terminal:()=>be("This Viewer session expired. Reopen Context Map Viewer."),fallbackStatus:()=>V?.status??"invalid",isHidden:()=>document.hidden,setInterval:window.setInterval.bind(window),clearInterval:window.clearInterval.bind(window)});function G(e,t=v.clientWidth/2,o=v.clientHeight/2){let i=Math.max(.35,Math.min(2.5,r.transform.scale*e)),s=i/r.transform.scale;r={...r,transform:{x:t-(t-r.transform.x)*s,y:o-(o-r.transform.y)*s,scale:i}},M()}function Te(){r.tree?.root&&(r={...r,transform:O(r.tree.root,r.folded,r.query,{width:v.clientWidth,height:v.clientHeight})},M())}j.addEventListener("input",()=>{r={...r,query:j.value},I({focusFirstMatch:!!r.query.trim()})});for(let e of document.querySelectorAll("[data-mode]"))e.addEventListener("click",()=>ve(e.dataset.mode));document.getElementById("zoom-in").addEventListener("click",()=>G(1.2));document.getElementById("zoom-out").addEventListener("click",()=>G(1/1.2));document.getElementById("fit").addEventListener("click",Te);document.getElementById("expand").addEventListener("click",()=>{r={...r,folded:new Set},I()});document.getElementById("collapse").addEventListener("click",()=>{r.tree?.root&&(r={...r,folded:U(r.tree.root)},I())});y.addEventListener("wheel",e=>{e.preventDefault();let t=v.getBoundingClientRect();G(e.deltaY<0?1.1:1/1.1,e.clientX-t.left,e.clientY-t.top)},{passive:!1});y.addEventListener("pointerdown",e=>{e.target.closest?.(".map-node")||(S={pointerId:e.pointerId,x:e.clientX,y:e.clientY},y.setPointerCapture(e.pointerId),y.classList.add("dragging"))});y.addEventListener("pointermove",e=>{!S||S.pointerId!==e.pointerId||(r={...r,transform:{...r.transform,x:r.transform.x+e.clientX-S.x,y:r.transform.y+e.clientY-S.y}},S={...S,x:e.clientX,y:e.clientY},M())});y.addEventListener("pointerup",e=>{S?.pointerId===e.pointerId&&(S=null,y.classList.remove("dragging"),y.releasePointerCapture(e.pointerId))});document.addEventListener("visibilitychange",()=>{k.visibilityChanged(document.hidden)});window.addEventListener("resize",()=>ae());window.addEventListener("pagehide",()=>{k.dispose(),W.dispose()},{once:!0});document.documentElement.dataset.initialOverviewBehavior=he;M();document.querySelector('meta[name="context-map-viewer-transport"]')?.content==="mcp"&&Z(window.openai);k.start();})();
 </script>
   </body>
 </html>

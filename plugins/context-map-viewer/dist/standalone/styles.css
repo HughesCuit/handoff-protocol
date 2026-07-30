@@ -64,6 +64,17 @@ body {
   gap: 3px;
 }
 
+.view-modes {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.view-modes [aria-checked="true"] {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, var(--panel));
+}
+
 button {
   min-height: 32px;
   padding: 5px 8px;
@@ -113,11 +124,67 @@ button:focus-visible {
 
 .stage {
   position: relative;
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
   min-height: 0;
   overflow: hidden;
   background-color: var(--surface);
   background-image: radial-gradient(circle, color-mix(in srgb, var(--line) 35%, transparent) 1px, transparent 1px);
   background-size: 18px 18px;
+}
+
+.stage[data-mode="tree"] { grid-template-columns: minmax(0, 1fr); }
+.stage[data-mode="map"] { grid-template-columns: minmax(0, 1fr); }
+.stage[data-mode="tree"] .map-pane,
+.stage[data-mode="map"] .tree-pane { display: none; }
+
+.tree-pane {
+  min-width: 0;
+  overflow: auto;
+  border-right: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.tree-root {
+  padding: 6px;
+}
+
+.tree-item {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  align-items: center;
+  width: 100%;
+}
+
+.tree-disclosure,
+.tree-label {
+  min-width: 0;
+  border-color: transparent;
+  background: transparent;
+}
+
+.tree-disclosure {
+  padding: 5px;
+}
+
+.tree-label {
+  padding-left: calc(8px + var(--tree-depth) * 14px);
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tree-item[aria-selected="true"],
+.map-node.selected rect {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.map-pane {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
 }
 
 #canvas {
@@ -234,6 +301,21 @@ button:focus-visible {
 
 .empty-state[hidden] {
   display: none;
+}
+
+@media (max-width: 559px) and (min-width: 420px) {
+  .stage[data-mode="split"] { grid-template-columns: 180px minmax(0, 1fr); }
+}
+
+@media (max-width: 419px) {
+  .stage[data-mode="split"] {
+    grid-template-columns: 1fr;
+    grid-template-rows: 40% 60%;
+  }
+  .stage[data-mode="split"] .tree-pane {
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
 }
 
 @media (prefers-color-scheme: dark) {

@@ -14,6 +14,11 @@
           <span aria-hidden="true">⌕</span>
           <input id="search" type="search" placeholder="Search nodes" autocomplete="off">
         </label>
+        <div id="view-modes" class="view-modes" role="radiogroup" aria-label="View mode">
+          <button id="mode-tree" type="button" role="radio" aria-checked="false" data-mode="tree">Tree</button>
+          <button id="mode-map" type="button" role="radio" aria-checked="false" data-mode="map">Map</button>
+          <button id="mode-split" type="button" role="radio" aria-checked="true" data-mode="split">Both</button>
+        </div>
         <div class="toolbar-group">
           <button id="zoom-out" type="button" aria-label="Zoom out">−</button>
           <output id="zoom-value" aria-live="polite">100%</output>
@@ -24,13 +29,25 @@
         </div>
         <div id="sync-status" class="sync-status" role="status">Refreshing</div>
       </header>
-      <section id="stage" class="stage" aria-label="Context Map canvas">
-        <svg id="canvas" role="img" aria-label="Handoff Context Map">
-          <g id="viewport">
-            <g id="links"></g>
-            <g id="nodes"></g>
-          </g>
-        </svg>
+      <section id="stage" class="stage" data-mode="split">
+        <div id="tree-pane" class="tree-pane">
+          <div id="tree-root" class="tree-root" role="tree" aria-label="Context Map tree"></div>
+        </div>
+        <section id="map-pane" class="map-pane" aria-label="Context Map canvas">
+          <svg id="canvas" role="img" aria-label="Handoff Context Map">
+            <g id="viewport">
+              <g id="links"></g>
+              <g id="nodes"></g>
+            </g>
+          </svg>
+        </section>
+        <aside id="details-drawer" class="details-drawer" aria-labelledby="details-title" hidden>
+          <button id="details-close" type="button" aria-label="Close node details">×</button>
+          <h2 id="details-title" tabindex="-1">Node details</h2>
+          <div id="details-path" class="details-path"></div>
+          <p id="details-text" class="details-text"></p>
+          <dl id="details-meta" class="details-meta"></dl>
+        </aside>
         <div id="empty-state" class="empty-state" hidden></div>
       </section>
     </main>

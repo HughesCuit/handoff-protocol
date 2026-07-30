@@ -4,6 +4,7 @@ import {
   createViewState,
   fitTreeTransform,
   focusNodeTransform,
+  indexTree,
   layoutTree,
   requestPictureInPicture,
   transitionSnapshotViewState,
@@ -21,6 +22,9 @@ const canvas = document.getElementById("canvas");
 const viewport = document.getElementById("viewport");
 const linksLayer = document.getElementById("links");
 const nodesLayer = document.getElementById("nodes");
+const treePane = document.getElementById("tree-pane");
+const treeRoot = document.getElementById("tree-root");
+const mapPane = document.getElementById("map-pane");
 const searchInput = document.getElementById("search");
 const statusElement = document.getElementById("sync-status");
 const emptyState = document.getElementById("empty-state");
@@ -56,17 +60,68 @@ function svgElement(name, attributes = {}) {
   return element;
 }
 
-function fullNodeMap(root) {
-  const map = new Map();
-  const visit = (node) => {
-    map.set(node.id, node);
-    for (const child of node.children ?? []) visit(child);
-  };
-  visit(root);
-  return map;
+function toggleFold(nodeId) {
+  const folded = new Set(viewState.folded);
+  if (folded.has(nodeId)) folded.delete(nodeId);
+  else folded.add(nodeId);
+  viewState = { ...viewState, folded };
+  renderAllViews();
 }
 
-function renderTree(focusFirstMatch = false) {
+function selectNode(nodeId) {
+  if (!viewState.tree?.root) return;
+  if (!indexTree(viewState.tree.root).has(nodeId)) return;
+  viewState = { ...viewState, selectedNodeId: nodeId };
+  renderAllViews();
+}
+
+function renderNavigationTree() {
+  treeRoot.replaceChildren();
+  if (!viewState.tree?.root) return;
+  const visible = buildVisibleTree(
+    viewState.tree.root,
+    viewState.folded,
+    viewState.query,
+  );
+  const authoritative = indexTree(viewState.tree.root);
+
+  const renderNode = (node, level) => {
+    const row = document.createElement("div");
+    row.className = "tree-item";
+    row.setAttribute("role", "treeitem");
+    row.setAttribute("aria-level", String(level));
+    row.setAttribute("aria-selected", String(viewState.selectedNodeId === node.id));
+    row.style.setProperty("--tree-depth", String(level - 1));
+    const hasChildren = (authoritative.get(node.id)?.node.children?.length ?? 0) > 0;
+    if (hasChildren) {
+      row.setAttribute("aria-expanded", String(!viewState.folded.has(node.id)));
+    }
+    const disclosure = document.createElement("button");
+    disclosure.type = "button";
+    disclosure.className = "tree-disclosure";
+    disclosure.textContent = hasChildren
+      ? (viewState.folded.has(node.id) ? "+" : "−")
+      : "";
+    disclosure.disabled = !hasChildren;
+    disclosure.setAttribute(
+      "aria-label",
+      `${viewState.folded.has(node.id) ? "Expand" : "Collapse"} ${node.text}`,
+    );
+    disclosure.addEventListener("click", () => toggleFold(node.id));
+
+    const label = document.createElement("button");
+    label.type = "button";
+    label.className = "tree-label";
+    label.textContent = `${iconFor(node)}${node.text}`;
+    label.addEventListener("click", () => selectNode(node.id));
+    row.append(disclosure, label);
+    treeRoot.append(row);
+    for (const child of node.children ?? []) renderNode(child, level + 1);
+  };
+  renderNode(visible.root, 1);
+}
+
+function renderMap(focusFirstMatch = false) {
   if (!viewState.tree?.root) return;
   const visible = buildVisibleTree(
     viewState.tree.root,
@@ -75,7 +130,7 @@ function renderTree(focusFirstMatch = false) {
   );
   const layout = layoutTree(visible.root);
   const positions = new Map(layout.nodes.map((node) => [node.id, node]));
-  const authoritative = fullNodeMap(viewState.tree.root);
+  const authoritative = indexTree(viewState.tree.root);
   linksLayer.replaceChildren();
   nodesLayer.replaceChildren();
 
@@ -100,6 +155,7 @@ function renderTree(focusFirstMatch = false) {
     if (node.taskState === "done") classes.push("done");
     if (node.risk === "high") classes.push("risk-high");
     if (node.excluded) classes.push("excluded");
+    if (viewState.selectedNodeId === node.id) classes.push("selected");
     if (viewState.query && visible.matches.has(node.id)) classes.push("match");
     if (
       viewState.query &&
@@ -125,7 +181,7 @@ function renderTree(focusFirstMatch = false) {
     text.textContent = `${iconFor(node)}${truncate(node.text)}`;
     group.append(text);
 
-    const hasChildren = (authoritative.get(node.id)?.children?.length ?? 0) > 0;
+    const hasChildren = (authoritative.get(node.id)?.node.children?.length ?? 0) > 0;
     if (hasChildren) {
       const badge = svgElement("circle", {
         class: "fold-badge",
@@ -141,18 +197,11 @@ function renderTree(focusFirstMatch = false) {
       });
       badgeText.textContent = viewState.folded.has(node.id) ? "+" : "−";
       group.append(badge, badgeText);
-      const toggle = () => {
-        const next = new Set(viewState.folded);
-        if (next.has(node.id)) next.delete(node.id);
-        else next.add(node.id);
-        viewState = { ...viewState, folded: next };
-        renderTree();
-      };
-      group.addEventListener("click", toggle);
+      group.addEventListener("click", () => toggleFold(node.id));
       group.addEventListener("keydown", (event) => {
         if (event.key === "Enter" || event.key === " ") {
           event.preventDefault();
-          toggle();
+          toggleFold(node.id);
         }
       });
     }
@@ -160,7 +209,7 @@ function renderTree(focusFirstMatch = false) {
   }
   canvas.setAttribute(
     "viewBox",
-    `0 0 ${Math.max(stage.clientWidth, 320)} ${Math.max(stage.clientHeight, 240)}`,
+    `0 0 ${Math.max(mapPane.clientWidth, 320)} ${Math.max(mapPane.clientHeight, 240)}`,
   );
   if (focusFirstMatch && visible.matches.size > 0) {
     viewState = {
@@ -168,12 +217,36 @@ function renderTree(focusFirstMatch = false) {
       transform: focusNodeTransform(
         layout,
         visible.matches.values().next().value,
-        { width: stage.clientWidth, height: stage.clientHeight },
+        { width: mapPane.clientWidth, height: mapPane.clientHeight },
         viewState.transform,
       ),
     };
   }
   setTransform();
+}
+
+function renderDisplayMode() {
+  const mode = viewState.displayMode;
+  stage.dataset.mode = mode;
+  for (const button of document.querySelectorAll("[data-mode]")) {
+    button.setAttribute("aria-checked", String(button.dataset.mode === mode));
+  }
+}
+
+function renderAllViews({ focusFirstMatch = false } = {}) {
+  renderNavigationTree();
+  renderMap(focusFirstMatch);
+  renderDisplayMode();
+}
+
+function setDisplayMode(mode) {
+  if (!["tree", "map", "split"].includes(mode)) return;
+  viewState = { ...viewState, displayMode: mode };
+  stage.dataset.mode = mode;
+  for (const button of document.querySelectorAll("[data-mode]")) {
+    button.setAttribute("aria-checked", String(button.dataset.mode === mode));
+  }
+  renderAllViews();
 }
 
 function setStatus(status) {
@@ -222,10 +295,13 @@ function applySnapshot(next) {
   if (viewState.tree?.root) {
     emptyState.hidden = true;
     canvas.hidden = false;
-    renderTree();
+    treePane.hidden = false;
+    renderAllViews();
     return;
   }
   canvas.hidden = true;
+  treePane.hidden = true;
+  treeRoot.replaceChildren();
   emptyState.hidden = false;
   emptyState.textContent = emptyMessage(next.status);
 }
@@ -233,6 +309,8 @@ function applySnapshot(next) {
 function showTerminalEmptyState(message) {
   viewState = { ...viewState, tree: null };
   canvas.hidden = true;
+  treePane.hidden = true;
+  treeRoot.replaceChildren();
   emptyState.hidden = false;
   emptyState.textContent = message;
   setStatus("expired");
@@ -291,14 +369,17 @@ function fitView() {
 
 searchInput.addEventListener("input", () => {
   viewState = { ...viewState, query: searchInput.value };
-  renderTree(Boolean(viewState.query.trim()));
+  renderAllViews({ focusFirstMatch: Boolean(viewState.query.trim()) });
 });
+for (const button of document.querySelectorAll("[data-mode]")) {
+  button.addEventListener("click", () => setDisplayMode(button.dataset.mode));
+}
 document.getElementById("zoom-in").addEventListener("click", () => zoomAt(1.2));
 document.getElementById("zoom-out").addEventListener("click", () => zoomAt(1 / 1.2));
 document.getElementById("fit").addEventListener("click", fitView);
 document.getElementById("expand").addEventListener("click", () => {
   viewState = { ...viewState, folded: new Set() };
-  renderTree();
+  renderAllViews();
 });
 document.getElementById("collapse").addEventListener("click", () => {
   if (!viewState.tree?.root) return;
@@ -306,7 +387,7 @@ document.getElementById("collapse").addEventListener("click", () => {
     ...viewState,
     folded: collapseAll(viewState.tree.root),
   };
-  renderTree();
+  renderAllViews();
 });
 
 canvas.addEventListener("wheel", (event) => {
@@ -348,7 +429,7 @@ document.addEventListener("visibilitychange", () => {
   lifecycle.visibilityChanged(document.hidden);
 });
 
-window.addEventListener("resize", () => setTransform());
+window.addEventListener("resize", () => renderMap());
 window.addEventListener("pagehide", () => {
   lifecycle.dispose();
   transport.dispose();
