@@ -1,25 +1,20 @@
 import {
   buildVisibleTree,
-  bindingChanged,
   collapseAll,
+  createViewState,
   fitTreeTransform,
   focusNodeTransform,
-  initialOverviewFolds,
   layoutTree,
-  needsOverviewInitialization,
-  reconcileFoldState,
   requestPictureInPicture,
+  transitionSnapshotViewState,
 } from "./model.mjs";
 import { createPageLifecycle, createPageTransport } from "./transports.mjs";
 
 let snapshot = null;
-let lastTree = null;
-let folded = new Set();
-let query = "";
-let transform = { x: 36, y: 36, scale: 1 };
+let viewState = createViewState();
 let dragging = null;
-let bindingId = null;
-let initializedBindingId = null;
+const INITIAL_OVERVIEW_BUILD_MARKER =
+  "initial-overview:sync-gated-transition:v2";
 
 const stage = document.getElementById("stage");
 const canvas = document.getElementById("canvas");
@@ -35,9 +30,9 @@ const SVG_NS = "http://www.w3.org/2000/svg";
 function setTransform() {
   viewport.setAttribute(
     "transform",
-    `translate(${transform.x} ${transform.y}) scale(${transform.scale})`,
+    `translate(${viewState.transform.x} ${viewState.transform.y}) scale(${viewState.transform.scale})`,
   );
-  zoomValue.textContent = `${Math.round(transform.scale * 100)}%`;
+  zoomValue.textContent = `${Math.round(viewState.transform.scale * 100)}%`;
 }
 
 function iconFor(node) {
@@ -72,11 +67,15 @@ function fullNodeMap(root) {
 }
 
 function renderTree(focusFirstMatch = false) {
-  if (!lastTree?.root) return;
-  const visible = buildVisibleTree(lastTree.root, folded, query);
+  if (!viewState.tree?.root) return;
+  const visible = buildVisibleTree(
+    viewState.tree.root,
+    viewState.folded,
+    viewState.query,
+  );
   const layout = layoutTree(visible.root);
   const positions = new Map(layout.nodes.map((node) => [node.id, node]));
-  const authoritative = fullNodeMap(lastTree.root);
+  const authoritative = fullNodeMap(viewState.tree.root);
   linksLayer.replaceChildren();
   nodesLayer.replaceChildren();
 
@@ -101,8 +100,12 @@ function renderTree(focusFirstMatch = false) {
     if (node.taskState === "done") classes.push("done");
     if (node.risk === "high") classes.push("risk-high");
     if (node.excluded) classes.push("excluded");
-    if (query && visible.matches.has(node.id)) classes.push("match");
-    if (query && !visible.matches.has(node.id) && !visible.ancestors.has(node.id)) {
+    if (viewState.query && visible.matches.has(node.id)) classes.push("match");
+    if (
+      viewState.query &&
+      !visible.matches.has(node.id) &&
+      !visible.ancestors.has(node.id)
+    ) {
       classes.push("dim");
     }
 
@@ -136,13 +139,13 @@ function renderTree(focusFirstMatch = false) {
         y: node.height / 2 + 3.5,
         "text-anchor": "middle",
       });
-      badgeText.textContent = folded.has(node.id) ? "+" : "−";
+      badgeText.textContent = viewState.folded.has(node.id) ? "+" : "−";
       group.append(badge, badgeText);
       const toggle = () => {
-        const next = new Set(folded);
+        const next = new Set(viewState.folded);
         if (next.has(node.id)) next.delete(node.id);
         else next.add(node.id);
-        folded = next;
+        viewState = { ...viewState, folded: next };
         renderTree();
       };
       group.addEventListener("click", toggle);
@@ -160,12 +163,15 @@ function renderTree(focusFirstMatch = false) {
     `0 0 ${Math.max(stage.clientWidth, 320)} ${Math.max(stage.clientHeight, 240)}`,
   );
   if (focusFirstMatch && visible.matches.size > 0) {
-    transform = focusNodeTransform(
-      layout,
-      visible.matches.values().next().value,
-      { width: stage.clientWidth, height: stage.clientHeight },
-      transform,
-    );
+    viewState = {
+      ...viewState,
+      transform: focusNodeTransform(
+        layout,
+        visible.matches.values().next().value,
+        { width: stage.clientWidth, height: stage.clientHeight },
+        viewState.transform,
+      ),
+    };
   }
   setTransform();
 }
@@ -205,36 +211,15 @@ function emptyMessage(status) {
 
 function applySnapshot(next) {
   if (!next || typeof next !== "object") return;
-  const nextBindingId = next.bindingId ?? bindingId;
-  if (bindingChanged(bindingId, nextBindingId)) {
-    lastTree = null;
-    folded = new Set();
-    query = "";
-    searchInput.value = "";
-  }
-  bindingId = nextBindingId;
   snapshot = next;
   setStatus(next.status);
-  if (next.tree?.root) {
-    const initializeOverview = needsOverviewInitialization(
-      initializedBindingId,
-      bindingId,
-      next.tree.root,
-    );
-    folded = initializeOverview
-      ? initialOverviewFolds(next.tree.root)
-      : reconcileFoldState(folded, next.tree.root);
-    lastTree = next.tree;
-    emptyState.hidden = true;
-    canvas.hidden = false;
-    renderTree();
-    if (initializeOverview) {
-      initializedBindingId = bindingId;
-      fitView();
-    }
-    return;
-  }
-  if (lastTree?.root) {
+  viewState = transitionSnapshotViewState(
+    viewState,
+    next,
+    { width: stage.clientWidth, height: stage.clientHeight },
+  );
+  searchInput.value = viewState.query;
+  if (viewState.tree?.root) {
     emptyState.hidden = true;
     canvas.hidden = false;
     renderTree();
@@ -246,7 +231,7 @@ function applySnapshot(next) {
 }
 
 function showTerminalEmptyState(message) {
-  lastTree = null;
+  viewState = { ...viewState, tree: null };
   canvas.hidden = true;
   emptyState.hidden = false;
   emptyState.textContent = message;
@@ -274,41 +259,53 @@ lifecycle = createPageLifecycle({
 });
 
 function zoomAt(factor, centerX = stage.clientWidth / 2, centerY = stage.clientHeight / 2) {
-  const nextScale = Math.max(0.35, Math.min(2.5, transform.scale * factor));
-  const ratio = nextScale / transform.scale;
-  transform = {
-    x: centerX - (centerX - transform.x) * ratio,
-    y: centerY - (centerY - transform.y) * ratio,
-    scale: nextScale,
+  const nextScale = Math.max(
+    0.35,
+    Math.min(2.5, viewState.transform.scale * factor),
+  );
+  const ratio = nextScale / viewState.transform.scale;
+  viewState = {
+    ...viewState,
+    transform: {
+      x: centerX - (centerX - viewState.transform.x) * ratio,
+      y: centerY - (centerY - viewState.transform.y) * ratio,
+      scale: nextScale,
+    },
   };
   setTransform();
 }
 
 function fitView() {
-  if (!lastTree?.root) return;
-  transform = fitTreeTransform(
-    lastTree.root,
-    folded,
-    query,
-    { width: stage.clientWidth, height: stage.clientHeight },
-  );
+  if (!viewState.tree?.root) return;
+  viewState = {
+    ...viewState,
+    transform: fitTreeTransform(
+      viewState.tree.root,
+      viewState.folded,
+      viewState.query,
+      { width: stage.clientWidth, height: stage.clientHeight },
+    ),
+  };
   setTransform();
 }
 
 searchInput.addEventListener("input", () => {
-  query = searchInput.value;
-  renderTree(Boolean(query.trim()));
+  viewState = { ...viewState, query: searchInput.value };
+  renderTree(Boolean(viewState.query.trim()));
 });
 document.getElementById("zoom-in").addEventListener("click", () => zoomAt(1.2));
 document.getElementById("zoom-out").addEventListener("click", () => zoomAt(1 / 1.2));
 document.getElementById("fit").addEventListener("click", fitView);
 document.getElementById("expand").addEventListener("click", () => {
-  folded = new Set();
+  viewState = { ...viewState, folded: new Set() };
   renderTree();
 });
 document.getElementById("collapse").addEventListener("click", () => {
-  if (!lastTree?.root) return;
-  folded = collapseAll(lastTree.root);
+  if (!viewState.tree?.root) return;
+  viewState = {
+    ...viewState,
+    folded: collapseAll(viewState.tree.root),
+  };
   renderTree();
 });
 
@@ -329,8 +326,14 @@ canvas.addEventListener("pointerdown", (event) => {
 });
 canvas.addEventListener("pointermove", (event) => {
   if (!dragging || dragging.pointerId !== event.pointerId) return;
-  transform.x += event.clientX - dragging.x;
-  transform.y += event.clientY - dragging.y;
+  viewState = {
+    ...viewState,
+    transform: {
+      ...viewState.transform,
+      x: viewState.transform.x + event.clientX - dragging.x,
+      y: viewState.transform.y + event.clientY - dragging.y,
+    },
+  };
   dragging = { ...dragging, x: event.clientX, y: event.clientY };
   setTransform();
 });
@@ -350,6 +353,8 @@ window.addEventListener("pagehide", () => {
   lifecycle.dispose();
   transport.dispose();
 }, { once: true });
+document.documentElement.dataset.initialOverviewBehavior =
+  INITIAL_OVERVIEW_BUILD_MARKER;
 setTransform();
 if (document.querySelector('meta[name="context-map-viewer-transport"]')?.content === "mcp") {
   requestPictureInPicture(window.openai);

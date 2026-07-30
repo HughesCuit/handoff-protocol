@@ -68,11 +68,11 @@ test("initial overview folds only top-level sections with children", () => {
   assert.deepEqual(visible.root.children[0].children, []);
 });
 
-test("overview initialization waits for a valid tree and runs once per binding", () => {
-  assert.equal(needsOverviewInitialization(null, "a", null), false);
-  assert.equal(needsOverviewInitialization(null, "a", TREE), true);
-  assert.equal(needsOverviewInitialization("a", "a", TREE), false);
-  assert.equal(needsOverviewInitialization("a", "b", TREE), true);
+test("overview initialization requires a pending synced tree", () => {
+  assert.equal(needsOverviewInitialization(true, "a", "missing", TREE), false);
+  assert.equal(needsOverviewInitialization(true, "a", "synced", null), false);
+  assert.equal(needsOverviewInitialization(true, "a", "synced", TREE), true);
+  assert.equal(needsOverviewInitialization(false, "a", "synced", TREE), false);
 });
 
 test("fitted overview transform contains the folded tree in the viewport", () => {

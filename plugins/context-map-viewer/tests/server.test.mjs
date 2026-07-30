@@ -60,11 +60,18 @@ test("skill prefers the side browser and retains inline fallback", async () => {
 });
 
 test("build emits a self-contained MCP Apps widget", async () => {
-  const [widgetHtml, standaloneHtml, standaloneApp, appSource] = await Promise.all([
+  const [
+    widgetHtml,
+    standaloneHtml,
+    standaloneApp,
+    standaloneModel,
+    modelSource,
+  ] = await Promise.all([
     readFile(new URL("dist/widget.html", pluginRoot), "utf8"),
     readFile(new URL("dist/standalone/index.html", pluginRoot), "utf8"),
     readFile(new URL("dist/standalone/app.mjs", pluginRoot), "utf8"),
-    readFile(new URL("web/app.mjs", pluginRoot), "utf8"),
+    readFile(new URL("dist/standalone/model.mjs", pluginRoot), "utf8"),
+    readFile(new URL("web/model.mjs", pluginRoot), "utf8"),
   ]);
 
   assert.match(widgetHtml, /ui\/notifications\/tool-result/);
@@ -76,9 +83,9 @@ test("build emits a self-contained MCP Apps widget", async () => {
   assert.match(standaloneHtml, /src="\.\/app\.mjs"/);
   assert.match(standaloneApp, /api\/context-map/);
   assert.doesNotMatch(standaloneApp, /tools\/call/);
-  assert.match(appSource, /initialOverviewFolds/);
-  assert.match(appSource, /needsOverviewInitialization/);
-  assert.match(appSource, /fitTreeTransform/);
+  assert.match(widgetHtml, /initial-overview:sync-gated-transition:v2/);
+  assert.match(standaloneApp, /initial-overview:sync-gated-transition:v2/);
+  assert.equal(standaloneModel, modelSource);
 });
 
 test("registers explicit workspace binding and opaque refresh inputs", () => {

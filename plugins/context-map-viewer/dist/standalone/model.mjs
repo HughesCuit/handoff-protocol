@@ -27,14 +27,16 @@ export function initialOverviewFolds(root) {
 }
 
 export function needsOverviewInitialization(
-  initializedBindingId,
-  nextBindingId,
+  overviewPending,
+  bindingId,
+  status,
   root,
 ) {
   return Boolean(
+    overviewPending &&
     root &&
-    nextBindingId &&
-    initializedBindingId !== nextBindingId,
+    bindingId &&
+    status === "synced",
   );
 }
 
@@ -93,6 +95,57 @@ export function fitTreeTransform(root, folded, query, stage) {
         availableHeight / layout.height,
       ),
     ),
+  };
+}
+
+export function createViewState() {
+  return {
+    bindingId: null,
+    tree: null,
+    folded: new Set(),
+    query: "",
+    transform: { x: 36, y: 36, scale: 1 },
+    overviewPending: true,
+  };
+}
+
+export function transitionSnapshotViewState(previous, next, stage) {
+  if (!next || typeof next !== "object") return previous;
+  const nextBindingId = next.bindingId ?? previous.bindingId;
+  const scoped = bindingChanged(previous.bindingId, nextBindingId)
+    ? {
+        ...previous,
+        bindingId: nextBindingId,
+        tree: null,
+        folded: new Set(),
+        query: "",
+        overviewPending: true,
+      }
+    : { ...previous, bindingId: nextBindingId };
+  const root = next.tree?.root;
+  if (!root) return scoped;
+
+  if (needsOverviewInitialization(
+    scoped.overviewPending,
+    nextBindingId,
+    next.status,
+    root,
+  )) {
+    const folded = initialOverviewFolds(root);
+    return {
+      ...scoped,
+      tree: next.tree,
+      folded,
+      transform: fitTreeTransform(root, folded, scoped.query, stage),
+      overviewPending: false,
+    };
+  }
+
+  if (next.status !== "synced" && scoped.tree?.root) return scoped;
+  return {
+    ...scoped,
+    tree: next.tree,
+    folded: reconcileFoldState(scoped.folded, root),
   };
 }
 
