@@ -236,6 +236,7 @@ function renderNavigationTree() {
     }
     const disclosure = document.createElement("button");
     disclosure.type = "button";
+    disclosure.tabIndex = -1;
     disclosure.className = "tree-disclosure";
     disclosure.textContent = hasChildren
       ? (viewState.folded.has(node.id) ? "+" : "−")
@@ -245,7 +246,10 @@ function renderNavigationTree() {
       "aria-label",
       `${viewState.folded.has(node.id) ? "Expand" : "Collapse"} ${node.text}`,
     );
-    disclosure.addEventListener("click", () => toggleFold(node.id));
+    disclosure.addEventListener("click", () => {
+      toggleFold(node.id);
+      focusTreeItem(node.id);
+    });
 
     const label = document.createElement("button");
     label.type = "button";
@@ -512,8 +516,10 @@ function applySnapshot(next) {
     next,
     mapViewport(),
   );
+  const bindingChanged = previousBindingId !== viewState.bindingId;
+  if (bindingChanged) treeFocusId = null;
   if (
-    previousBindingId !== viewState.bindingId ||
+    bindingChanged ||
     (previousSelectedNodeId && previousSelectedNodeId !== viewState.selectedNodeId)
   ) {
     detailsReturnFocus = null;

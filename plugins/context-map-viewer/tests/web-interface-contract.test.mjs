@@ -94,6 +94,19 @@ test("tree supports roving keyboard focus and details restore focus", async () =
   assert.match(app, /returnFocus\?\.isConnected/);
 });
 
+test("tree focus resets across bindings and keeps disclosures out of the tab sequence", async () => {
+  const app = await source("web/app.mjs");
+  assert.match(
+    app,
+    /previousBindingId !== viewState\.bindingId[\s\S]*treeFocusId = null/,
+  );
+  assert.match(app, /disclosure\.tabIndex = -1/);
+  assert.match(
+    app,
+    /toggleFold\(node\.id\);\s*focusTreeItem\(node\.id\);/,
+  );
+});
+
 test("details styling is an overlay and compact mode becomes full width", async () => {
   const css = await source("web/styles.css");
   assert.match(css, /\.details-drawer\s*\{[^}]*position:\s*absolute/s);
