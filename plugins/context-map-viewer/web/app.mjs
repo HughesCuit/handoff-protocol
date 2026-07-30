@@ -80,13 +80,25 @@ function toggleFold(nodeId) {
   renderAllViews();
 }
 
-function selectNode(nodeId, source) {
+function selectNode(
+  nodeId,
+  source,
+  returnFocus = document.activeElement,
+) {
   if (!viewState.tree?.root) return;
   const index = indexTree(viewState.tree.root);
   const selected = index.get(nodeId);
   if (!selected) return;
-  const returnFocus = arguments[2] ?? document.activeElement;
   const wasDetailOpen = viewState.detailOpen;
+  const returnSource = returnFocus?.classList?.contains("node-body")
+    ? "map"
+    : returnFocus?.classList?.contains("tree-label")
+      ? "tree"
+      : source;
+  detailsReturnFocus = {
+    source: returnSource,
+    nodeId,
+  };
   viewState = {
     ...viewState,
     selectedNodeId: nodeId,
@@ -95,12 +107,6 @@ function selectNode(nodeId, source) {
   };
   renderAllViews();
 
-  const renderedActions = document.querySelectorAll(
-    source === "map" ? ".node-body" : ".tree-label",
-  );
-  detailsReturnFocus = [...renderedActions].find(
-    (element) => element.dataset.nodeId === nodeId,
-  ) ?? returnFocus;
   if (!wasDetailOpen && viewState.detailOpen) detailsTitle.focus();
 
   if (viewState.displayMode !== "tree") {
@@ -121,6 +127,20 @@ function selectNode(nodeId, source) {
     };
     setTransform();
   }
+}
+
+function resolveDetailsReturnFocus() {
+  if (!detailsReturnFocus) return null;
+  const selectors = detailsReturnFocus.source === "map"
+    ? [".node-body", ".tree-label"]
+    : [".tree-label", ".node-body"];
+  for (const selector of selectors) {
+    const current = [...document.querySelectorAll(selector)].find(
+      (element) => element.dataset.nodeId === detailsReturnFocus.nodeId,
+    );
+    if (current) return current;
+  }
+  return null;
 }
 
 function renderDetails() {
@@ -154,7 +174,8 @@ function renderDetails() {
 function closeDetails() {
   viewState = { ...viewState, detailOpen: false };
   renderDetails();
-  if (detailsReturnFocus?.isConnected) detailsReturnFocus.focus();
+  const returnFocus = resolveDetailsReturnFocus();
+  if (returnFocus?.isConnected) returnFocus.focus();
   detailsReturnFocus = null;
 }
 

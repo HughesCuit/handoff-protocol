@@ -56,13 +56,31 @@ test("responsive toolbar styles wrap controls within narrow viewports", async ()
 
 test("selection expands ancestors, focuses the map, and details render authoritative text", async () => {
   const app = await source("web/app.mjs");
-  assert.match(app, /function selectNode\(nodeId, source\)/);
+  assert.match(
+    app,
+    /function selectNode\(\s*nodeId,\s*source,\s*returnFocus = document\.activeElement,?\s*\)/,
+  );
   assert.match(app, /expandAncestors\(viewState\.folded, nodeId,/);
   assert.match(app, /focusNodeTransform\(/);
   assert.match(app, /function renderDetails\(\)/);
   assert.match(app, /detailsText\.textContent = selected\.node\.text/);
   assert.match(app, /class: "node-disclosure"/);
   assert.match(app, /class: "node-body"/);
+});
+
+test("details focus return resolves a stable node descriptor after rerenders", async () => {
+  const app = await source("web/app.mjs");
+  assert.match(
+    app,
+    /detailsReturnFocus = \{\s*source: returnSource,\s*nodeId,\s*\}/s,
+  );
+  assert.match(app, /function resolveDetailsReturnFocus\(\)/);
+  assert.match(
+    app,
+    /element\.dataset\.nodeId === detailsReturnFocus\.nodeId/,
+  );
+  assert.match(app, /const returnFocus = resolveDetailsReturnFocus\(\)/);
+  assert.doesNotMatch(app, /detailsReturnFocus\?\.[\s\S]*isConnected/);
 });
 
 test("details styling is an overlay and compact mode becomes full width", async () => {
