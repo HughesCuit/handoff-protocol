@@ -27,6 +27,7 @@ body {
 .toolbar {
   z-index: 2;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   min-width: 0;
@@ -61,12 +62,14 @@ body {
 .toolbar-group {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 3px;
 }
 
 .view-modes {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 3px;
 }
 
@@ -301,6 +304,10 @@ button:focus-visible {
 
 .empty-state[hidden] {
   display: none;
+}
+
+@media (max-width: 559px) {
+  .search { flex-basis: 100%; }
 }
 
 @media (max-width: 559px) and (min-width: 420px) {

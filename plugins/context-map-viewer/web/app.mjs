@@ -31,6 +31,14 @@ const emptyState = document.getElementById("empty-state");
 const zoomValue = document.getElementById("zoom-value");
 const SVG_NS = "http://www.w3.org/2000/svg";
 
+function mapViewport() {
+  return { width: mapPane.clientWidth, height: mapPane.clientHeight };
+}
+
+function mapIsVisible() {
+  return viewState.displayMode !== "tree";
+}
+
 function setTransform() {
   viewport.setAttribute(
     "transform",
@@ -123,6 +131,7 @@ function renderNavigationTree() {
 
 function renderMap(focusFirstMatch = false) {
   if (!viewState.tree?.root) return;
+  const mapSize = mapViewport();
   const visible = buildVisibleTree(
     viewState.tree.root,
     viewState.folded,
@@ -209,7 +218,7 @@ function renderMap(focusFirstMatch = false) {
   }
   canvas.setAttribute(
     "viewBox",
-    `0 0 ${Math.max(mapPane.clientWidth, 320)} ${Math.max(mapPane.clientHeight, 240)}`,
+    `0 0 ${Math.max(mapSize.width, 320)} ${Math.max(mapSize.height, 240)}`,
   );
   if (focusFirstMatch && visible.matches.size > 0) {
     viewState = {
@@ -217,7 +226,7 @@ function renderMap(focusFirstMatch = false) {
       transform: focusNodeTransform(
         layout,
         visible.matches.values().next().value,
-        { width: mapPane.clientWidth, height: mapPane.clientHeight },
+        mapSize,
         viewState.transform,
       ),
     };
@@ -225,8 +234,7 @@ function renderMap(focusFirstMatch = false) {
   setTransform();
 }
 
-function renderDisplayMode() {
-  const mode = viewState.displayMode;
+function renderDisplayMode(mode = viewState.displayMode) {
   stage.dataset.mode = mode;
   for (const button of document.querySelectorAll("[data-mode]")) {
     button.setAttribute("aria-checked", String(button.dataset.mode === mode));
@@ -234,18 +242,14 @@ function renderDisplayMode() {
 }
 
 function renderAllViews({ focusFirstMatch = false } = {}) {
-  renderNavigationTree();
-  renderMap(focusFirstMatch);
   renderDisplayMode();
+  renderNavigationTree();
+  if (mapIsVisible()) renderMap(focusFirstMatch);
 }
 
 function setDisplayMode(mode) {
   if (!["tree", "map", "split"].includes(mode)) return;
   viewState = { ...viewState, displayMode: mode };
-  stage.dataset.mode = mode;
-  for (const button of document.querySelectorAll("[data-mode]")) {
-    button.setAttribute("aria-checked", String(button.dataset.mode === mode));
-  }
   renderAllViews();
 }
 
@@ -286,12 +290,19 @@ function applySnapshot(next) {
   if (!next || typeof next !== "object") return;
   snapshot = next;
   setStatus(next.status);
+  const nextBindingId = next.bindingId ?? viewState.bindingId;
+  const nextDisplayMode =
+    viewState.bindingId !== null && viewState.bindingId !== nextBindingId
+      ? "split"
+      : viewState.displayMode;
+  renderDisplayMode(nextDisplayMode);
   viewState = transitionSnapshotViewState(
     viewState,
     next,
-    { width: stage.clientWidth, height: stage.clientHeight },
+    mapViewport(),
   );
   searchInput.value = viewState.query;
+  renderDisplayMode();
   if (viewState.tree?.root) {
     emptyState.hidden = true;
     canvas.hidden = false;
@@ -336,7 +347,8 @@ lifecycle = createPageLifecycle({
   clearInterval: window.clearInterval.bind(window),
 });
 
-function zoomAt(factor, centerX = stage.clientWidth / 2, centerY = stage.clientHeight / 2) {
+function zoomAt(factor, centerX = mapPane.clientWidth / 2, centerY = mapPane.clientHeight / 2) {
+  if (!mapIsVisible()) return;
   const nextScale = Math.max(
     0.35,
     Math.min(2.5, viewState.transform.scale * factor),
@@ -354,14 +366,14 @@ function zoomAt(factor, centerX = stage.clientWidth / 2, centerY = stage.clientH
 }
 
 function fitView() {
-  if (!viewState.tree?.root) return;
+  if (!viewState.tree?.root || !mapIsVisible()) return;
   viewState = {
     ...viewState,
     transform: fitTreeTransform(
       viewState.tree.root,
       viewState.folded,
       viewState.query,
-      { width: stage.clientWidth, height: stage.clientHeight },
+      mapViewport(),
     ),
   };
   setTransform();
@@ -392,7 +404,7 @@ document.getElementById("collapse").addEventListener("click", () => {
 
 canvas.addEventListener("wheel", (event) => {
   event.preventDefault();
-  const rect = stage.getBoundingClientRect();
+  const rect = mapPane.getBoundingClientRect();
   zoomAt(
     event.deltaY < 0 ? 1.1 : 1 / 1.1,
     event.clientX - rect.left,
@@ -429,7 +441,7 @@ document.addEventListener("visibilitychange", () => {
   lifecycle.visibilityChanged(document.hidden);
 });
 
-window.addEventListener("resize", () => renderMap());
+window.addEventListener("resize", () => renderAllViews());
 window.addEventListener("pagehide", () => {
   lifecycle.dispose();
   transport.dispose();
