@@ -178,8 +178,7 @@ button:focus-visible {
   white-space: nowrap;
 }
 
-.tree-item[aria-selected="true"],
-.map-node.selected rect {
+.tree-item[aria-selected="true"] {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
@@ -210,8 +209,12 @@ button:focus-visible {
 }
 
 .map-node {
-  cursor: pointer;
   transition: opacity 120ms ease;
+}
+
+.node-body,
+.node-disclosure {
+  cursor: pointer;
 }
 
 .map-node rect {
@@ -278,6 +281,11 @@ button:focus-visible {
   stroke-width: 3;
 }
 
+.map-node.selected rect {
+  stroke: var(--accent);
+  stroke-width: 3;
+}
+
 .map-node.dim {
   opacity: 0.22;
 }
@@ -290,6 +298,28 @@ button:focus-visible {
   fill: #fff !important;
   font-size: 10px !important;
   font-weight: 700;
+}
+
+.truncated-affordance {
+  fill: var(--accent);
+}
+
+.details-drawer {
+  position: absolute;
+  z-index: 4;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(360px, 72%);
+  overflow: auto;
+  padding: 18px;
+  border-left: 1px solid var(--border);
+  background: var(--panel);
+  box-shadow: -12px 0 28px rgb(0 0 0 / 14%);
+}
+
+.details-drawer[hidden] {
+  display: none;
 }
 
 .empty-state {
@@ -315,6 +345,11 @@ button:focus-visible {
 }
 
 @media (max-width: 419px) {
+  .details-drawer {
+    box-sizing: border-box;
+    width: 100%;
+  }
+
   .stage[data-mode="split"] {
     grid-template-columns: 1fr;
     grid-template-rows: 40% 60%;

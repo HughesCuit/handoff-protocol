@@ -2,12 +2,15 @@ import {
   buildVisibleTree,
   collapseAll,
   createViewState,
+  expandAncestors,
   fitTreeTransform,
   focusNodeTransform,
   indexTree,
+  isLabelTruncated,
   layoutTree,
   requestPictureInPicture,
   transitionSnapshotViewState,
+  truncateLabel,
 } from "./model.mjs";
 import { createPageLifecycle, createPageTransport } from "./transports.mjs";
 
@@ -29,6 +32,12 @@ const searchInput = document.getElementById("search");
 const statusElement = document.getElementById("sync-status");
 const emptyState = document.getElementById("empty-state");
 const zoomValue = document.getElementById("zoom-value");
+const detailsDrawer = document.getElementById("details-drawer");
+const detailsTitle = document.getElementById("details-title");
+const detailsPath = document.getElementById("details-path");
+const detailsText = document.getElementById("details-text");
+const detailsMeta = document.getElementById("details-meta");
+let detailsReturnFocus = null;
 const SVG_NS = "http://www.w3.org/2000/svg";
 
 function mapViewport() {
@@ -55,11 +64,6 @@ function iconFor(node) {
   return "";
 }
 
-function truncate(text, limit = 28) {
-  const value = String(text);
-  return value.length > limit ? `${value.slice(0, limit - 1)}…` : value;
-}
-
 function svgElement(name, attributes = {}) {
   const element = document.createElementNS(SVG_NS, name);
   for (const [key, value] of Object.entries(attributes)) {
@@ -76,11 +80,82 @@ function toggleFold(nodeId) {
   renderAllViews();
 }
 
-function selectNode(nodeId) {
+function selectNode(nodeId, source) {
   if (!viewState.tree?.root) return;
-  if (!indexTree(viewState.tree.root).has(nodeId)) return;
-  viewState = { ...viewState, selectedNodeId: nodeId };
+  const index = indexTree(viewState.tree.root);
+  const selected = index.get(nodeId);
+  if (!selected) return;
+  const returnFocus = arguments[2] ?? document.activeElement;
+  const wasDetailOpen = viewState.detailOpen;
+  viewState = {
+    ...viewState,
+    selectedNodeId: nodeId,
+    folded: expandAncestors(viewState.folded, nodeId, index),
+    detailOpen: source === "map" || isLabelTruncated(selected.node.text),
+  };
   renderAllViews();
+
+  const renderedActions = document.querySelectorAll(
+    source === "map" ? ".node-body" : ".tree-label",
+  );
+  detailsReturnFocus = [...renderedActions].find(
+    (element) => element.dataset.nodeId === nodeId,
+  ) ?? returnFocus;
+  if (!wasDetailOpen && viewState.detailOpen) detailsTitle.focus();
+
+  if (viewState.displayMode !== "tree") {
+    const visible = buildVisibleTree(
+      viewState.tree.root,
+      viewState.folded,
+      viewState.query,
+    );
+    const layout = layoutTree(visible.root);
+    viewState = {
+      ...viewState,
+      transform: focusNodeTransform(
+        layout,
+        nodeId,
+        mapViewport(),
+        viewState.transform,
+      ),
+    };
+    setTransform();
+  }
+}
+
+function renderDetails() {
+  const selected = viewState.tree?.root && viewState.selectedNodeId
+    ? indexTree(viewState.tree.root).get(viewState.selectedNodeId)
+    : null;
+  const open = Boolean(viewState.detailOpen && selected);
+  detailsDrawer.hidden = !open;
+  if (!open) return;
+
+  detailsText.textContent = selected.node.text;
+  detailsPath.textContent = [...selected.ancestors, selected.node]
+    .map((node) => node.text)
+    .join(" › ");
+  detailsMeta.replaceChildren();
+  for (const [label, value] of [
+    ["Section", selected.node.section],
+    ["Task", selected.node.taskState],
+    ["Risk", selected.node.risk],
+    ["Excluded", selected.node.excluded ? "Yes" : null],
+  ]) {
+    if (!value) continue;
+    const term = document.createElement("dt");
+    term.textContent = label;
+    const description = document.createElement("dd");
+    description.textContent = value;
+    detailsMeta.append(term, description);
+  }
+}
+
+function closeDetails() {
+  viewState = { ...viewState, detailOpen: false };
+  renderDetails();
+  if (detailsReturnFocus?.isConnected) detailsReturnFocus.focus();
+  detailsReturnFocus = null;
 }
 
 function renderNavigationTree() {
@@ -120,8 +195,9 @@ function renderNavigationTree() {
     const label = document.createElement("button");
     label.type = "button";
     label.className = "tree-label";
+    label.dataset.nodeId = node.id;
     label.textContent = `${iconFor(node)}${node.text}`;
-    label.addEventListener("click", () => selectNode(node.id));
+    label.addEventListener("click", () => selectNode(node.id, "tree", label));
     row.append(disclosure, label);
     treeRoot.append(row);
     for (const child of node.children ?? []) renderNode(child, level + 1);
@@ -177,21 +253,52 @@ function renderMap(focusFirstMatch = false) {
     const group = svgElement("g", {
       class: classes.join(" "),
       transform: `translate(${node.x} ${node.y})`,
+    });
+    const body = svgElement("g", {
+      class: "node-body",
       tabindex: 0,
       role: "button",
-      "aria-label": node.text,
+      "aria-label": `Open details for ${node.text}`,
+      "data-node-id": node.id,
     });
-    group.append(svgElement("rect", {
+    const rect = svgElement("rect", {
       width: node.width,
       height: node.height,
       rx: 9,
-    }));
+    });
     const text = svgElement("text", { x: 13, y: 26 });
-    text.textContent = `${iconFor(node)}${truncate(node.text)}`;
-    group.append(text);
+    text.textContent = `${iconFor(node)}${truncateLabel(node.text)}`;
+    body.append(rect, text);
+    if (isLabelTruncated(node.text)) {
+      const affordance = svgElement("text", {
+        class: "truncated-affordance",
+        x: node.width - 14,
+        y: 26,
+        "aria-hidden": "true",
+      });
+      affordance.textContent = "…";
+      body.append(affordance);
+    }
+    body.addEventListener("click", (event) => {
+      event.stopPropagation();
+      selectNode(node.id, "map", body);
+    });
+    body.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        selectNode(node.id, "map", body);
+      }
+    });
+    group.append(body);
 
     const hasChildren = (authoritative.get(node.id)?.node.children?.length ?? 0) > 0;
     if (hasChildren) {
+      const disclosure = svgElement("g", {
+        class: "node-disclosure",
+        role: "button",
+        tabindex: 0,
+        "aria-label": `${viewState.folded.has(node.id) ? "Expand" : "Collapse"} ${node.text}`,
+      });
       const badge = svgElement("circle", {
         class: "fold-badge",
         cx: node.width,
@@ -205,14 +312,18 @@ function renderMap(focusFirstMatch = false) {
         "text-anchor": "middle",
       });
       badgeText.textContent = viewState.folded.has(node.id) ? "+" : "−";
-      group.append(badge, badgeText);
-      group.addEventListener("click", () => toggleFold(node.id));
-      group.addEventListener("keydown", (event) => {
+      disclosure.append(badge, badgeText);
+      disclosure.addEventListener("click", (event) => {
+        event.stopPropagation();
+        toggleFold(node.id);
+      });
+      disclosure.addEventListener("keydown", (event) => {
         if (event.key === "Enter" || event.key === " ") {
           event.preventDefault();
           toggleFold(node.id);
         }
       });
+      group.append(disclosure);
     }
     nodesLayer.append(group);
   }
@@ -245,6 +356,7 @@ function renderAllViews({ focusFirstMatch = false } = {}) {
   renderDisplayMode();
   renderNavigationTree();
   if (mapIsVisible()) renderMap(focusFirstMatch);
+  renderDetails();
 }
 
 function setDisplayMode(mode) {
@@ -389,6 +501,7 @@ for (const button of document.querySelectorAll("[data-mode]")) {
 document.getElementById("zoom-in").addEventListener("click", () => zoomAt(1.2));
 document.getElementById("zoom-out").addEventListener("click", () => zoomAt(1 / 1.2));
 document.getElementById("fit").addEventListener("click", fitView);
+document.getElementById("details-close").addEventListener("click", closeDetails);
 document.getElementById("expand").addEventListener("click", () => {
   viewState = { ...viewState, folded: new Set() };
   renderAllViews();

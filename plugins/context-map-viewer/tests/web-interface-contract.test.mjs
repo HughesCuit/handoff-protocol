@@ -53,3 +53,21 @@ test("responsive toolbar styles wrap controls within narrow viewports", async ()
   assert.match(css, /\.toolbar\s*\{[\s\S]*flex-wrap: wrap/);
   assert.match(css, /@media \(max-width: 559px\)[\s\S]*\.search\s*\{[\s\S]*flex-basis: 100%/);
 });
+
+test("selection expands ancestors, focuses the map, and details render authoritative text", async () => {
+  const app = await source("web/app.mjs");
+  assert.match(app, /function selectNode\(nodeId, source\)/);
+  assert.match(app, /expandAncestors\(viewState\.folded, nodeId,/);
+  assert.match(app, /focusNodeTransform\(/);
+  assert.match(app, /function renderDetails\(\)/);
+  assert.match(app, /detailsText\.textContent = selected\.node\.text/);
+  assert.match(app, /class: "node-disclosure"/);
+  assert.match(app, /class: "node-body"/);
+});
+
+test("details styling is an overlay and compact mode becomes full width", async () => {
+  const css = await source("web/styles.css");
+  assert.match(css, /\.details-drawer\s*\{[^}]*position:\s*absolute/s);
+  assert.match(css, /\.details-drawer\s*\{[^}]*right:\s*0/s);
+  assert.match(css, /@media \(max-width: 419px\)[\s\S]*\.details-drawer[\s\S]*width:\s*100%/);
+});
