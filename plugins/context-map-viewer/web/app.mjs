@@ -2,8 +2,11 @@ import {
   buildVisibleTree,
   bindingChanged,
   collapseAll,
+  fitTreeTransform,
   focusNodeTransform,
+  initialOverviewFolds,
   layoutTree,
+  needsOverviewInitialization,
   reconcileFoldState,
   requestPictureInPicture,
 } from "./model.mjs";
@@ -16,6 +19,7 @@ let query = "";
 let transform = { x: 36, y: 36, scale: 1 };
 let dragging = null;
 let bindingId = null;
+let initializedBindingId = null;
 
 const stage = document.getElementById("stage");
 const canvas = document.getElementById("canvas");
@@ -201,21 +205,33 @@ function emptyMessage(status) {
 
 function applySnapshot(next) {
   if (!next || typeof next !== "object") return;
-  if (bindingChanged(bindingId, next.bindingId)) {
+  const nextBindingId = next.bindingId ?? bindingId;
+  if (bindingChanged(bindingId, nextBindingId)) {
     lastTree = null;
     folded = new Set();
     query = "";
     searchInput.value = "";
   }
-  bindingId = next.bindingId ?? bindingId;
+  bindingId = nextBindingId;
   snapshot = next;
   setStatus(next.status);
   if (next.tree?.root) {
-    folded = reconcileFoldState(folded, next.tree.root);
+    const initializeOverview = needsOverviewInitialization(
+      initializedBindingId,
+      bindingId,
+      next.tree.root,
+    );
+    folded = initializeOverview
+      ? initialOverviewFolds(next.tree.root)
+      : reconcileFoldState(folded, next.tree.root);
     lastTree = next.tree;
     emptyState.hidden = true;
     canvas.hidden = false;
     renderTree();
+    if (initializeOverview) {
+      initializedBindingId = bindingId;
+      fitView();
+    }
     return;
   }
   if (lastTree?.root) {
@@ -270,15 +286,12 @@ function zoomAt(factor, centerX = stage.clientWidth / 2, centerY = stage.clientH
 
 function fitView() {
   if (!lastTree?.root) return;
-  const visible = buildVisibleTree(lastTree.root, folded, query);
-  const layout = layoutTree(visible.root);
-  const availableWidth = Math.max(200, stage.clientWidth - 40);
-  const availableHeight = Math.max(160, stage.clientHeight - 40);
-  const scale = Math.max(
-    0.35,
-    Math.min(1.4, availableWidth / layout.width, availableHeight / layout.height),
+  transform = fitTreeTransform(
+    lastTree.root,
+    folded,
+    query,
+    { width: stage.clientWidth, height: stage.clientHeight },
   );
-  transform = { x: 20, y: 20, scale };
   setTransform();
 }
 

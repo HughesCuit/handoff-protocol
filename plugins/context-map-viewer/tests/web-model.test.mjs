@@ -5,9 +5,12 @@ import {
   buildVisibleTree,
   collapseAll,
   focusNodeTransform,
+  fitTreeTransform,
+  initialOverviewFolds,
   bindingChanged,
   layoutTree,
   matchSearch,
+  needsOverviewInitialization,
   reconcileFoldState,
   requestPictureInPicture,
 } from "../web/model.mjs";
@@ -43,6 +46,52 @@ test("folded descendants are excluded and collapse-all keeps sections visible", 
   const visible = buildVisibleTree(TREE, folded, "");
   assert.deepEqual(visible.root.children.map((node) => node.id), ["tasks", "risks"]);
   assert.deepEqual(visible.root.children[0].children, []);
+});
+
+test("initial overview folds only top-level sections with children", () => {
+  const root = structuredClone(TREE);
+  root.children.push({
+    id: "empty-section",
+    text: "Empty",
+    children: [],
+  });
+
+  assert.deepEqual(
+    [...initialOverviewFolds(root)],
+    ["tasks", "risks"],
+  );
+  const visible = buildVisibleTree(root, initialOverviewFolds(root), "");
+  assert.deepEqual(
+    visible.root.children.map((node) => node.id),
+    ["tasks", "risks", "empty-section"],
+  );
+  assert.deepEqual(visible.root.children[0].children, []);
+});
+
+test("overview initialization waits for a valid tree and runs once per binding", () => {
+  assert.equal(needsOverviewInitialization(null, "a", null), false);
+  assert.equal(needsOverviewInitialization(null, "a", TREE), true);
+  assert.equal(needsOverviewInitialization("a", "a", TREE), false);
+  assert.equal(needsOverviewInitialization("a", "b", TREE), true);
+});
+
+test("fitted overview transform contains the folded tree in the viewport", () => {
+  const folded = initialOverviewFolds(TREE);
+  const transform = fitTreeTransform(
+    TREE,
+    folded,
+    "",
+    { width: 800, height: 500 },
+  );
+  const visible = buildVisibleTree(TREE, folded, "");
+  const layout = layoutTree(visible.root);
+
+  assert.equal(transform.x, 20);
+  assert.equal(transform.y, 20);
+  assert(transform.scale >= 0.35);
+  assert(transform.scale <= 1.4);
+  assert(layout.width * transform.scale <= 760);
+  assert(layout.height * transform.scale <= 460);
 });
 
 test("search matches ancestor paths and temporarily reveals folded ancestors", () => {

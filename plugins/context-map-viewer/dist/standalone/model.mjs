@@ -18,6 +18,26 @@ export function collapseAll(root) {
   return new Set((root.children ?? []).map((node) => node.id));
 }
 
+export function initialOverviewFolds(root) {
+  return new Set(
+    (root?.children ?? [])
+      .filter((node) => (node.children?.length ?? 0) > 0)
+      .map((node) => node.id),
+  );
+}
+
+export function needsOverviewInitialization(
+  initializedBindingId,
+  nextBindingId,
+  root,
+) {
+  return Boolean(
+    root &&
+    nextBindingId &&
+    initializedBindingId !== nextBindingId,
+  );
+}
+
 export function matchSearch(root, query) {
   const tokens = String(query)
     .toLocaleLowerCase()
@@ -55,6 +75,25 @@ export function buildVisibleTree(root, folded, query) {
   }
 
   return { root: clone(root), ...search };
+}
+
+export function fitTreeTransform(root, folded, query, stage) {
+  const visible = buildVisibleTree(root, folded, query);
+  const layout = layoutTree(visible.root);
+  const availableWidth = Math.max(200, stage.width - 40);
+  const availableHeight = Math.max(160, stage.height - 40);
+  return {
+    x: 20,
+    y: 20,
+    scale: Math.max(
+      0.35,
+      Math.min(
+        1.4,
+        availableWidth / layout.width,
+        availableHeight / layout.height,
+      ),
+    ),
+  };
 }
 
 export function layoutTree(root, options = {}) {
