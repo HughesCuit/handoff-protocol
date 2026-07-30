@@ -3,10 +3,44 @@ function walk(node, visit, ancestors = []) {
   for (const child of node.children ?? []) walk(child, visit, [...ancestors, node]);
 }
 
+export const NODE_LABEL_LIMIT = 28;
+
 export function collectIds(root) {
   const ids = new Set();
   walk(root, (node) => ids.add(node.id));
   return ids;
+}
+
+export function indexTree(root) {
+  const index = new Map();
+  walk(root, (node, ancestors) => {
+    index.set(node.id, { node, ancestors });
+  });
+  return index;
+}
+
+export function expandAncestors(folded, nodeId, index) {
+  const next = new Set(folded);
+  for (const ancestor of index.get(nodeId)?.ancestors ?? []) {
+    next.delete(ancestor.id);
+  }
+  return next;
+}
+
+export function reconcileSelectedNode(selectedNodeId, root) {
+  if (!selectedNodeId || !root) return null;
+  return collectIds(root).has(selectedNodeId) ? selectedNodeId : null;
+}
+
+export function isLabelTruncated(text, limit = NODE_LABEL_LIMIT) {
+  return String(text).length > limit;
+}
+
+export function truncateLabel(text, limit = NODE_LABEL_LIMIT) {
+  const value = String(text);
+  return isLabelTruncated(value, limit)
+    ? `${value.slice(0, limit - 1)}…`
+    : value;
 }
 
 export function reconcileFoldState(previous, root) {
@@ -106,6 +140,9 @@ export function createViewState() {
     query: "",
     transform: { x: 36, y: 36, scale: 1 },
     overviewPending: true,
+    displayMode: "split",
+    selectedNodeId: null,
+    detailOpen: false,
   };
 }
 
@@ -120,6 +157,9 @@ export function transitionSnapshotViewState(previous, next, stage) {
         folded: new Set(),
         query: "",
         overviewPending: true,
+        displayMode: "split",
+        selectedNodeId: null,
+        detailOpen: false,
       }
     : { ...previous, bindingId: nextBindingId };
   const root = next.tree?.root;
@@ -132,20 +172,26 @@ export function transitionSnapshotViewState(previous, next, stage) {
     root,
   )) {
     const folded = initialOverviewFolds(root);
+    const selectedNodeId = reconcileSelectedNode(scoped.selectedNodeId, root);
     return {
       ...scoped,
       tree: next.tree,
       folded,
       transform: fitTreeTransform(root, folded, scoped.query, stage),
       overviewPending: false,
+      selectedNodeId,
+      detailOpen: selectedNodeId ? scoped.detailOpen : false,
     };
   }
 
   if (next.status !== "synced" && scoped.tree?.root) return scoped;
+  const selectedNodeId = reconcileSelectedNode(scoped.selectedNodeId, root);
   return {
     ...scoped,
     tree: next.tree,
     folded: reconcileFoldState(scoped.folded, root),
+    selectedNodeId,
+    detailOpen: selectedNodeId ? scoped.detailOpen : false,
   };
 }
 

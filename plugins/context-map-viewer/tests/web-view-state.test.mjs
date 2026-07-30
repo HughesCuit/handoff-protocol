@@ -47,6 +47,70 @@ function viewStateController() {
   };
 }
 
+test("navigation state defaults to split and survives a same-binding refresh", () => {
+  const controller = viewStateController();
+  let state = controller.transition(controller.create(), {
+    bindingId: "workspace-a",
+    status: "synced",
+    tree: structuredClone(TREE),
+  }, STAGE);
+  state = {
+    ...state,
+    displayMode: "tree",
+    selectedNodeId: "svg",
+    detailOpen: true,
+  };
+
+  state = controller.transition(state, {
+    bindingId: "workspace-a",
+    status: "synced",
+    tree: structuredClone(TREE),
+  }, STAGE);
+
+  assert.equal(state.displayMode, "tree");
+  assert.equal(state.selectedNodeId, "svg");
+  assert.equal(state.detailOpen, true);
+});
+
+test("removed selections close details and binding changes reset navigation state", () => {
+  const controller = viewStateController();
+  let state = controller.transition(controller.create(), {
+    bindingId: "workspace-a",
+    status: "synced",
+    tree: structuredClone(TREE),
+  }, STAGE);
+  state = {
+    ...state,
+    displayMode: "map",
+    selectedNodeId: "svg",
+    detailOpen: true,
+  };
+
+  const withoutSvg = structuredClone(TREE);
+  withoutSvg.root.children[0].children[0].children = [];
+  state = controller.transition(state, {
+    bindingId: "workspace-a",
+    status: "synced",
+    tree: withoutSvg,
+  }, STAGE);
+  assert.equal(state.selectedNodeId, null);
+  assert.equal(state.detailOpen, false);
+
+  state = controller.transition({
+    ...state,
+    selectedNodeId: "tasks",
+    detailOpen: true,
+    displayMode: "map",
+  }, {
+    bindingId: "workspace-b",
+    status: "synced",
+    tree: structuredClone(TREE),
+  }, STAGE);
+  assert.equal(state.displayMode, "split");
+  assert.equal(state.selectedNodeId, null);
+  assert.equal(state.detailOpen, false);
+});
+
 test("missing or invalid retained trees wait for a synced snapshot to initialize", () => {
   const controller = viewStateController();
 

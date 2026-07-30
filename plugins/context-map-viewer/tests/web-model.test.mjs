@@ -4,15 +4,20 @@ import test from "node:test";
 import {
   buildVisibleTree,
   collapseAll,
+  expandAncestors,
   focusNodeTransform,
   fitTreeTransform,
+  indexTree,
   initialOverviewFolds,
+  isLabelTruncated,
   bindingChanged,
   layoutTree,
   matchSearch,
   needsOverviewInitialization,
+  reconcileSelectedNode,
   reconcileFoldState,
   requestPictureInPicture,
+  truncateLabel,
 } from "../web/model.mjs";
 
 const TREE = {
@@ -38,6 +43,30 @@ const TREE = {
     },
   ],
 };
+
+test("tree index records complete ordered ancestor paths", () => {
+  const index = indexTree(TREE);
+  assert.deepEqual(
+    index.get("svg").ancestors.map((node) => node.id),
+    ["root", "tasks", "build"],
+  );
+  assert.equal(index.get("svg").node.text, "Use SVG canvas");
+});
+
+test("selecting a hidden node expands every ancestor without mutating input", () => {
+  const folded = new Set(["tasks", "build", "risks"]);
+  const next = expandAncestors(folded, "svg", indexTree(TREE));
+  assert.deepEqual([...folded], ["tasks", "build", "risks"]);
+  assert.deepEqual([...next], ["risks"]);
+});
+
+test("selection reconciliation and the shared 28-character label policy are deterministic", () => {
+  assert.equal(reconcileSelectedNode("svg", TREE), "svg");
+  assert.equal(reconcileSelectedNode("missing", TREE), null);
+  assert.equal(isLabelTruncated("x".repeat(28)), false);
+  assert.equal(isLabelTruncated("x".repeat(29)), true);
+  assert.equal(truncateLabel("x".repeat(29)), `${"x".repeat(27)}…`);
+});
 
 test("folded descendants are excluded and collapse-all keeps sections visible", () => {
   const folded = collapseAll(TREE);
