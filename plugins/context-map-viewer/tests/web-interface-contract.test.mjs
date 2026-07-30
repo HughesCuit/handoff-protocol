@@ -83,6 +83,17 @@ test("details focus return resolves a stable node descriptor after rerenders", a
   assert.doesNotMatch(app, /detailsReturnFocus\?\.[\s\S]*isConnected/);
 });
 
+test("tree supports roving keyboard focus and details restore focus", async () => {
+  const app = await source("web/app.mjs");
+  assert.match(app, /function moveTreeFocus\(currentId, direction\)/);
+  assert.match(app, /case "ArrowDown"/);
+  assert.match(app, /case "ArrowUp"/);
+  assert.match(app, /case "ArrowRight"/);
+  assert.match(app, /case "ArrowLeft"/);
+  assert.match(app, /const returnFocus = resolveDetailsReturnFocus\(\)/);
+  assert.match(app, /returnFocus\?\.isConnected/);
+});
+
 test("details styling is an overlay and compact mode becomes full width", async () => {
   const css = await source("web/styles.css");
   assert.match(css, /\.details-drawer\s*\{[^}]*position:\s*absolute/s);

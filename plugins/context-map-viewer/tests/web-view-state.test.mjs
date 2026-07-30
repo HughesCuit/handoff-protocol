@@ -220,6 +220,34 @@ test("same-binding errors and synced refreshes preserve user view state", () => 
   assert.equal(state.tree.root.children[1].children.at(-1).id, "latency");
 });
 
+test("same-binding invalid snapshots retain details but a later deletion closes them", () => {
+  const controller = viewStateController();
+  let state = controller.transition(controller.create(), {
+    bindingId: "workspace-a",
+    status: "synced",
+    tree: structuredClone(TREE),
+  }, STAGE);
+  state = { ...state, selectedNodeId: "svg", detailOpen: true };
+
+  const retained = controller.transition(state, {
+    bindingId: "workspace-a",
+    status: "invalid",
+    tree: structuredClone(TREE),
+  }, STAGE);
+  assert.equal(retained.selectedNodeId, "svg");
+  assert.equal(retained.detailOpen, true);
+
+  const withoutSvg = structuredClone(TREE);
+  withoutSvg.root.children[0].children[0].children = [];
+  const deleted = controller.transition(retained, {
+    bindingId: "workspace-a",
+    status: "synced",
+    tree: withoutSvg,
+  }, STAGE);
+  assert.equal(deleted.selectedNodeId, null);
+  assert.equal(deleted.detailOpen, false);
+});
+
 test("a valid new binding folds and fits its first synced tree", () => {
   const controller = viewStateController();
   let state = controller.transition(controller.create(), {

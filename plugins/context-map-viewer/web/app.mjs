@@ -17,6 +17,7 @@ import { createPageLifecycle, createPageTransport } from "./transports.mjs";
 let snapshot = null;
 let viewState = createViewState();
 let dragging = null;
+let treeFocusId = null;
 const INITIAL_OVERVIEW_BUILD_MARKER =
   "initial-overview:sync-gated-transition:v2";
 
@@ -78,6 +79,32 @@ function toggleFold(nodeId) {
   else folded.add(nodeId);
   viewState = { ...viewState, folded };
   renderAllViews();
+}
+
+function setTreeFocus(nodeId) {
+  treeFocusId = nodeId;
+  for (const label of treeRoot.querySelectorAll(".tree-label")) {
+    label.tabIndex = label.dataset.nodeId === nodeId ? 0 : -1;
+  }
+}
+
+function focusTreeItem(nodeId) {
+  const label = [...treeRoot.querySelectorAll(".tree-label")].find(
+    (item) => item.dataset.nodeId === nodeId,
+  );
+  if (!label) return;
+  setTreeFocus(nodeId);
+  label.focus();
+}
+
+function moveTreeFocus(currentId, direction) {
+  const items = [...treeRoot.querySelectorAll('[role="treeitem"]')];
+  const index = items.findIndex((item) => item.dataset.nodeId === currentId);
+  const target = direction === "next" ? items[index + 1] : items[index - 1];
+  const label = target?.querySelector(".tree-label");
+  if (!label) return;
+  setTreeFocus(label.dataset.nodeId);
+  label.focus();
 }
 
 function selectNode(
@@ -188,10 +215,17 @@ function renderNavigationTree() {
     viewState.query,
   );
   const authoritative = indexTree(viewState.tree.root);
+  const visibleNodeIds = indexTree(visible.root);
+  if (!visibleNodeIds.has(treeFocusId)) {
+    treeFocusId = visibleNodeIds.has(viewState.selectedNodeId)
+      ? viewState.selectedNodeId
+      : visible.root.id;
+  }
 
   const renderNode = (node, level) => {
     const row = document.createElement("div");
     row.className = "tree-item";
+    row.dataset.nodeId = node.id;
     row.setAttribute("role", "treeitem");
     row.setAttribute("aria-level", String(level));
     row.setAttribute("aria-selected", String(viewState.selectedNodeId === node.id));
@@ -217,8 +251,50 @@ function renderNavigationTree() {
     label.type = "button";
     label.className = "tree-label";
     label.dataset.nodeId = node.id;
+    label.tabIndex = node.id === treeFocusId ? 0 : -1;
     label.textContent = `${iconFor(node)}${node.text}`;
-    label.addEventListener("click", () => selectNode(node.id, "tree", label));
+    label.addEventListener("click", () => {
+      setTreeFocus(node.id);
+      selectNode(node.id, "tree", label);
+    });
+    label.addEventListener("keydown", (event) => {
+      switch (event.key) {
+        case "ArrowDown":
+          event.preventDefault();
+          moveTreeFocus(node.id, "next");
+          break;
+        case "ArrowUp":
+          event.preventDefault();
+          moveTreeFocus(node.id, "previous");
+          break;
+        case "ArrowRight":
+          event.preventDefault();
+          if (hasChildren && viewState.folded.has(node.id)) {
+            toggleFold(node.id);
+            focusTreeItem(node.id);
+          }
+          break;
+        case "ArrowLeft": {
+          event.preventDefault();
+          if (hasChildren && !viewState.folded.has(node.id)) {
+            toggleFold(node.id);
+            focusTreeItem(node.id);
+            break;
+          }
+          const parentId = authoritative.get(node.id)?.ancestors.at(-1)?.id;
+          if (parentId) focusTreeItem(parentId);
+          break;
+        }
+        case "Enter":
+        case " ":
+          event.preventDefault();
+          setTreeFocus(node.id);
+          selectNode(node.id, "tree", label);
+          break;
+        default:
+          break;
+      }
+    });
     row.append(disclosure, label);
     treeRoot.append(row);
     for (const child of node.children ?? []) renderNode(child, level + 1);
@@ -428,19 +504,27 @@ function applySnapshot(next) {
     viewState.bindingId !== null && viewState.bindingId !== nextBindingId
       ? "split"
       : viewState.displayMode;
+  const previousBindingId = viewState.bindingId;
+  const previousSelectedNodeId = viewState.selectedNodeId;
   renderDisplayMode(nextDisplayMode);
   viewState = transitionSnapshotViewState(
     viewState,
     next,
     mapViewport(),
   );
+  if (
+    previousBindingId !== viewState.bindingId ||
+    (previousSelectedNodeId && previousSelectedNodeId !== viewState.selectedNodeId)
+  ) {
+    detailsReturnFocus = null;
+  }
   searchInput.value = viewState.query;
   renderDisplayMode();
+  renderAllViews();
   if (viewState.tree?.root) {
     emptyState.hidden = true;
     canvas.hidden = false;
     treePane.hidden = false;
-    renderAllViews();
     return;
   }
   canvas.hidden = true;

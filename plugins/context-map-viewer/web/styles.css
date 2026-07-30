@@ -178,6 +178,11 @@ button:focus-visible {
   white-space: nowrap;
 }
 
+.tree-label:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
 .tree-item[aria-selected="true"] {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
