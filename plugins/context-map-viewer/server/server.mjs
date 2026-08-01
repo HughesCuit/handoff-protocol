@@ -112,7 +112,7 @@ export async function selectActiveRoot(
 export function createContextMapServer(options = {}) {
   const server = new McpServer({
     name: "context-map-viewer",
-    version: "0.1.0",
+    version: "0.2.0",
   });
   const store = options.store ?? new ContextMapStore();
   const widgetHtml = options.widgetHtml ?? "";
