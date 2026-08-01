@@ -18,6 +18,7 @@ let snapshot = null;
 let viewState = createViewState();
 let dragging = null;
 let treeFocusId = null;
+let pendingMapFocusNodeId = null;
 const INITIAL_OVERVIEW_BUILD_MARKER =
   "initial-overview:sync-gated-transition:v2";
 
@@ -47,6 +48,19 @@ function mapViewport() {
 
 function mapIsVisible() {
   return viewState.displayMode !== "tree";
+}
+
+function snapshotRevisionIsUnchanged(next) {
+  if (!snapshot) return false;
+  const previousBindingId = snapshot.bindingId ?? viewState.bindingId;
+  const nextBindingId = next.bindingId ?? viewState.bindingId;
+  if (
+    previousBindingId !== nextBindingId ||
+    snapshot.version !== next.version
+  ) {
+    return false;
+  }
+  return Boolean(viewState.tree?.root) || snapshot.status === next.status;
 }
 
 function setTransform() {
@@ -132,28 +146,10 @@ function selectNode(
     folded: expandAncestors(viewState.folded, nodeId, index),
     detailOpen: source === "map" || isLabelTruncated(selected.node.text),
   };
+  pendingMapFocusNodeId = nodeId;
   renderAllViews();
 
   if (!wasDetailOpen && viewState.detailOpen) detailsTitle.focus();
-
-  if (viewState.displayMode !== "tree") {
-    const visible = buildVisibleTree(
-      viewState.tree.root,
-      viewState.folded,
-      viewState.query,
-    );
-    const layout = layoutTree(visible.root);
-    viewState = {
-      ...viewState,
-      transform: focusNodeTransform(
-        layout,
-        nodeId,
-        mapViewport(),
-        viewState.transform,
-      ),
-    };
-    setTransform();
-  }
 }
 
 function resolveDetailsReturnFocus() {
@@ -176,7 +172,14 @@ function renderDetails() {
     : null;
   const open = Boolean(viewState.detailOpen && selected);
   detailsDrawer.hidden = !open;
-  if (!open) return;
+  if (!open) {
+    detailsPath.textContent = "";
+    detailsText.textContent = "";
+    detailsMeta.replaceChildren();
+    return;
+  }
+
+  positionDetailsDrawer();
 
   detailsText.textContent = selected.node.text;
   detailsPath.textContent = [...selected.ancestors, selected.node]
@@ -198,12 +201,33 @@ function renderDetails() {
   }
 }
 
+function positionDetailsDrawer() {
+  const stageRect = stage.getBoundingClientRect();
+  const targetRect = mapIsVisible()
+    ? mapPane.getBoundingClientRect()
+    : stageRect;
+  const width = Math.max(
+    0,
+    stageRect.width < 420
+      ? targetRect.width
+      : Math.min(360, targetRect.width),
+  );
+  const left = Math.max(
+    0,
+    targetRect.right - stageRect.left - width,
+  );
+  detailsDrawer.style.left = `${left}px`;
+  detailsDrawer.style.width = `${width}px`;
+}
+
 function closeDetails() {
   viewState = { ...viewState, detailOpen: false };
   renderDetails();
-  const returnFocus = resolveDetailsReturnFocus();
-  if (returnFocus?.isConnected) returnFocus.focus();
-  detailsReturnFocus = null;
+  queueMicrotask(() => {
+    const returnFocus = resolveDetailsReturnFocus();
+    if (returnFocus?.isConnected) returnFocus.focus();
+    detailsReturnFocus = null;
+  });
 }
 
 function renderNavigationTree() {
@@ -230,6 +254,9 @@ function renderNavigationTree() {
     row.setAttribute("aria-level", String(level));
     row.setAttribute("aria-selected", String(viewState.selectedNodeId === node.id));
     row.style.setProperty("--tree-depth", String(level - 1));
+    if (viewState.query && visible.matches.has(node.id)) {
+      row.classList.add("match");
+    }
     const hasChildren = (authoritative.get(node.id)?.node.children?.length ?? 0) > 0;
     if (hasChildren) {
       row.setAttribute("aria-expanded", String(!viewState.folded.has(node.id)));
@@ -359,7 +386,10 @@ function renderMap(focusFirstMatch = false) {
       class: "node-body",
       tabindex: 0,
       role: "button",
-      "aria-label": `Open details for ${node.text}`,
+      "aria-current": String(viewState.selectedNodeId === node.id),
+      "aria-label": viewState.selectedNodeId === node.id
+        ? `Selected node: ${node.text}. Open details`
+        : `Open details for ${node.text}`,
       "data-node-id": node.id,
     });
     const rect = svgElement("rect", {
@@ -432,16 +462,24 @@ function renderMap(focusFirstMatch = false) {
     "viewBox",
     `0 0 ${Math.max(mapSize.width, 320)} ${Math.max(mapSize.height, 240)}`,
   );
-  if (focusFirstMatch && visible.matches.size > 0) {
+  const focusNodeId = pendingMapFocusNodeId ?? (
+    focusFirstMatch && visible.matches.size > 0
+      ? visible.matches.values().next().value
+      : null
+  );
+  if (focusNodeId && positions.has(focusNodeId)) {
     viewState = {
       ...viewState,
       transform: focusNodeTransform(
         layout,
-        visible.matches.values().next().value,
+        focusNodeId,
         mapSize,
         viewState.transform,
       ),
     };
+    if (pendingMapFocusNodeId === focusNodeId) {
+      pendingMapFocusNodeId = null;
+    }
   }
   setTransform();
 }
@@ -501,8 +539,10 @@ function emptyMessage(status) {
 
 function applySnapshot(next) {
   if (!next || typeof next !== "object") return;
+  const revisionUnchanged = snapshotRevisionIsUnchanged(next);
   snapshot = next;
   setStatus(next.status);
+  if (revisionUnchanged) return;
   const nextBindingId = next.bindingId ?? viewState.bindingId;
   const nextDisplayMode =
     viewState.bindingId !== null && viewState.bindingId !== nextBindingId
@@ -523,6 +563,7 @@ function applySnapshot(next) {
     (previousSelectedNodeId && previousSelectedNodeId !== viewState.selectedNodeId)
   ) {
     detailsReturnFocus = null;
+    pendingMapFocusNodeId = null;
   }
   searchInput.value = viewState.query;
   renderDisplayMode();
@@ -541,12 +582,25 @@ function applySnapshot(next) {
 }
 
 function showTerminalEmptyState(message) {
-  viewState = { ...viewState, tree: null };
+  viewState = {
+    ...viewState,
+    tree: null,
+    selectedNodeId: null,
+    detailOpen: false,
+  };
+  treeFocusId = null;
+  detailsReturnFocus = null;
+  pendingMapFocusNodeId = null;
+  renderDetails();
   canvas.hidden = true;
   treePane.hidden = true;
   treeRoot.replaceChildren();
+  linksLayer.replaceChildren();
+  nodesLayer.replaceChildren();
   emptyState.hidden = false;
   emptyState.textContent = message;
+  emptyState.tabIndex = -1;
+  emptyState.focus();
   setStatus("expired");
 }
 
@@ -604,6 +658,16 @@ function fitView() {
 
 searchInput.addEventListener("input", () => {
   viewState = { ...viewState, query: searchInput.value };
+  if (viewState.query.trim() && viewState.tree?.root) {
+    const visible = buildVisibleTree(
+      viewState.tree.root,
+      viewState.folded,
+      viewState.query,
+    );
+    pendingMapFocusNodeId = visible.matches.values().next().value ?? null;
+  } else {
+    pendingMapFocusNodeId = null;
+  }
   renderAllViews({ focusFirstMatch: Boolean(viewState.query.trim()) });
 });
 for (const button of document.querySelectorAll("[data-mode]")) {

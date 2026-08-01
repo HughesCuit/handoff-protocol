@@ -188,6 +188,11 @@ button:focus-visible {
   outline-offset: 2px;
 }
 
+.tree-item.match .tree-label {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  font-weight: 650;
+}
+
 .map-pane {
   position: relative;
   min-width: 0;
@@ -310,6 +315,7 @@ button:focus-visible {
 }
 
 .details-drawer {
+  box-sizing: border-box;
   position: absolute;
   z-index: 4;
   top: 0;
