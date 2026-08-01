@@ -4,12 +4,20 @@ import test from "node:test";
 import {
   buildVisibleTree,
   collapseAll,
+  expandAncestors,
   focusNodeTransform,
+  fitTreeTransform,
+  indexTree,
+  initialOverviewFolds,
+  isLabelTruncated,
   bindingChanged,
   layoutTree,
   matchSearch,
+  needsOverviewInitialization,
+  reconcileSelectedNode,
   reconcileFoldState,
   requestPictureInPicture,
+  truncateLabel,
 } from "../web/model.mjs";
 
 const TREE = {
@@ -36,6 +44,30 @@ const TREE = {
   ],
 };
 
+test("tree index records complete ordered ancestor paths", () => {
+  const index = indexTree(TREE);
+  assert.deepEqual(
+    index.get("svg").ancestors.map((node) => node.id),
+    ["root", "tasks", "build"],
+  );
+  assert.equal(index.get("svg").node.text, "Use SVG canvas");
+});
+
+test("selecting a hidden node expands every ancestor without mutating input", () => {
+  const folded = new Set(["tasks", "build", "risks"]);
+  const next = expandAncestors(folded, "svg", indexTree(TREE));
+  assert.deepEqual([...folded], ["tasks", "build", "risks"]);
+  assert.deepEqual([...next], ["risks"]);
+});
+
+test("selection reconciliation and the shared 28-character label policy are deterministic", () => {
+  assert.equal(reconcileSelectedNode("svg", TREE), "svg");
+  assert.equal(reconcileSelectedNode("missing", TREE), null);
+  assert.equal(isLabelTruncated("x".repeat(28)), false);
+  assert.equal(isLabelTruncated("x".repeat(29)), true);
+  assert.equal(truncateLabel("x".repeat(29)), `${"x".repeat(27)}…`);
+});
+
 test("folded descendants are excluded and collapse-all keeps sections visible", () => {
   const folded = collapseAll(TREE);
   assert.deepEqual([...folded], ["tasks", "risks"]);
@@ -43,6 +75,52 @@ test("folded descendants are excluded and collapse-all keeps sections visible", 
   const visible = buildVisibleTree(TREE, folded, "");
   assert.deepEqual(visible.root.children.map((node) => node.id), ["tasks", "risks"]);
   assert.deepEqual(visible.root.children[0].children, []);
+});
+
+test("initial overview folds only top-level sections with children", () => {
+  const root = structuredClone(TREE);
+  root.children.push({
+    id: "empty-section",
+    text: "Empty",
+    children: [],
+  });
+
+  assert.deepEqual(
+    [...initialOverviewFolds(root)],
+    ["tasks", "risks"],
+  );
+  const visible = buildVisibleTree(root, initialOverviewFolds(root), "");
+  assert.deepEqual(
+    visible.root.children.map((node) => node.id),
+    ["tasks", "risks", "empty-section"],
+  );
+  assert.deepEqual(visible.root.children[0].children, []);
+});
+
+test("overview initialization requires a pending synced tree", () => {
+  assert.equal(needsOverviewInitialization(true, "a", "missing", TREE), false);
+  assert.equal(needsOverviewInitialization(true, "a", "synced", null), false);
+  assert.equal(needsOverviewInitialization(true, "a", "synced", TREE), true);
+  assert.equal(needsOverviewInitialization(false, "a", "synced", TREE), false);
+});
+
+test("fitted overview transform contains the folded tree in the viewport", () => {
+  const folded = initialOverviewFolds(TREE);
+  const transform = fitTreeTransform(
+    TREE,
+    folded,
+    "",
+    { width: 800, height: 500 },
+  );
+  const visible = buildVisibleTree(TREE, folded, "");
+  const layout = layoutTree(visible.root);
+
+  assert.equal(transform.x, 20);
+  assert.equal(transform.y, 20);
+  assert(transform.scale >= 0.35);
+  assert(transform.scale <= 1.4);
+  assert(layout.width * transform.scale <= 760);
+  assert(layout.height * transform.scale <= 460);
 });
 
 test("search matches ancestor paths and temporarily reveals folded ancestors", () => {
