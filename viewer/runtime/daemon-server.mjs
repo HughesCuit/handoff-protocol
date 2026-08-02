@@ -1,4 +1,5 @@
 import { createServer as createHttpServer } from "node:http";
+import { timingSafeEqual } from "node:crypto";
 import { isAbsolute } from "node:path";
 
 import { DAEMON_VERSION, SCHEMA_VERSION } from "./daemon-state.mjs";
@@ -135,7 +136,10 @@ export class DaemonServer {
     if (typeof header !== "string") return false;
     const match = /^Bearer (.+)$/.exec(header);
     if (!match) return false;
-    return match[1] === this.controlToken;
+    const provided = Buffer.from(match[1]);
+    const expected = Buffer.from(this.controlToken);
+    if (provided.length !== expected.length) return false;
+    return timingSafeEqual(provided, expected);
   }
 
   async handle(request, response) {
