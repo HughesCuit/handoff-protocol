@@ -12,6 +12,10 @@ build/
 !/plugins/context-map-viewer/dist/
 !/plugins/context-map-viewer/dist/**
 
+# Handoff Viewer daemon serves committed prebuilt web assets.
+!/viewer/dist/
+!/viewer/dist/**
+
 # IDE
 .vscode/
 .idea/
