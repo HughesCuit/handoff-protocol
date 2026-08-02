@@ -33,13 +33,15 @@ import {
 } from "./context-map.ts";
 import {
   compileContext,
+  compileV3Context,
   DEFAULT_BUDGET,
   MIN_BUDGET,
   validateBudget,
 } from "./context-compiler.mjs";
-import { viewTamperWarnings } from "./views.mjs";
+import { sha256Hex, viewTamperWarnings } from "./views.mjs";
+import { loadHandoffState } from "./handoff-state.mjs";
+import { detectLayout } from "./migrate-v3.mjs";
 import { validateProjectConfig } from "./config.mjs";
-import { isMigrationNeeded } from "./migrate.mjs";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -575,6 +577,67 @@ function formatOutput(result: LoadResult, mode: string): string {
   return lines.join("\n");
 }
 
+// ── v3 loading ───────────────────────────────────────────────────────────────
+
+const v3Io = {
+  readFile: (p: string) => Deno.readTextFile(p),
+};
+
+async function layoutOfDir(handoffDir: string): Promise<string> {
+  const files: string[] = [];
+  try {
+    for await (const entry of Deno.readDir(handoffDir)) files.push(entry.name);
+  } catch {
+    return "empty";
+  }
+  for (const sub of ["content", "views"]) {
+    try {
+      for await (const entry of Deno.readDir(join(handoffDir, sub))) files.push(`${sub}/${entry.name}`);
+    } catch {
+      // Subdirectory absent: not a v3 marker.
+    }
+  }
+  return detectLayout(files);
+}
+
+async function loadV3State(handoffDir: string) {
+  try {
+    return await loadHandoffState(v3Io, handoffDir);
+  } catch {
+    return null;
+  }
+}
+
+/** Project a canonical v3 state into HandoffContext-shaped fields. */
+function v3StateToContext(state: never, json: HandoffContext | null): HandoffContext {
+  const st = state as {
+    map: { sections: Record<string, { label: string; priority?: string; checked?: boolean }[]> };
+  };
+  const labels = (key: string) => (st.map.sections[key] || []).map((n) => n.label);
+  const todos = (st.map.sections.tasks || []).map((n) => ({
+    task: n.label,
+    priority: n.priority || "medium",
+    status: n.checked ? "completed" : "pending",
+  }));
+  return {
+    version: (json as unknown as { protocolVersion?: string } | null)?.protocolVersion || "3.0.0",
+    timestamp: json?.timestamp || "",
+    agent: json?.agent || "unknown",
+    project: json?.project || "unknown",
+    current_goal: labels("goals").join("\n"),
+    status: labels("status").join("\n") || "unknown",
+    completed: [],
+    modified_files: [],
+    todos,
+    blockers: [],
+    decisions: labels("decisions"),
+    next_steps: [],
+    git: json?.git || { branch: "unknown", latest_commit: "", commit_message: "", is_dirty: false },
+    risks: labels("risks"),
+    notes: labels("notes").join("\n"),
+  } as unknown as HandoffContext;
+}
+
 // ── Main Load Logic ──────────────────────────────────────────────────────────
 
 async function load(mode: string, compile: CompileRequest | null = null): Promise<LoadResult> {
@@ -631,122 +694,193 @@ async function load(mode: string, compile: CompileRequest | null = null): Promis
     };
   }
 
-  // The Context Map is the semantic source; context.json supplements it with
-  // machine state (git, timestamps, modified files). Absent/empty/malformed
-  // maps fall back to the legacy path unchanged.
-  const map = await loadContextMap(handoffDir);
+  const layout = await layoutOfDir(handoffDir);
   let ctx = await loadContextJson(handoffDir);
-  const legacyJsonVersion = ctx ? ctx.version : undefined;
   let compileDiagnostics: CompileDiagnostics | null = null;
 
-  // Generated views are never a semantic source. Warn when an on-disk view
-  // no longer matches the hash stored by the last save (manual edit); the
-  // map stays authoritative regardless.
-  if (ctx && (ctx as { views?: Record<string, string> }).views) {
-    const storedViews = (ctx as { views: Record<string, string> }).views;
-    const currentContents: Record<string, string> = {};
-    for (const name of Object.keys(storedViews)) {
-      try {
-        currentContents[name] = await Deno.readTextFile(join(handoffDir, name));
-      } catch {
-        // Missing views are regenerated on the next save.
+  if (layout === "v3") {
+    // Canonical v3 state: directory + content files. context.json supplements
+    // machine state (git, timestamps); the generated view is never a source.
+    const state = await loadV3State(handoffDir);
+    if (state) {
+      const storedViewHash = (ctx as { hashes?: Record<string, string> } | null)?.hashes?.["views/HANDOFF.md"];
+      if (storedViewHash) {
+        try {
+          const current = await Deno.readTextFile(join(handoffDir, "views", "HANDOFF.md"));
+          if (sha256Hex(current) !== storedViewHash) {
+            console.error(
+              "Warning: views/HANDOFF.md was manually edited, but it is generated from context-map.md and the content/ files. " +
+              "Edit those instead — manual view changes are never imported and are overwritten on save."
+            );
+          }
+        } catch {
+          // Missing views are regenerated on the next save.
+        }
+      }
+      for (const diagnostic of (state as { diagnostics?: string[] }).diagnostics || []) {
+        console.error(`Note: ${diagnostic}`);
+      }
+
+      let effective = state;
+      if (compile) {
+        const defaultFocus = [
+          ...(((state as never) as { map: { sections: { goals: { label: string }[] } } }).map.sections.goals || []).map((n) => n.label),
+          ...(((state as never) as { map: { sections: { tasks: { label: string; checked?: boolean }[] } } }).map.sections.tasks || []).filter((n) => !n.checked).map((n) => n.label),
+        ].map((t) => normalizeNodeText(t)).join(" ");
+        const focus = compile.full ? "" : (compile.focus ?? defaultFocus);
+        const compiled = compileV3Context({ state, focus, budget: compile.budget, full: compile.full } as never) as {
+          state: { map: unknown; content: unknown };
+          selectedIds: string[];
+          omittedCount: number;
+          estimatedTokens: number;
+          overflow: boolean;
+          fallbackReason: string | null;
+        };
+        effective = { ...(state as object), map: compiled.state.map, content: compiled.state.content } as never;
+        compileDiagnostics = {
+          focus: compile.full ? "(full map)" : focus,
+          budget: compile.budget ?? DEFAULT_BUDGET,
+          selectedPaths: compiled.selectedIds,
+          omittedCount: compiled.omittedCount,
+          estimatedTokens: compiled.estimatedTokens,
+          overflow: compiled.overflow,
+          fallbackReason: compiled.fallbackReason,
+        };
+      }
+      ctx = v3StateToContext(effective as never, ctx);
+    } else {
+      // Present-but-unreadable v3 state: the generated view is the last
+      // read-only fallback (semantics recover on the next save).
+      const viewPath = join(handoffDir, "views", "HANDOFF.md");
+      if (!await exists(viewPath)) {
+        return {
+          understanding: "Handoff directory exists but contains no readable context.",
+          nextActions: ["Run `/handoff save` to regenerate context"],
+          risks: ["Invalid handoff state - no readable files"],
+          pendingTasks: 0,
+          context: null,
+          storageMode,
+        };
+      }
+      const parsed = parseHandoffMd(await Deno.readTextFile(viewPath));
+      ctx = {
+        version: "3.0.0",
+        timestamp: new Date().toISOString(),
+        agent: "unknown",
+        project: parsed.project || "unknown",
+        current_goal: parsed.current_goal || "",
+        status: parsed.status || "unknown",
+        completed: parsed.completed || [],
+        modified_files: parsed.modified_files || [],
+        todos: parsed.todos || [],
+        blockers: parsed.blockers || [],
+        decisions: parsed.decisions || [],
+        next_steps: parsed.next_steps || [],
+        git: parsed.git || { branch: "unknown", latest_commit: "", commit_message: "", is_dirty: false },
+        risks: parsed.risks || [],
+        notes: "(parsed from views/HANDOFF.md)",
+      };
+    }
+  } else {
+    // v2 / legacy path (read-only; the next save migrates to v3).
+    const map = await loadContextMap(handoffDir);
+
+    // Generated views are never a semantic source. Warn when an on-disk view
+    // no longer matches the hash stored by the last save (manual edit); the
+    // map stays authoritative regardless.
+    if (ctx && (ctx as { views?: Record<string, string> }).views) {
+      const storedViews = (ctx as unknown as { views: Record<string, string> }).views;
+      const currentContents: Record<string, string> = {};
+      for (const name of Object.keys(storedViews)) {
+        try {
+          currentContents[name] = await Deno.readTextFile(join(handoffDir, name));
+        } catch {
+          // Missing views are regenerated on the next save.
+        }
+      }
+      for (const warning of viewTamperWarnings(storedViews, currentContents)) {
+        console.error(warning);
       }
     }
-    for (const warning of viewTamperWarnings(storedViews, currentContents)) {
-      console.error(warning);
-    }
-  }
 
-  if (map) {
-    // Map semantics win; context.json (when present) supplies machine state
-    // and any semantic field the map leaves empty. Works for map-only,
-    // mixed-format, and (map absent) legacy handoffs.
-    // With --focus/--budget/--full, the map is first compiled down to the
-    // relevant nodes; diagnostics travel with the result.
-    let effectiveMap = map;
-    if (compile) {
-      const focus = compile.full ? "" : (compile.focus ?? defaultFocusFromMap(map));
-      const compiled = compileContext(map, {
-        focus,
-        budget: compile.budget,
-        full: compile.full,
-      }) as {
-        map: ParsedMap;
-        selectedPaths: string[];
-        omittedCount: number;
-        estimatedTokens: number;
-        overflow: boolean;
-        fallbackReason: string | null;
-      };
-      effectiveMap = compiled.map;
-      compileDiagnostics = {
-        focus: compile.full ? "(full map)" : focus,
-        budget: compile.budget ?? DEFAULT_BUDGET,
-        selectedPaths: compiled.selectedPaths,
-        omittedCount: compiled.omittedCount,
-        estimatedTokens: compiled.estimatedTokens,
-        overflow: compiled.overflow,
-        fallbackReason: compiled.fallbackReason,
-      };
-    }
-    ctx = mergeContextMapWithJson(effectiveMap, ctx);
-  } else if (ctx && !Array.isArray(ctx.todos)) {
-    // v2 context.json carries no semantic fields; without a readable map it
-    // cannot stand alone — fall through to the HANDOFF.md view.
-    ctx = null;
-  }
-
-  // Fallback: parse HANDOFF.md if the map is unusable and context.json is
-  // missing/invalid (legacy 1.x handoff).
-  if (!ctx) {
-    console.error("Warning: context-map.md and context.json missing or invalid. Falling back to HANDOFF.md parsing.");
-
-    const handoffMd = await loadHandoffMd(handoffDir);
-    if (!handoffMd) {
-      console.error("Error: No readable context found in .handoff/ (checked context-map.md, context.json, HANDOFF.md)");
-      console.error("Run `/handoff save` to regenerate the handoff files.");
-      return {
-        understanding: "Handoff directory exists but contains no readable context.",
-        nextActions: ["Run `/handoff save` to regenerate context"],
-        risks: ["Invalid handoff state - no readable files"],
-        pendingTasks: 0,
-        context: null,
-        storageMode,
-      };
+    if (map) {
+      let effectiveMap = map;
+      if (compile) {
+        const focus = compile.full ? "" : (compile.focus ?? defaultFocusFromMap(map));
+        const compiled = compileContext(map, {
+          focus,
+          budget: compile.budget,
+          full: compile.full,
+        }) as {
+          map: ParsedMap;
+          selectedPaths: string[];
+          omittedCount: number;
+          estimatedTokens: number;
+          overflow: boolean;
+          fallbackReason: string | null;
+        };
+        effectiveMap = compiled.map;
+        compileDiagnostics = {
+          focus: compile.full ? "(full map)" : focus,
+          budget: compile.budget ?? DEFAULT_BUDGET,
+          selectedPaths: compiled.selectedPaths,
+          omittedCount: compiled.omittedCount,
+          estimatedTokens: compiled.estimatedTokens,
+          overflow: compiled.overflow,
+          fallbackReason: compiled.fallbackReason,
+        };
+      }
+      ctx = mergeContextMapWithJson(effectiveMap, ctx);
+    } else if (ctx && !Array.isArray(ctx.todos)) {
+      // v2 context.json carries no semantic fields; without a readable map it
+      // cannot stand alone — fall through to the HANDOFF.md view.
+      ctx = null;
     }
 
-    const parsed = parseHandoffMd(handoffMd);
-    ctx = {
-      version: "1.0.0",
-      timestamp: new Date().toISOString(),
-      agent: "unknown",
-      project: parsed.project || "unknown",
-      current_goal: parsed.current_goal || "",
-      status: parsed.status || "unknown",
-      completed: parsed.completed || [],
-      modified_files: parsed.modified_files || [],
-      todos: parsed.todos || [],
-      blockers: parsed.blockers || [],
-      decisions: parsed.decisions || [],
-      next_steps: parsed.next_steps || [],
-      git: parsed.git || { branch: "unknown", latest_commit: "", commit_message: "", is_dirty: false },
-      risks: parsed.risks || [],
-      notes: "(parsed from HANDOFF.md - context.json was unavailable)",
-    };
+    // Fallback: parse HANDOFF.md if the map is unusable and context.json is
+    // missing/invalid (legacy 1.x handoff).
+    if (!ctx) {
+      console.error("Warning: context-map.md and context.json missing or invalid. Falling back to HANDOFF.md parsing.");
 
-    console.error("Successfully parsed HANDOFF.md as fallback.");
-  }
+      const handoffMd = await loadHandoffMd(handoffDir);
+      if (!handoffMd) {
+        console.error("Error: No readable context found in .handoff/ (checked context-map.md, context.json, HANDOFF.md)");
+        console.error("Run `/handoff save` to regenerate the handoff files.");
+        return {
+          understanding: "Handoff directory exists but contains no readable context.",
+          nextActions: ["Run `/handoff save` to regenerate context"],
+          risks: ["Invalid handoff state - no readable files"],
+          pendingTasks: 0,
+          context: null,
+          storageMode,
+        };
+      }
 
-  // Legacy (pre-v2) handoffs still load through the paths above; point at the
-  // atomic migration without changing read-only load behavior.
-  if (
-    isMigrationNeeded({
-      mapPresent: !!map,
-      contextVersion: legacyJsonVersion || (map ? undefined : ctx && ctx.version),
-      configVersion: storageConfig?.version,
-    })
-  ) {
-    console.error("Note: legacy handoff format (pre-v2) detected. Run `/handoff save` to migrate to v2; originals are backed up under .handoff/history/migrations/ automatically.");
+      const parsed = parseHandoffMd(handoffMd);
+      ctx = {
+        version: "1.0.0",
+        timestamp: new Date().toISOString(),
+        agent: "unknown",
+        project: parsed.project || "unknown",
+        current_goal: parsed.current_goal || "",
+        status: parsed.status || "unknown",
+        completed: parsed.completed || [],
+        modified_files: parsed.modified_files || [],
+        todos: parsed.todos || [],
+        blockers: parsed.blockers || [],
+        decisions: parsed.decisions || [],
+        next_steps: parsed.next_steps || [],
+        git: parsed.git || { branch: "unknown", latest_commit: "", commit_message: "", is_dirty: false },
+        risks: parsed.risks || [],
+        notes: "(parsed from HANDOFF.md - context.json was unavailable)",
+      };
+
+      console.error("Successfully parsed HANDOFF.md as fallback.");
+    }
+
+    if (layout === "v2" || layout === "legacy") {
+      console.error(`Note: ${layout === "v2" ? "v2" : "legacy (pre-v2)"} handoff format detected. Run \`/handoff save\` to migrate to v3; originals are backed up under .handoff/history/migrations/ automatically.`);
+    }
   }
 
   const understanding = generateUnderstanding(ctx);

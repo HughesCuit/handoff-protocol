@@ -445,6 +445,7 @@ export async function applyV3Migration(io, plan, paths, options = {}) {
       const finalPath = name === CONFIG_OUTPUT_NAME ? configPath : `${handoffDir}/${name}`;
       if (!finalPath) continue;
       const tempPath = `${finalPath}${MIGRATION_TMP_SUFFIX}`;
+      await io.mkdir(tempPath.split("/").slice(0, -1).join("/"));
       await io.writeFile(tempPath, content);
       temps.push({ name, tempPath, finalPath });
     }

@@ -58,3 +58,6 @@ export function contentPathForSection(sectionKey) {
   const file = CONTENT_FILES[sectionKey];
   return file ? `${CONTENT_DIR}/${file}` : null;
 }
+
+/** Paths a v3 save writes and a submodule commit includes (dirs allowed). */
+export const V3_TRACKED_PATHS = Object.freeze(["context-map.md", "content", "views", "context.json"]);

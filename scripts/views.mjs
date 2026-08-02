@@ -413,3 +413,78 @@ export function buildInitialV3Files({ project, timestamp, agent, lang } = {}) {
   files["context.json"] = JSON.stringify(contextJson, null, 2) + "\n";
   return files;
 }
+
+// ── Atomic multi-file writes ─────────────────────────────────────────────────
+
+/** Suffix for the temporary sibling files a save writes through. */
+export const SAVE_TMP_SUFFIX = ".save-tmp";
+/** Suffix for the rollback siblings originals are moved to during install. */
+export const SAVE_ROLLBACK_SUFFIX = ".save-rollback";
+
+/**
+ * Write a set of files atomically: every file goes to a temporary sibling
+ * first and is re-read for verification; only then is each temp renamed into
+ * place (existing files first move to rollback siblings). A failure before
+ * every rename completes restores originals byte-for-byte; dropping rollback
+ * siblings afterwards is best-effort.
+ *
+ * `io`: { readFile, writeFile, rename, mkdir?, exists, remove }.
+ * `files`: { "<relative/path>": "content" } under `baseDir`.
+ * Returns `{ written: [finalPath] }`.
+ */
+export async function writeFilesAtomically(io, baseDir, files) {
+  const dir = String(baseDir).replace(/\/+$/, "");
+  const temps = [];
+  const replaced = [];
+  try {
+    for (const [name, content] of Object.entries(files)) {
+      const finalPath = `${dir}/${name}`;
+      const tempPath = `${finalPath}${SAVE_TMP_SUFFIX}`;
+      if (io.mkdir) await io.mkdir(finalPath.split("/").slice(0, -1).join("/"));
+      await io.writeFile(tempPath, content);
+      temps.push({ name, tempPath, finalPath });
+    }
+    for (const temp of temps) {
+      const written = await io.readFile(temp.tempPath);
+      if (written !== files[temp.name]) {
+        throw new Error(`atomic write verification failed for ${temp.name}`);
+      }
+    }
+    for (const temp of temps) {
+      const entry = { finalPath: temp.finalPath, rollbackPath: null };
+      if (await io.exists(temp.finalPath)) {
+        entry.rollbackPath = `${temp.finalPath}${SAVE_ROLLBACK_SUFFIX}`;
+        await io.rename(temp.finalPath, entry.rollbackPath);
+      }
+      replaced.push(entry);
+      await io.rename(temp.tempPath, temp.finalPath);
+    }
+  } catch (err) {
+    for (const entry of replaced.reverse()) {
+      try {
+        if (await io.exists(entry.finalPath)) await io.remove(entry.finalPath);
+        if (entry.rollbackPath) await io.rename(entry.rollbackPath, entry.finalPath);
+      } catch {
+        // Best effort: keep restoring the remaining files.
+      }
+    }
+    for (const temp of temps) {
+      try {
+        await io.remove(temp.tempPath);
+      } catch {
+        // Already renamed or never written: nothing to clean.
+      }
+    }
+    throw err;
+  }
+  for (const entry of replaced) {
+    if (entry.rollbackPath) {
+      try {
+        await io.remove(entry.rollbackPath);
+      } catch {
+        // Leftover rollback siblings are harmless.
+      }
+    }
+  }
+  return { written: temps.map((t) => t.finalPath) };
+}

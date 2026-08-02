@@ -23,8 +23,14 @@ import {
   assertIncludes,
   assertNotIncludes,
 } from "../shared/unit-suite.mjs";
-import { parseContextMap, PROTOCOL_VERSION, SECTION_LABELS, SECTION_KEYS } from "../../scripts/context-map.mjs";
-import { GENERATED_MARKER, sha256Hex } from "../../scripts/views.mjs";
+import {
+  parseContextMapV3,
+  V3_PROTOCOL_VERSION,
+  V3_SECTION_KEYS,
+  V3_SECTION_LABELS,
+} from "../../scripts/context-map.mjs";
+import { V3_GENERATED_MARKER, sha256Hex } from "../../scripts/views.mjs";
+import { CONTENT_FILES } from "../../scripts/content-files.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const fixturesDir = join(root, "tests", "fixtures");
@@ -98,19 +104,26 @@ test("load: mixed handoff prefers map semantics, supplements machine state", () 
 
 // ── Save integration ─────────────────────────────────────────────────────────
 
-test("save: generates context-map.md with all sections, reconciles idempotently", async () => {
+test("save: generates the v3 layout, reconciles idempotently, and never infers a goal", async () => {
   const dir = await initTempRepo();
 
   runSave(dir);
-  const mapPath = join(dir, ".handoff", "context-map.md");
+  const handoff = join(dir, ".handoff");
+  const mapPath = join(handoff, "context-map.md");
   assert(existsSync(mapPath), "context-map.md was not written");
   const first = await readFile(mapPath, "utf-8");
-  for (const key of SECTION_KEYS) {
-    assertIncludes(first, `## ${SECTION_LABELS[key].en}`, `missing section '${key}'`);
+  for (const key of V3_SECTION_KEYS) {
+    assertIncludes(first, `## ${V3_SECTION_LABELS[key].en}`, `missing section '${key}'`);
   }
-  // Legacy files still produced at med verbosity.
-  for (const f of ["HANDOFF.md", "context.json", "tasks.md", "decisions.md"]) {
-    assert(existsSync(join(dir, ".handoff", f)), `${f} missing after save`);
+  // Canonical v3 files are produced; legacy root views are not.
+  for (const name of Object.values(CONTENT_FILES)) {
+    assert(existsSync(join(handoff, "content", name)), `content/${name} missing after save`);
+  }
+  for (const name of ["views/HANDOFF.md", "context.json"]) {
+    assert(existsSync(join(handoff, name)), `${name} missing after save`);
+  }
+  for (const legacy of ["HANDOFF.md", "tasks.md", "decisions.md"]) {
+    assert(!existsSync(join(handoff, legacy)), `legacy root file '${legacy}' must not be created in v3`);
   }
 
   // Second save with unchanged state: map is byte-identical (idempotent).
@@ -118,8 +131,8 @@ test("save: generates context-map.md with all sections, reconciles idempotently"
   const second = await readFile(mapPath, "utf-8");
   assertEqual(second, first, "repeated save was not idempotent");
 
-  const parsed = parseContextMap(second);
-  assertEqual(parsed.sections.goal.length, 1, "goal duplicated across saves");
+  const parsed = parseContextMapV3(second);
+  assertEqual(parsed.sections.goals.length, 0, "the latest commit must never become the Current Goal");
 });
 
 test("save: snapshots semantic state only when it changes", async () => {
@@ -131,8 +144,9 @@ test("save: snapshots semantic state only when it changes", async () => {
   assertEqual(first.length, 1, "first save should write one snapshot");
   assert(first[0].endsWith(".json"), "snapshot should be JSON");
   const snapshot = JSON.parse(await readFile(join(snapDir, first[0]), "utf-8"));
-  assertEqual(snapshot.version, PROTOCOL_VERSION);
+  assertEqual(snapshot.version, V3_PROTOCOL_VERSION);
   assert(snapshot.digest && snapshot.state, "snapshot missing digest/state");
+  assert(Array.isArray(snapshot.state.nodes), "v3 snapshot must normalize nodes with stable IDs");
 
   runSave(dir); // unchanged
   assertEqual((await readdir(snapDir)).length, 1, "unchanged save must not snapshot");
@@ -142,24 +156,30 @@ test("save: snapshots semantic state only when it changes", async () => {
   const map = await readFile(mapPath, "utf-8");
   await writeFile(
     mapPath,
-    map.replace("## Knowledge and Notes", "## Knowledge and Notes\n\n- User note from a human edit")
+    map.replace("## Knowledge and Notes", "## Knowledge and Notes\n\n- `note9` User note from a human edit")
   );
   runSave(dir);
   assertEqual((await readdir(snapDir)).length, 2, "changed save should write a second snapshot");
 });
 
-test("save: low verbosity still writes the context map (and skips legacy task files)", async () => {
+test("save: low verbosity still writes the canonical v3 layout", async () => {
   const dir = await initTempRepo();
   runSave(dir, ["--verbosity", "low"]);
 
-  const mapPath = join(dir, ".handoff", "context-map.md");
-  assert(existsSync(mapPath), "low verbosity save did not write context-map.md");
-  const map = await readFile(mapPath, "utf-8");
+  const handoff = join(dir, ".handoff");
+  const map = await readFile(join(handoff, "context-map.md"), "utf-8");
   assertIncludes(map, "## Current Goal");
   assertIncludes(map, "## Excluded");
-  assert((await readFile(join(dir, ".handoff", "HANDOFF.md"), "utf-8")).startsWith(GENERATED_MARKER), "low verbosity HANDOFF.md is not a marked generated view");
-  assert(!existsSync(join(dir, ".handoff", "tasks.md")), "low verbosity should skip tasks.md");
-  assert(!existsSync(join(dir, ".handoff", "decisions.md")), "low verbosity should skip decisions.md");
+  for (const name of Object.values(CONTENT_FILES)) {
+    assert(existsSync(join(handoff, "content", name)), `low verbosity must still write content/${name}`);
+  }
+  assert(
+    (await readFile(join(handoff, "views", "HANDOFF.md"), "utf-8")).startsWith(V3_GENERATED_MARKER),
+    "low verbosity HANDOFF.md is not a marked generated view"
+  );
+  for (const legacy of ["HANDOFF.md", "tasks.md", "decisions.md"]) {
+    assert(!existsSync(join(handoff, legacy)), `legacy root file '${legacy}' must not exist in v3`);
+  }
 });
 
 for (const [label, args] of [
@@ -168,21 +188,23 @@ for (const [label, args] of [
   ["diff mode", ["diff"]],
   ["high verbosity", ["--verbosity", "high"]],
 ]) {
-  test(`save: ${label} writes a readable context map`, async () => {
+  test(`save: ${label} writes a readable v3 layout`, async () => {
     const dir = await initTempRepo();
     runSave(dir, args);
-    const mapPath = join(dir, ".handoff", "context-map.md");
+    const handoff = join(dir, ".handoff");
+    const mapPath = join(handoff, "context-map.md");
     assert(existsSync(mapPath), `${label} did not write context-map.md`);
-    const parsed = parseContextMap(await readFile(mapPath, "utf-8"));
+    const parsed = parseContextMapV3(await readFile(mapPath, "utf-8"));
     assert(parsed, `${label} wrote an unreadable context map`);
-    for (const key of SECTION_KEYS) {
+    for (const key of V3_SECTION_KEYS) {
       assert(Array.isArray(parsed.sections[key]), `${label} omitted section '${key}'`);
+      assert(existsSync(join(handoff, "content", CONTENT_FILES[key])), `${label} omitted a content file for '${key}'`);
     }
-    // Compatibility views are still produced at every mode/verbosity.
-    for (const name of ["HANDOFF.md", "tasks.md", "decisions.md"]) {
-      const viewPath = join(dir, ".handoff", name);
-      assert(existsSync(viewPath), `${label} did not write ${name}`);
-      assert((await readFile(viewPath, "utf-8")).startsWith(GENERATED_MARKER), `${label} wrote ${name} without the generated marker`);
+    const viewPath = join(handoff, "views", "HANDOFF.md");
+    assert(existsSync(viewPath), `${label} did not write views/HANDOFF.md`);
+    assert((await readFile(viewPath, "utf-8")).startsWith(V3_GENERATED_MARKER), `${label} wrote the view without the generated marker`);
+    for (const legacy of ["HANDOFF.md", "tasks.md", "decisions.md"]) {
+      assert(!existsSync(join(handoff, legacy)), `${label} created legacy root file '${legacy}'`);
     }
   });
 }
@@ -219,8 +241,12 @@ test("save: submodule storage includes context-map.md in the submodule commit", 
 
   assert(existsSync(join(dir, ".handoff", "context-map.md")), "map not written into submodule");
   const tracked = git(join(dir, ".handoff"), ["ls-files"]);
+  const trackedFiles = tracked.split("\n");
   assertIncludes(tracked, "context-map.md", "context-map.md not committed in submodule");
-  assertIncludes(tracked, "HANDOFF.md", "legacy files not committed in submodule");
+  assertIncludes(tracked, "content/tasks.md", "content files not committed in submodule");
+  assertIncludes(tracked, "views/HANDOFF.md", "generated view not committed in submodule");
+  assertIncludes(tracked, "context.json", "context.json not committed in submodule");
+  assert(!trackedFiles.includes("tasks.md"), "legacy root tasks.md must not be committed in v3");
 });
 
 test("save: TODO scan only picks up comment tags and skips excluded directories", async () => {
@@ -239,7 +265,7 @@ test("save: TODO scan only picks up comment tags and skips excluded directories"
   await writeFile(join(dir, "tests", "fixtures", "sample.ts"), "// TODO: fixture dir must be excluded\n");
 
   runSave(dir);
-  const tasksMd = await readFile(join(dir, ".handoff", "tasks.md"), "utf-8");
+  const tasksMd = await readFile(join(dir, ".handoff", "content", "tasks.md"), "utf-8");
   assertIncludes(tasksMd, "wire up the real scanner (src/app.ts:1)");
   assertNotIncludes(tasksMd, "string false positive");
   assertNotIncludes(tasksMd, "template false positive");
@@ -253,34 +279,42 @@ const SEMANTIC_JSON_FIELDS = [
   "blockers", "decisions", "next_steps", "risks", "notes",
 ];
 
-test("save: v2 context.json drops semantic fields and stores SHA-256 view hashes", async () => {
+test("save: v3 context.json drops semantic fields and stores SHA-256 file hashes", async () => {
   const dir = await initTempRepo();
   runSave(dir);
 
-  const json = JSON.parse(await readFile(join(dir, ".handoff", "context.json"), "utf-8"));
+  const handoff = join(dir, ".handoff");
+  const json = JSON.parse(await readFile(join(handoff, "context.json"), "utf-8"));
   for (const field of SEMANTIC_JSON_FIELDS) {
-    assert(!(field in json), `semantic field '${field}' must not appear in v2 context.json`);
+    assert(!(field in json), `semantic field '${field}' must not appear in v3 context.json`);
   }
+  assertEqual(json.protocolVersion, V3_PROTOCOL_VERSION);
   assert(json.project && json.timestamp && json.agent && json.git, "metadata missing from context.json");
-  assertEqual(JSON.stringify(json.diagnostics), JSON.stringify({ migration: [], conflicts: [] }));
+  assert(json.idCounters && typeof json.idCounters === "object", "monotonic ID counters missing");
+  assertEqual(JSON.stringify(json.diagnostics), JSON.stringify({ migration: [], conflicts: [], integrity: [] }));
 
-  for (const name of ["HANDOFF.md", "tasks.md", "decisions.md"]) {
-    const content = await readFile(join(dir, ".handoff", name), "utf-8");
-    assert(content.startsWith(GENERATED_MARKER), `${name} does not begin with the generated marker`);
-    assertEqual(json.views[name], sha256Hex(content), `stored hash does not match written ${name}`);
+  const hashed = ["context-map.md", ...Object.values(CONTENT_FILES).map((n) => `content/${n}`), "views/HANDOFF.md"];
+  assertEqual(JSON.stringify(Object.keys(json.hashes).sort()), JSON.stringify(hashed.sort()));
+  for (const name of hashed) {
+    const content = await readFile(join(handoff, name), "utf-8");
+    assertEqual(json.hashes[name], sha256Hex(content), `stored hash does not match written ${name}`);
   }
+  assert(
+    (await readFile(join(handoff, "views", "HANDOFF.md"), "utf-8")).startsWith(V3_GENERATED_MARKER),
+    "views/HANDOFF.md does not begin with the generated marker"
+  );
 });
 
 test("save: manual view edits warn and are never imported into the map", async () => {
   const dir = await initTempRepo();
   runSave(dir);
-  await writeFile(join(dir, ".handoff", "HANDOFF.md"), "manual vandalism\n");
+  await writeFile(join(dir, ".handoff", "views", "HANDOFF.md"), "manual vandalism\n");
 
   const res = spawnSync(process.execPath, [join(root, "scripts", "node", "save.mjs")], { cwd: dir, encoding: "utf-8" });
   assertEqual(res.status, 0, `save failed: ${res.stderr}`);
   assertIncludes(res.stderr, "HANDOFF.md");
 
-  const view = await readFile(join(dir, ".handoff", "HANDOFF.md"), "utf-8");
+  const view = await readFile(join(dir, ".handoff", "views", "HANDOFF.md"), "utf-8");
   assertNotIncludes(view, "manual vandalism", "manual edit survived regeneration");
   const map = await readFile(join(dir, ".handoff", "context-map.md"), "utf-8");
   assertNotIncludes(map, "manual vandalism", "manual view edit was imported into the map");
@@ -289,17 +323,17 @@ test("save: manual view edits warn and are never imported into the map", async (
 test("load: warns when a generated view was manually edited, semantics still come from the map", async () => {
   const dir = await initTempRepo();
   runSave(dir);
-  const tasksPath = join(dir, ".handoff", "tasks.md");
-  await writeFile(tasksPath, (await readFile(tasksPath, "utf-8")) + "\n- [ ] manual injected task\n");
+  const viewPath = join(dir, ".handoff", "views", "HANDOFF.md");
+  await writeFile(viewPath, (await readFile(viewPath, "utf-8")) + "\n- manual injected task\n");
 
   const res = spawnSync(process.execPath, [join(root, "scripts", "node", "load.mjs")], { cwd: dir, encoding: "utf-8" });
   assertEqual(res.status, 0, `load failed: ${res.stderr}`);
-  assertIncludes(res.stderr, "tasks.md");
+  assertIncludes(res.stderr, "HANDOFF.md");
   assertIncludes(res.stdout, "Current understanding:");
   assertNotIncludes(res.stdout, "manual injected task");
 });
 
-test("load: v2 handoff with a missing map falls back to the HANDOFF.md view", async () => {
+test("load: v3 handoff with a missing map falls back to the generated view", async () => {
   const dir = await initTempRepo();
   runSave(dir);
   await rm(join(dir, ".handoff", "context-map.md"));
@@ -310,27 +344,28 @@ test("load: v2 handoff with a missing map falls back to the HANDOFF.md view", as
   assertIncludes(res.stdout, "Project: fixture-app");
 });
 
-test("save: low-verbosity saves preserve view hashes and tamper detection for skipped views", async () => {
+test("save: low-verbosity saves keep hashes consistent and tamper detection intact", async () => {
   const dir = await initTempRepo();
   runSave(dir);
   runSave(dir, ["--verbosity", "low"]);
 
-  // The skipped views keep their hash entries in context.json.
-  const json = JSON.parse(await readFile(join(dir, ".handoff", "context.json"), "utf-8"));
-  for (const name of ["HANDOFF.md", "tasks.md", "decisions.md"]) {
-    const content = await readFile(join(dir, ".handoff", name), "utf-8");
-    assertEqual(json.views[name], sha256Hex(content), `low save dropped the ${name} hash entry`);
+  // Every stored hash still matches the on-disk file after a low save.
+  const handoff = join(dir, ".handoff");
+  const json = JSON.parse(await readFile(join(handoff, "context.json"), "utf-8"));
+  for (const [name, hash] of Object.entries(json.hashes)) {
+    const content = await readFile(join(handoff, name), "utf-8");
+    assertEqual(hash, sha256Hex(content), `low save dropped the ${name} hash entry`);
   }
 
-  // Tampering with a skipped view still warns on load (and on the next save).
-  const tasksPath = join(dir, ".handoff", "tasks.md");
-  await writeFile(tasksPath, (await readFile(tasksPath, "utf-8")) + "\n- [ ] manual injected task\n");
+  // Tampering with the generated view still warns on load (and on the next save).
+  const viewPath = join(handoff, "views", "HANDOFF.md");
+  await writeFile(viewPath, (await readFile(viewPath, "utf-8")) + "\n- manual injected task\n");
   const loadRes = spawnSync(process.execPath, [join(root, "scripts", "node", "load.mjs")], { cwd: dir, encoding: "utf-8" });
   assertEqual(loadRes.status, 0, `load failed: ${loadRes.stderr}`);
-  assertIncludes(loadRes.stderr, "tasks.md");
+  assertIncludes(loadRes.stderr, "HANDOFF.md");
   const saveRes = spawnSync(process.execPath, [join(root, "scripts", "node", "save.mjs"), "--verbosity", "low"], { cwd: dir, encoding: "utf-8" });
   assertEqual(saveRes.status, 0, `save failed: ${saveRes.stderr}`);
-  assertIncludes(saveRes.stderr, "tasks.md");
+  assertIncludes(saveRes.stderr, "HANDOFF.md");
 });
 
 // ── Legacy migration (v2) ─────────────────────────────────────────────────
@@ -341,39 +376,40 @@ async function copyHandoffFixture(name) {
   return dir;
 }
 
-test("migrate: save migrates a legacy 1.x handoff with backup and stays idempotent", async () => {
+test("migrate: save migrates a legacy 1.x handoff to v3 with backup and stays idempotent", async () => {
   const dir = await copyHandoffFixture("legacy-1x");
   const out = runSave(dir);
   assertIncludes(out, "migrat", "save should announce the migration");
 
-  const map = parseContextMap(await readFile(join(dir, ".handoff", "context-map.md"), "utf-8"));
-  assert(map, "migration did not produce a readable context map");
-  assertEqual(map.sections.goal[0].text, "feat: add rate limiting middleware");
-  const taskTexts = map.sections.tasks.map((n) => n.text);
-  assert(taskTexts.some((t) => t.includes("Add Redis backend for distributed rate limiting")), "legacy task lost");
+  const handoff = join(dir, ".handoff");
+  const map = parseContextMapV3(await readFile(join(handoff, "context-map.md"), "utf-8"));
+  assert(map, "migration did not produce a readable v3 context map");
+  assertEqual(map.sections.goals[0].label, "feat: add rate limiting middleware");
   assert(map.sections.tasks.every((n) => !n.checked), "legacy tasks should stay pending");
-  assert(
-    map.sections.decisions.some((n) => n.text.includes("Simpler to reason about bursty traffic")),
-    "decision rationale lost"
-  );
-  assert(
-    map.sections.risks.some((n) => n.text.includes("1 high-priority TODO/FIXME items pending")),
-    "legacy risk lost"
-  );
+  assert(map.sections.tasks.every((n) => n.id && n.id.startsWith("task")), "legacy tasks lost their stable IDs");
+  const tasksMd = await readFile(join(handoff, "content", "tasks.md"), "utf-8");
+  assertIncludes(tasksMd, "Add Redis backend for distributed rate limiting", "legacy task body lost");
+  const decisionsMd = await readFile(join(handoff, "content", "decisions.md"), "utf-8");
+  assertIncludes(decisionsMd, "Simpler to reason about bursty traffic", "decision rationale lost");
+  const risksMd = await readFile(join(handoff, "content", "risks.md"), "utf-8");
+  assertIncludes(risksMd, "1 high-priority TODO/FIXME items pending", "legacy risk lost");
 
-  // Originals are backed up under .handoff/history/migrations/<UTC-timestamp>/.
-  const migrationsRoot = join(dir, ".handoff", "history", "migrations");
+  // Legacy root views are retired; originals are backed up.
+  for (const legacy of ["HANDOFF.md", "tasks.md", "decisions.md"]) {
+    assert(!existsSync(join(handoff, legacy)), `legacy root file '${legacy}' must be retired`);
+  }
+  const migrationsRoot = join(handoff, "history", "migrations");
   assertEqual((await readdir(migrationsRoot)).length, 1, "expected exactly one backup directory");
   const backupDir = join(migrationsRoot, (await readdir(migrationsRoot))[0]);
   assertIncludes(await readFile(join(backupDir, "HANDOFF.md"), "utf-8"), "v1.2.0", "backup must hold the original HANDOFF.md");
   assertIncludes(await readFile(join(backupDir, "context.json"), "utf-8"), "my-api", "backup must hold the original context.json");
   assert(existsSync(join(backupDir, ".handoff.config.json")), "config not backed up");
 
-  // Versions upgrade to v2.
+  // Versions upgrade to v3.
   const config = JSON.parse(await readFile(join(dir, ".handoff.config.json"), "utf-8"));
-  assertEqual(config.version, PROTOCOL_VERSION, "config version not upgraded");
-  const json = JSON.parse(await readFile(join(dir, ".handoff", "context.json"), "utf-8"));
-  assertEqual(json.version, PROTOCOL_VERSION, "context.json version not upgraded");
+  assertEqual(config.version, V3_PROTOCOL_VERSION, "config version not upgraded");
+  const json = JSON.parse(await readFile(join(handoff, "context.json"), "utf-8"));
+  assertEqual(json.protocolVersion, V3_PROTOCOL_VERSION, "context.json version not upgraded");
   assert(json.diagnostics.migration.length > 0, "migration diagnostics missing from context.json");
 
   // Repeated save: already migrated, no second backup.
@@ -390,31 +426,29 @@ test("migrate: conflicting handoff keeps map semantics and records labeled confl
   const dir = await copyHandoffFixture("conflicting");
   runSave(dir);
 
-  const map = parseContextMap(await readFile(join(dir, ".handoff", "context-map.md"), "utf-8"));
-  assertEqual(map.sections.goal.length, 1, "singleton goal duplicated");
-  assertEqual(map.sections.goal[0].text, "Ship the map-approved compiler release", "map goal must win");
+  const handoff = join(dir, ".handoff");
+  const map = parseContextMapV3(await readFile(join(handoff, "context-map.md"), "utf-8"));
+  assertEqual(map.sections.goals.length, 1, "singleton goal duplicated");
+  assertEqual(map.sections.goals[0].label, "Ship the map-approved compiler release", "map goal must win");
 
   const questions = map.sections.questions;
-  assert(questions.some((n) => n.text === "How should v3 rank branches?"), "map question lost");
-  const conflictIdx = questions.findIndex((n) => n.text === "Migration conflict");
-  assert(conflictIdx >= 0, "Migration conflict node missing from Open Questions");
-  const children = questions.slice(conflictIdx + 1).filter((n) => n.depth > 0).map((n) => n.text);
-  assert(
-    children.some((t) => t.includes("JSON draft goal superseded by the map") && t.includes("(source: context.json)")),
-    `context.json conflict not labeled: ${JSON.stringify(children)}`
-  );
-  assert(
-    children.some((t) => t.includes("HANDOFF view goal superseded by the map") && t.includes("(source: HANDOFF.md)")),
-    `HANDOFF.md conflict not labeled: ${JSON.stringify(children)}`
-  );
+  assert(questions.some((n) => n.label === "How should v3 rank branches"), "map question lost");
+  const conflictParent = questions.find((n) => n.label === "Migration conflict");
+  assert(conflictParent, "Migration conflict node missing from Open Questions");
+  const children = questions.filter((n) => n.depth > 0);
+  assertEqual(children.length, 4, `every conflict child must become its own node: ${JSON.stringify(children.map((n) => n.label))}`);
+  const questionsMd = await readFile(join(handoff, "content", "open-questions.md"), "utf-8");
+  assertIncludes(questionsMd, "JSON draft goal superseded by the map (source: context.json)");
+  assertIncludes(questionsMd, "HANDOFF view goal superseded by the map (source: HANDOFF.md)");
 
-  assertEqual(map.sections.excluded[0].text, "No vector database in v3", "exclusion lost");
+  assertEqual(map.sections.excluded[0].label, "No vector database in v3", "exclusion lost");
   const tasks = map.sections.tasks;
-  const shared = tasks.filter((n) => n.text.includes("Wire the context compiler into load"));
+  const shared = tasks.filter((n) => n.label.includes("Wire the context compiler into load"));
   assertEqual(shared.length, 1, "overlapping task not deduplicated");
   assertEqual(shared[0].checked, false, "map task state lost to the legacy duplicate");
-  assert(tasks.some((n) => n.text.includes("Legacy-only task from context.json")), "unique context.json task lost");
-  assert(tasks.some((n) => n.text.includes("Legacy-only task from HANDOFF.md")), "unique HANDOFF.md task lost");
+  const tasksMd = await readFile(join(handoff, "content", "tasks.md"), "utf-8");
+  assertIncludes(tasksMd, "Legacy-only task from context.json", "unique context.json task lost");
+  assertIncludes(tasksMd, "Legacy-only task from HANDOFF.md", "unique HANDOFF.md task lost");
 });
 
 test("load: legacy handoffs warn that migration is available (read-only)", () => {
@@ -427,14 +461,25 @@ test("load: legacy handoffs warn that migration is available (read-only)", () =>
   assertIncludes(res.stdout, "feat: add rate limiting middleware", "legacy load behavior changed");
 });
 
-test("load: already-migrated v2 handoff does not warn about migration", () => {
+test("load: a v2 handoff warns that the next save migrates to v3 (read-only)", () => {
   const res = spawnSync(process.execPath, [join(root, "scripts", "node", "load.mjs")], {
     cwd: join(fixturesDir, "handoffs", "migrated"),
     encoding: "utf-8",
   });
   assertEqual(res.status, 0, `load failed: ${res.stderr}`);
-  assertNotIncludes(res.stderr, "migrat", "v2 handoff should not trigger a migration warning");
-  assertIncludes(res.stdout, "Already migrated v2 goal");
+  assertIncludes(res.stderr, "migrat", "v2 handoff should trigger a v3 migration note");
+  assertIncludes(res.stdout, "Already migrated v2 goal", "v2 load behavior changed");
+});
+
+test("load: a v3 handoff does not warn about migration", () => {
+  const res = spawnSync(process.execPath, [join(root, "scripts", "node", "load.mjs")], {
+    cwd: join(fixturesDir, "v3", "basic"),
+    encoding: "utf-8",
+  });
+  assertEqual(res.status, 0, `load failed: ${res.stderr}`);
+  assertNotIncludes(res.stderr, "migrat", "v3 handoff must not trigger a migration note");
+  assertIncludes(res.stdout, "Ship the v3 context directory release");
+  assertIncludes(res.stdout, "Pending tasks: 1");
 });
 
 // ── Config validation integration ────────────────────────────────────────────

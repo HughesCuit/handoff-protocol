@@ -29,21 +29,22 @@ import { mkdirSync, writeFileSync, readFileSync, readdirSync, statSync, existsSy
 import { join, extname, relative, dirname } from "node:path";
 import { createInterface } from "node:readline";
 import {
-  buildInferredSections,
   filterSensitive,
-  HANDOFF_FILES,
   MAP_FILENAME,
-  parseContextMap,
-  PROTOCOL_VERSION,
-  reconcileContextMap,
-  renderContextMap,
+  V3_PROTOCOL_VERSION,
 } from "./context-map.mjs";
 import {
-  buildContextJson,
+  buildInferredV3Sections,
+  loadHandoffState,
+  reconcileV3State,
+} from "../handoff-state.mjs";
+import { V3_TRACKED_PATHS } from "../content-files.mjs";
+import {
   buildInitialV3Files,
-  generateViews,
+  buildV3ContextJson,
+  renderV3Files,
   sha256Hex,
-  viewTamperWarnings,
+  writeFilesAtomically,
 } from "../views.mjs";
 import {
   extractTodoComments,
@@ -51,8 +52,8 @@ import {
   SOURCE_EXTENSIONS,
 } from "../source-comments.mjs";
 import { CONFIG_FILENAME, validateProjectConfig } from "../config.mjs";
-import { applyMigration, planMigration } from "../migrate.mjs";
-import { writeSnapshot } from "../snapshots.mjs";
+import { applyV3Migration, detectLayout, planV2ToV3Migration } from "../migrate-v3.mjs";
+import { writeV3Snapshot } from "../snapshots.mjs";
 
 // ── Security ─────────────────────────────────────────────────────────────────
 // SENSITIVE_PATTERNS and filterSensitive live in ./context-map.mjs (shared with
@@ -136,7 +137,7 @@ function ensureSubmoduleReady(cwd) {
 }
 
 function commitAndPushSubmodule(handoffDir) {
-  for (const file of HANDOFF_FILES) {
+  for (const file of V3_TRACKED_PATHS) {
     runCommand(`git add ${file}`, { cwd: handoffDir });
   }
 
@@ -219,7 +220,7 @@ async function initStorage(cwd, mode) {
     mkdirSync(join(cwd, ".handoff"), { recursive: true });
 
     const config = {
-      version: PROTOCOL_VERSION,
+      version: "2.0.0",
       storage: { mode: "direct", path: ".handoff" },
     };
     validateConfigOrExit(config);
@@ -279,7 +280,7 @@ async function initStorage(cwd, mode) {
     }
 
     const config = {
-      version: PROTOCOL_VERSION,
+      version: "2.0.0",
       storage: { mode: "submodule", path: ".handoff", remote: remoteUrl },
     };
     validateConfigOrExit(config);
@@ -347,23 +348,16 @@ function readProjectInfo() {
   return { name: "unknown", language: "unknown" };
 }
 
-// ── Legacy migration ─────────────────────────────────────────────────────────
+// ── v3 migration and canonical state ───────────────────────────────────────
 
-// Filesystem adapter for the shared, runtime-agnostic migration core.
-const migrationIo = {
+// Filesystem adapter for the shared, runtime-agnostic v3 cores (migration,
+// atomic writes, snapshots, state loading).
+const handoffIo = {
   readFile: async (p) => readFileSync(p, "utf-8"),
   writeFile: async (p, content) => writeFileSync(p, content),
   rename: async (from, to) => renameSync(from, to),
   mkdir: async (p) => mkdirSync(p, { recursive: true }),
   exists: async (p) => existsSync(p),
-  remove: async (p) => rmSync(p, { force: true }),
-};
-
-// Filesystem adapter for the shared, runtime-agnostic snapshot core.
-const snapshotIo = {
-  readFile: async (p) => readFileSync(p, "utf-8"),
-  writeFile: async (p, content) => writeFileSync(p, content),
-  mkdir: async (p) => mkdirSync(p, { recursive: true }),
   listDir: async (p) => {
     try {
       return readdirSync(p);
@@ -374,16 +368,34 @@ const snapshotIo = {
   remove: async (p) => rmSync(p, { force: true }),
 };
 
+function layoutOfDir(handoffDir) {
+  let top;
+  try {
+    top = readdirSync(handoffDir);
+  } catch {
+    return "empty";
+  }
+  const files = [...top];
+  for (const sub of ["content", "views"]) {
+    try {
+      for (const n of readdirSync(join(handoffDir, sub))) files.push(`${sub}/${n}`);
+    } catch {
+      // Subdirectory absent: not a v3 marker.
+    }
+  }
+  return detectLayout(files);
+}
+
 /**
- * Migrate a legacy (pre-v2) handoff into the canonical model before the save
- * proceeds. The migration is atomic: originals are backed up under
+ * Migrate a pre-v3 handoff (v2 or legacy 1.x) into the canonical v3 model
+ * before the save proceeds. Atomic: originals are backed up under
  * .handoff/history/migrations/<UTC-timestamp>/ and only replaced after every
- * temporary output validates. Migrated nodes enter the map as user-owned
- * content, so they always win over this save's fresh inference. Returns the
- * migration diagnostics (recorded in context.json), or null when the handoff
- * is already v2.
+ * temporary output validates; the config version upgrade renames last.
+ * Returns the migration diagnostics (recorded in context.json), or null when
+ * the handoff is already v3 or has no data.
  */
-async function migrateLegacyHandoff(cwd, handoffDir) {
+async function migrateToV3(cwd, handoffDir) {
+  if (layoutOfDir(handoffDir) === "v3") return null;
   const readIfExists = (p) => {
     try {
       return readFileSync(p, "utf-8");
@@ -391,24 +403,40 @@ async function migrateLegacyHandoff(cwd, handoffDir) {
       return undefined;
     }
   };
-  const plan = planMigration({
+  const inputs = {
     config: readIfExists(join(cwd, CONFIG_FILENAME)),
     contextJson: readIfExists(join(handoffDir, "context.json")),
     handoffMd: readIfExists(join(handoffDir, "HANDOFF.md")),
     tasksMd: readIfExists(join(handoffDir, "tasks.md")),
     decisionsMd: readIfExists(join(handoffDir, "decisions.md")),
     contextMapMd: readIfExists(join(handoffDir, MAP_FILENAME)),
-  });
+  };
+  const hasAnyInput = Object.entries(inputs)
+    .filter(([key]) => key !== "config")
+    .some(([, value]) => value != null);
+  if (!hasAnyInput) return null;
+
+  const plan = planV2ToV3Migration(inputs);
   if (!plan.needed) return null;
 
-  const result = await applyMigration(plan, { handoffDir, configPath: join(cwd, CONFIG_FILENAME) }, migrationIo);
-  console.log(`Legacy handoff detected — migrated to Handoff Protocol v${PROTOCOL_VERSION}.`);
+  const result = await applyV3Migration(handoffIo, plan, { handoffDir, configPath: join(cwd, CONFIG_FILENAME) });
+  console.log(`Previous handoff layout detected — migrated to Handoff Protocol v${V3_PROTOCOL_VERSION}.`);
   console.log(`Backup: ${result.backupDir}`);
   for (const entry of plan.diagnostics.migration) console.log(`  - ${entry}`);
   if (plan.diagnostics.conflicts.length > 0) {
     console.log(`  - ${plan.diagnostics.conflicts.length} conflict(s) preserved under Open Questions > Migration conflict`);
   }
   return plan.diagnostics;
+}
+
+/**
+ * Load the canonical v3 state, tolerating a fresh (not yet initialized)
+ * directory. A present-but-invalid state aborts the save rather than
+ * destroying user content.
+ */
+async function loadExistingState(handoffDir) {
+  if (!existsSync(join(handoffDir, MAP_FILENAME))) return null;
+  return loadHandoffState(handoffIo, handoffDir);
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
@@ -433,9 +461,9 @@ async function save(mode, lang, verbosity) {
     mkdirSync(handoffDir, { recursive: true });
   }
 
-  // Legacy (pre-v2) handoffs migrate atomically into the canonical model
-  // before inference reconciles into the map below.
-  const migrationDiagnostics = await migrateLegacyHandoff(cwd, handoffDir);
+  // Pre-v3 handoffs (v2 or legacy 1.x) migrate atomically into the canonical
+  // v3 model before inference reconciles below.
+  const migrationDiagnostics = await migrateToV3(cwd, handoffDir);
 
   const { name, language } = readProjectInfo();
   const gitBranch = runCommand("git branch --show-current") || "unknown";
@@ -447,8 +475,7 @@ async function save(mode, lang, verbosity) {
   const commitCount = verbosity === "high" ? 20 : verbosity === "low" ? 3 : 5;
   const recentCommits = runCommand(`git log --oneline -n ${commitCount}`) || "";
   const commits = recentCommits.split("\n").filter((l) => l.trim());
-  const inferredGoal = commits[0]?.replace(/^[a-f0-9]+\s+/, "") || "";
-  const completed = commits.slice(1, commitCount).map((c) => c.replace(/^[a-f0-9]+\s+/, ""));
+  const completed = commits.slice(1, commitCount).map((c) => c.replace(/^[a-f0-9]+\s/, ""));
 
   const modifiedFiles = (runCommand("git status --porcelain") || "").split("\n").filter((l) => l.trim()).map((line) => {
     const sc = line.substring(0, 2).trim();
@@ -462,96 +489,94 @@ async function save(mode, lang, verbosity) {
   const maxTodos = verbosity === "high" ? 50 : verbosity === "low" ? 5 : 20;
   const status = modifiedFiles.length === 0 ? "idle - no pending changes" : git.is_dirty ? `in-progress - ${modifiedFiles.length} file(s) modified` : "ready - changes committed";
 
-  const ctx = {
-    version: PROTOCOL_VERSION, timestamp: new Date().toISOString(), agent: process.env.AGENT_NAME || "opencode",
-    project: name, current_goal: inferredGoal, status, completed, modified_files: modifiedFiles,
-    todos: todos.slice(0, maxTodos), blockers: [], decisions: [], next_steps: [], git, risks: [], notes: commits.join("\n"),
-    lang: lang || language, verbosity,
-  };
+  const timestamp = new Date().toISOString();
+  const agent = process.env.AGENT_NAME || "opencode";
 
-  // Context Map: the only writable semantic source. Inference reconciles
-  // into context-map.md on every save, at every mode and verbosity level;
-  // user-edited nodes always win over agent inference, and agent-managed
-  // nodes are refreshed only by non-empty inference, so a low-verbosity save
-  // never degrades the map. The sensitive-data filter is applied before any
-  // content is written.
-  const inferred = buildInferredSections(ctx);
-  const mapPath = join(handoffDir, MAP_FILENAME);
-  let existingMap = null;
+  // Verified project evidence becomes inference. Current Goal is never
+  // inferred: commit messages (including release commits) describe history,
+  // not goals — only an explicit user goal or an existing valid goal
+  // populates that section.
+  const inferred = buildInferredV3Sections({
+    status,
+    todos: todos.slice(0, maxTodos),
+    nextSteps: [],
+    decisions: [],
+    risks: [],
+    blockers: [],
+    notes: commits.join("\n"),
+  });
+
+  // Previous metadata supplies monotonic ID counters and view hashes.
+  let previousJson = null;
   try {
-    existingMap = parseContextMap(readFileSync(mapPath, "utf-8"));
+    previousJson = JSON.parse(readFileSync(join(handoffDir, "context.json"), "utf-8"));
   } catch {
-    // Absent or unreadable: start from a fresh map.
+    // No readable previous context.json: counters recover from durable state.
   }
-  const reconciled = reconcileContextMap(existingMap, inferred);
-  const mapContent = filterSensitive(renderContextMap(reconciled, { lang: lang || undefined }));
 
-  // HANDOFF.md / tasks.md / decisions.md are deterministic views generated
-  // from the reconciled map plus save-time machine metadata — never from
-  // inference directly.
-  const metadata = {
-    timestamp: ctx.timestamp,
-    agent: ctx.agent,
-    project: ctx.project,
-    lang: ctx.lang,
-    verbosity,
-    git: ctx.git,
-    completed,
-    modifiedFiles,
-    blockers: ctx.blockers,
-    nextSteps: ctx.next_steps,
+  // Reconcile the existing canonical state with fresh inference. User-owned
+  // labels, bodies, hierarchy, and task states always win; IDs allocate only
+  // for genuinely new semantic nodes.
+  const existing = await loadExistingState(handoffDir);
+  const reconciled = reconcileV3State({ existing, inferred, metadata: previousJson });
+  const state = {
+    version: V3_PROTOCOL_VERSION,
+    map: reconciled.map,
+    content: reconciled.content,
+    diagnostics: reconciled.diagnostics,
   };
-  const views = {};
-  for (const [name, content] of Object.entries(generateViews(reconciled, metadata, { verbosity }))) {
-    views[name] = filterSensitive(content);
-  }
 
-  // Manual edits to generated views are overwritten, never imported. Warn
+  // Manual edits to the generated view are overwritten, never imported. Warn
   // when the on-disk view no longer matches the hash stored by the last save.
-  let previousViews = null;
-  try {
-    previousViews = JSON.parse(readFileSync(join(handoffDir, "context.json"), "utf-8")).views;
-  } catch {
-    // No readable previous context.json: nothing to compare against.
-  }
-  const currentContents = {};
-  if (previousViews) {
-    for (const name of Object.keys(previousViews)) {
-      try {
-        currentContents[name] = readFileSync(join(handoffDir, name), "utf-8");
-      } catch {
-        // Missing views are regenerated silently.
+  const storedViewHash = previousJson && previousJson.hashes && previousJson.hashes["views/HANDOFF.md"];
+  if (storedViewHash) {
+    try {
+      const current = readFileSync(join(handoffDir, "views", "HANDOFF.md"), "utf-8");
+      if (sha256Hex(current) !== storedViewHash) {
+        console.error(
+          "Warning: views/HANDOFF.md was manually edited, but it is generated from context-map.md and the content/ files. " +
+          "Edit those instead — manual view changes are never imported and are overwritten on save."
+        );
       }
-    }
-    for (const warning of viewTamperWarnings(previousViews, currentContents)) {
-      console.error(warning);
+    } catch {
+      // Missing views are regenerated silently.
     }
   }
 
-  writeFileSync(mapPath, mapContent);
-  for (const [name, content] of Object.entries(views)) {
-    writeFileSync(join(handoffDir, name), content);
+  // Render every file from the canonical state and filter sensitive data
+  // before anything is persisted.
+  const metadata = { timestamp, agent, project: name, lang: lang || language, git };
+  const files = {};
+  for (const [file, content] of Object.entries(renderV3Files(state, metadata))) {
+    files[file] = filterSensitive(content);
   }
-  // context.json v2: metadata + Git state + hashes of the views just written.
-  const viewHashes = {};
-  for (const [name, content] of Object.entries(views)) {
-    viewHashes[name] = sha256Hex(content);
-  }
-  // Low-verbosity saves do not rewrite tasks.md/decisions.md; carry their
-  // stored hashes forward so tamper detection keeps covering them. Views
-  // deleted on disk are dropped instead of haunting future saves.
-  for (const [name, hash] of Object.entries(previousViews || {})) {
-    if (!(name in viewHashes) && currentContents[name] != null) {
-      viewHashes[name] = hash;
-    }
-  }
-  const contextJson = buildContextJson(metadata, viewHashes, migrationDiagnostics || undefined);
-  writeFileSync(join(handoffDir, "context.json"), filterSensitive(JSON.stringify(contextJson, null, 2)));
+  const contextJson = buildV3ContextJson({
+    state,
+    project: name,
+    git,
+    environment: { timestamp, agent, lang: metadata.lang },
+    diagnostics: {
+      migration: (migrationDiagnostics && migrationDiagnostics.migration) || [],
+      conflicts: (migrationDiagnostics && migrationDiagnostics.conflicts) || [],
+      integrity: reconciled.diagnostics,
+    },
+    files,
+  });
+  // Counters are monotonic across deletions; the reconciled high-water marks
+  // win over what a fresh recovery would observe.
+  contextJson.idCounters = reconciled.counters;
+  files["context.json"] = filterSensitive(JSON.stringify(contextJson, null, 2));
 
-  // Semantic snapshot (v2.3): record the reconciled map after a successful
-  // canonical save. Best-effort — a failed snapshot never fails the save.
+  await writeFilesAtomically(handoffIo, handoffDir, files);
+
+  for (const diagnostic of reconciled.diagnostics) {
+    console.error(`Note: ${diagnostic}`);
+  }
+
+  // Semantic snapshot: record the canonical state after a successful save.
+  // Best-effort — a failed snapshot never fails the save.
   try {
-    const snapshot = await writeSnapshot(reconciled, { handoffDir }, snapshotIo);
+    const snapshot = await writeV3Snapshot(state, { handoffDir }, handoffIo);
     if (snapshot.written) console.log(`Snapshot: ${snapshot.path}`);
   } catch (err) {
     console.error(`Warning: snapshot failed: ${err.message}`);
@@ -571,8 +596,7 @@ async function save(mode, lang, verbosity) {
   console.log(`Language: ${lang || language}`);
   console.log(`Verbosity: ${verbosity}`);
   console.log(`Project: ${name} (${language})`);
-  const savedFiles = verbosity === "low" ? "HANDOFF.md, context.json, context-map.md" : "HANDOFF.md, context.json, tasks.md, decisions.md, context-map.md";
-  console.log(`Files: ${savedFiles}`);
+  console.log(`Files: context-map.md, content/ (8 section files), views/HANDOFF.md, context.json`);
   if (todos.length > 0) console.log(`Scanned: ${todos.length} TODO/FIXME items found`);
 }
 

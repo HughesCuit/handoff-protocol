@@ -18,7 +18,7 @@
  */
 
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import {
   contextMapHasContent,
@@ -30,13 +30,15 @@ import {
 } from "./context-map.mjs";
 import {
   compileContext,
+  compileV3Context,
   DEFAULT_BUDGET,
   MIN_BUDGET,
   validateBudget,
 } from "../context-compiler.mjs";
-import { viewTamperWarnings } from "../views.mjs";
+import { loadHandoffState } from "../handoff-state.mjs";
+import { detectLayout } from "../migrate-v3.mjs";
+import { sha256Hex, viewTamperWarnings } from "../views.mjs";
 import { validateProjectConfig } from "../config.mjs";
-import { isMigrationNeeded } from "../migrate.mjs";
 
 // ── Security ─────────────────────────────────────────────────────────────────
 // SENSITIVE_PATTERNS and filterSensitive live in ./context-map.mjs (shared with
@@ -102,7 +104,7 @@ function parseHandoffMd(content) {
       case "completed work": result.completed.push(item); break;
       case "modified files": { const fm = item.match(/`([^`]+)`/); if (fm) result.modified_files.push({ path: fm[1], description: item, change_type: "modified" }); break; }
       case "outstanding issues": result.blockers.push(item); break;
-      case "todo": result.todos.push({ task: item.replace(/^\[[ x]\]\s*/, ""), priority: "medium", status: item.includes("[x]") ? "completed" : "pending" }); break;
+      case "todo": case "tasks": result.todos.push({ task: item.replace(/^\[[ x]\]\s*/, ""), priority: "medium", status: item.includes("[x]") ? "completed" : "pending" }); break;
       case "recommended next steps": result.next_steps.push(item.replace(/^\d+\.\s*/, "")); break;
       case "risks / notes": case "risks": result.risks.push(item); break;
     }
@@ -146,9 +148,68 @@ function defaultFocusFromMap(map) {
   return parts.map((t) => normalizeNodeText(t)).join(" ");
 }
 
+// ── v3 loading ───────────────────────────────────────────────────────────────
+
+const v3Io = {
+  readFile: async (p) => readFileSync(p, "utf-8"),
+};
+
+function layoutOfDir(handoffDir) {
+  let top;
+  try {
+    top = readdirSync(handoffDir);
+  } catch {
+    return "empty";
+  }
+  const files = [...top];
+  for (const sub of ["content", "views"]) {
+    try {
+      for (const n of readdirSync(join(handoffDir, sub))) files.push(`${sub}/${n}`);
+    } catch {
+      // Subdirectory absent: not a v3 marker.
+    }
+  }
+  return detectLayout(files);
+}
+
+async function loadV3State(handoffDir) {
+  try {
+    return await loadHandoffState(v3Io, handoffDir);
+  } catch {
+    return null;
+  }
+}
+
+/** Project a canonical v3 state into HandoffContext-shaped fields. */
+function v3StateToContext(state, json) {
+  const labels = (key) => (state.map.sections[key] || []).map((n) => n.label);
+  const todos = (state.map.sections.tasks || []).map((n) => ({
+    task: n.label,
+    priority: n.priority || "medium",
+    status: n.checked ? "completed" : "pending",
+  }));
+  return {
+    version: (json && json.protocolVersion) || "3.0.0",
+    timestamp: (json && json.timestamp) || "",
+    agent: (json && json.agent) || "unknown",
+    project: (json && json.project) || "unknown",
+    current_goal: labels("goals").join("\n"),
+    status: labels("status").join("\n") || "unknown",
+    completed: [],
+    modified_files: [],
+    todos,
+    blockers: [],
+    decisions: labels("decisions"),
+    next_steps: [],
+    git: (json && json.git) || { branch: "unknown", latest_commit: "", commit_message: "", is_dirty: false },
+    risks: labels("risks"),
+    notes: labels("notes").join("\n"),
+  };
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
-function load(mode, compileOpts = null) {
+async function load(mode, compileOpts = null) {
   const cwd = process.cwd();
   const handoffDir = join(cwd, ".handoff");
   const storageConfig = readStorageConfig(cwd);
@@ -173,80 +234,121 @@ function load(mode, compileOpts = null) {
     return { understanding: "No handoff context found.", nextActions: ["Run `/handoff save` to create context"], risks: ["No handoff directory"], pendingTasks: 0, context: null, storageMode };
   }
 
-  // The Context Map is the semantic source; context.json supplements it with
-  // machine state (git, timestamps, modified files). Absent/empty/malformed
-  // maps fall back to the legacy path unchanged.
-  const map = loadContextMap(handoffDir);
+  const layout = layoutOfDir(handoffDir);
   let ctx = loadContextJson(handoffDir);
-  const legacyJsonVersion = ctx ? ctx.version : undefined;
   let compileDiagnostics = null;
 
-  // Generated views are never a semantic source. Warn when an on-disk view
-  // no longer matches the hash stored by the last save (manual edit); the
-  // map stays authoritative regardless.
-  if (ctx && ctx.views) {
-    const currentContents = {};
-    for (const name of Object.keys(ctx.views)) {
-      try {
-        currentContents[name] = readFileSync(join(handoffDir, name), "utf-8");
-      } catch {
-        // Missing views are regenerated on the next save.
+  if (layout === "v3") {
+    // Canonical v3 state: directory + content files. context.json supplements
+    // machine state (git, timestamps); the generated view is never a source.
+    const state = await loadV3State(handoffDir);
+    if (state) {
+      const storedViewHash = ctx && ctx.hashes && ctx.hashes["views/HANDOFF.md"];
+      if (storedViewHash) {
+        try {
+          const current = readFileSync(join(handoffDir, "views", "HANDOFF.md"), "utf-8");
+          if (sha256Hex(current) !== storedViewHash) {
+            console.error(
+              "Warning: views/HANDOFF.md was manually edited, but it is generated from context-map.md and the content/ files. " +
+              "Edit those instead — manual view changes are never imported and are overwritten on save."
+            );
+          }
+        } catch {
+          // Missing views are regenerated on the next save.
+        }
+      }
+      for (const diagnostic of state.diagnostics || []) console.error(`Note: ${diagnostic}`);
+
+      let effective = state;
+      if (compileOpts) {
+        const defaultFocus = [
+          ...(state.map.sections.goals || []).map((n) => n.label),
+          ...(state.map.sections.tasks || []).filter((n) => !n.checked).map((n) => n.label),
+        ].map((t) => normalizeNodeText(t)).join(" ");
+        const focus = compileOpts.full ? "" : (compileOpts.focus ?? defaultFocus);
+        const compiled = compileV3Context({ state, focus, budget: compileOpts.budget, full: compileOpts.full });
+        effective = { ...state, map: compiled.state.map, content: compiled.state.content };
+        compileDiagnostics = {
+          focus: compileOpts.full ? "(full map)" : focus,
+          budget: compileOpts.budget ?? DEFAULT_BUDGET,
+          selectedPaths: compiled.selectedIds,
+          omittedCount: compiled.omittedCount,
+          estimatedTokens: compiled.estimatedTokens,
+          overflow: compiled.overflow,
+          fallbackReason: compiled.fallbackReason,
+        };
+      }
+      ctx = v3StateToContext(effective, ctx);
+    } else {
+      // Present-but-unreadable v3 state: the generated view is the last
+      // read-only fallback (semantics recover on the next save).
+      const viewPath = join(handoffDir, "views", "HANDOFF.md");
+      if (!existsSync(viewPath)) {
+        return { understanding: "No readable context.", nextActions: ["Run `/handoff save`"], risks: ["Invalid state"], pendingTasks: 0, context: null, storageMode };
+      }
+      const parsed = parseHandoffMd(readFileSync(viewPath, "utf-8"));
+      ctx = { version: "3.0.0", timestamp: new Date().toISOString(), agent: "unknown", project: parsed.project || "unknown", current_goal: parsed.current_goal || "", status: parsed.status || "unknown", completed: parsed.completed || [], modified_files: parsed.modified_files || [], todos: parsed.todos || [], blockers: parsed.blockers || [], decisions: [], next_steps: parsed.next_steps || [], git: parsed.git || { branch: "unknown", latest_commit: "", commit_message: "", is_dirty: false }, risks: parsed.risks || [], notes: "(parsed from views/HANDOFF.md)" };
+    }
+  } else {
+    // v2 / legacy path (read-only; the next save migrates to v3).
+    const map = loadContextMap(handoffDir);
+
+    // Generated views are never a semantic source. Warn when an on-disk view
+    // no longer matches the hash stored by the last save (manual edit); the
+    // map stays authoritative regardless.
+    if (ctx && ctx.views) {
+      const currentContents = {};
+      for (const name of Object.keys(ctx.views)) {
+        try {
+          currentContents[name] = readFileSync(join(handoffDir, name), "utf-8");
+        } catch {
+          // Missing views are regenerated on the next save.
+        }
+      }
+      for (const warning of viewTamperWarnings(ctx.views, currentContents)) {
+        console.error(warning);
       }
     }
-    for (const warning of viewTamperWarnings(ctx.views, currentContents)) {
-      console.error(warning);
+
+    if (map) {
+      let effectiveMap = map;
+      if (compileOpts) {
+        const focus = compileOpts.full ? "" : (compileOpts.focus ?? defaultFocusFromMap(map));
+        const compiled = compileContext(map, {
+          focus,
+          budget: compileOpts.budget,
+          full: compileOpts.full,
+        });
+        effectiveMap = compiled.map;
+        compileDiagnostics = {
+          focus: compileOpts.full ? "(full map)" : focus,
+          budget: compileOpts.budget ?? DEFAULT_BUDGET,
+          selectedPaths: compiled.selectedPaths,
+          omittedCount: compiled.omittedCount,
+          estimatedTokens: compiled.estimatedTokens,
+          overflow: compiled.overflow,
+          fallbackReason: compiled.fallbackReason,
+        };
+      }
+      ctx = mergeContextMapWithJson(effectiveMap, ctx);
+    } else if (ctx && !Array.isArray(ctx.todos)) {
+      // v2 context.json carries no semantic fields; without a readable map it
+      // cannot stand alone — fall through to the HANDOFF.md view.
+      ctx = null;
     }
-  }
 
-  if (map) {
-    // Map semantics win; context.json (when present) supplies machine state
-    // and any semantic field the map leaves empty. Works for map-only,
-    // mixed-format, and (map absent) legacy handoffs.
-    // With --focus/--budget/--full, the map is first compiled down to the
-    // relevant nodes; diagnostics travel with the result.
-    let effectiveMap = map;
-    if (compileOpts) {
-      const focus = compileOpts.full ? "" : (compileOpts.focus ?? defaultFocusFromMap(map));
-      const compiled = compileContext(map, {
-        focus,
-        budget: compileOpts.budget,
-        full: compileOpts.full,
-      });
-      effectiveMap = compiled.map;
-      compileDiagnostics = {
-        focus: compileOpts.full ? "(full map)" : focus,
-        budget: compileOpts.budget ?? DEFAULT_BUDGET,
-        selectedPaths: compiled.selectedPaths,
-        omittedCount: compiled.omittedCount,
-        estimatedTokens: compiled.estimatedTokens,
-        overflow: compiled.overflow,
-        fallbackReason: compiled.fallbackReason,
-      };
+    // Fallback: parse HANDOFF.md if the map is unusable and context.json is
+    // missing/invalid (legacy 1.x handoff).
+    if (!ctx) {
+      const mdPath = join(handoffDir, "HANDOFF.md");
+      if (!existsSync(mdPath)) return { understanding: "No readable context.", nextActions: ["Run `/handoff save`"], risks: ["Invalid state"], pendingTasks: 0, context: null, storageMode };
+      const parsed = parseHandoffMd(readFileSync(mdPath, "utf-8"));
+      ctx = { version: "1.0.0", timestamp: new Date().toISOString(), agent: "unknown", project: parsed.project || "unknown", current_goal: parsed.current_goal || "", status: parsed.status || "unknown", completed: parsed.completed || [], modified_files: parsed.modified_files || [], todos: parsed.todos || [], blockers: parsed.blockers || [], decisions: [], next_steps: parsed.next_steps || [], git: parsed.git || { branch: "unknown", latest_commit: "", commit_message: "", is_dirty: false }, risks: parsed.risks || [], notes: "(parsed from HANDOFF.md)" };
     }
-    ctx = mergeContextMapWithJson(effectiveMap, ctx);
-  } else if (ctx && !Array.isArray(ctx.todos)) {
-    // v2 context.json carries no semantic fields; without a readable map it
-    // cannot stand alone — fall through to the HANDOFF.md view.
-    ctx = null;
-  }
 
-  // Fallback: parse HANDOFF.md if the map is unusable and context.json is
-  // missing/invalid (legacy 1.x handoff).
-  if (!ctx) {
-    const mdPath = join(handoffDir, "HANDOFF.md");
-    if (!existsSync(mdPath)) return { understanding: "No readable context.", nextActions: ["Run `/handoff save`"], risks: ["Invalid state"], pendingTasks: 0, context: null, storageMode };
-    const parsed = parseHandoffMd(readFileSync(mdPath, "utf-8"));
-    ctx = { version: "1.0.0", timestamp: new Date().toISOString(), agent: "unknown", project: parsed.project || "unknown", current_goal: parsed.current_goal || "", status: parsed.status || "unknown", completed: parsed.completed || [], modified_files: parsed.modified_files || [], todos: parsed.todos || [], blockers: parsed.blockers || [], decisions: [], next_steps: parsed.next_steps || [], git: parsed.git || { branch: "unknown", latest_commit: "", commit_message: "", is_dirty: false }, risks: parsed.risks || [], notes: "(parsed from HANDOFF.md)" };
-  }
-
-  // Legacy (pre-v2) handoffs still load through the paths above; point at the
-  // atomic migration without changing read-only load behavior.
-  if (isMigrationNeeded({
-    mapPresent: !!map,
-    contextVersion: legacyJsonVersion || (map ? undefined : ctx && ctx.version),
-    configVersion: storageConfig && storageConfig.version,
-  })) {
-    console.error("Note: legacy handoff format (pre-v2) detected. Run `/handoff save` to migrate to v2; originals are backed up under .handoff/history/migrations/ automatically.");
+    if (layout === "v2" || layout === "legacy") {
+      console.error(`Note: ${layout === "v2" ? "v2" : "legacy (pre-v2)"} handoff format detected. Run \`/handoff save\` to migrate to v3; originals are backed up under .handoff/history/migrations/ automatically.`);
+    }
   }
 
   const parts = [`Project: ${ctx.project}`, `Status: ${ctx.status}`];
@@ -334,7 +436,7 @@ const cli = parseCliArgs(process.argv.slice(2));
 if (!["default", "auto", "merge"].includes(cli.mode)) { console.error(`Error: Unknown mode '${cli.mode}'`); process.exit(1); }
 
 try {
-  const result = load(cli.mode, cli.compile);
+  const result = await load(cli.mode, cli.compile);
   const mode = cli.mode;
   const lines = [`Storage: ${result.storageMode}`, "", "Current understanding:", result.understanding, "", "Recommended next actions:"];
   result.nextActions.forEach((a, i) => lines.push(`${i + 1}. ${a}`));

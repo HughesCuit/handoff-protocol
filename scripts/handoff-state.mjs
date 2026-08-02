@@ -349,7 +349,7 @@ export function recoverIdCounters(state, metadata) {
   } else if (typeof stored === "object" && !Array.isArray(stored)) {
     for (const [prefix, value] of Object.entries(stored)) {
       if (!(prefix in counters)) continue;
-      if (Number.isInteger(value) && value > 0) counters[prefix] = value;
+      if (Number.isInteger(value) && value >= 0) counters[prefix] = value;
       else recovered = true;
     }
   } else {
@@ -440,7 +440,7 @@ export function reconcileV3State({ existing, inferred, userIntent, metadata } = 
   );
 
   const diagnostics = [];
-  if (recovered) {
+  if (recovered && (existing || metadata)) {
     diagnostics.push("ID_COUNTER_RECOVERED: metadata counters were reconstructed from durable state");
   }
   const reject = (msg) => diagnostics.push(`INFERENCE_REJECTED: ${msg}`);
@@ -636,4 +636,57 @@ export function reconcileV3State({ existing, inferred, userIntent, metadata } = 
     counters,
     diagnostics: [...diagnostics, ...validateHandoffState(state)],
   };
+}
+
+// ── Save-path inference ──────────────────────────────────────────────────────
+
+/**
+ * Derive inferred v3 sections from verified project evidence (git state, TODO
+ * scan, machine status). Current Goal is NEVER inferred — only an explicit
+ * user goal or an existing valid goal populates that section, so commit
+ * messages (including release commits) can never become a goal.
+ *
+ * `evidence`: { status?, todos?: [{ task, priority?, status? }], nextSteps?,
+ *   decisions?: [{ title?, decision }], risks?, blockers?, notes? }.
+ * Returns `{ [sectionKey]: [{ label, summary, checked?, priority? }] }`.
+ */
+export function buildInferredV3Sections(evidence = {}) {
+  const inferred = {};
+  for (const key of V3_SECTION_KEYS) inferred[key] = [];
+
+  const status = String(evidence.status || "").trim();
+  if (status) inferred.status.push({ label: status, summary: status });
+
+  for (const todo of evidence.todos || []) {
+    if (!todo || !todo.task) continue;
+    const label = String(todo.task).trim();
+    if (!label) continue;
+    inferred.tasks.push({
+      label,
+      summary: label,
+      checked: todo.status === "completed",
+      priority: typeof todo.priority === "string" && todo.priority ? todo.priority : "medium",
+    });
+  }
+  for (const step of evidence.nextSteps || []) {
+    const label = String(step || "").trim();
+    if (label) inferred.tasks.push({ label, summary: label, checked: false });
+  }
+
+  for (const d of evidence.decisions || []) {
+    const label = (d && d.title ? `${d.title}: ${d.decision}` : String((d && d.decision) || "")).trim();
+    if (label) inferred.decisions.push({ label, summary: label });
+  }
+
+  for (const risk of [...(evidence.risks || []), ...(evidence.blockers || [])]) {
+    const label = String(risk || "").trim();
+    if (label) inferred.risks.push({ label, summary: label });
+  }
+
+  for (const line of String(evidence.notes || "").split("\n")) {
+    const label = line.trim();
+    if (label) inferred.notes.push({ label, summary: label });
+  }
+
+  return inferred;
 }
