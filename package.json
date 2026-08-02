@@ -42,5 +42,8 @@
   "scripts": {
     "test": "node --test \"tests/node/**/*.test.mjs\"",
     "test:deno": "deno test --allow-read --allow-write --allow-run --allow-env tests/deno/"
+  },
+  "devDependencies": {
+    "happy-dom": "^20.11.1"
   }
 }
