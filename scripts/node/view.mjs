@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn as realSpawn } from "node:child_process";
+import { realpathSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -301,6 +302,6 @@ async function main() {
   process.exitCode = 1;
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
   await main();
 }

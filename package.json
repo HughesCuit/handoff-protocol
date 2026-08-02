@@ -25,6 +25,8 @@
   "files": [
     "assets",
     "docs",
+    "!docs/superpowers",
+    "!docs/superpowers/**",
     "examples",
     "references",
     "scripts",

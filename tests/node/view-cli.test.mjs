@@ -289,6 +289,27 @@ test("ViewError carries a code", () => {
   assert.match(error.message, /detail/);
 });
 
+test("CLI entry guard runs main() when invoked through a symlink", async () => {
+  await withTempDir(async (dir) => {
+    const { symlink } = await import("node:fs/promises");
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const execFileAsync = promisify(execFile);
+    const viewPath = new URL("../../scripts/node/view.mjs", import.meta.url).pathname;
+    const linkPath = join(dir, "view-link.mjs");
+    await symlink(viewPath, linkPath);
+    let result;
+    try {
+      await execFileAsync(process.execPath, [linkPath, "--idle-minutes", "0"]);
+      result = { code: 0, stderr: "" };
+    } catch (error) {
+      result = { code: error.code, stderr: error.stderr };
+    }
+    assert.notEqual(result.code, 0, "main() must run and reject invalid args, not silently no-op");
+    assert.match(result.stderr, /VIEW_INVALID_IDLE_MINUTES/);
+  });
+});
+
 test("a held startup lock with no healthy daemon is recovered when stale", async () => {
   await withTempDir(async (runtimeDir) => {
     await withTempDir(async (projectDir) => {

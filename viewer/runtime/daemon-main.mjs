@@ -1,5 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 import {
   getRuntimeDir,
@@ -94,6 +96,6 @@ export async function startDaemon(options = {}) {
   return { close, port, controlToken, state, runtimeDir };
 }
 
-if (process.argv[1] === new URL(import.meta.url).pathname) {
+if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
   await startDaemon();
 }

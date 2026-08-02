@@ -68,6 +68,10 @@ export class SessionManager {
     if (!rootInfo.isDirectory()) {
       throw new TypeError("Workspace root must be an accessible directory.");
     }
+    // Prune and enforce capacity BEFORE binding a store / incrementing a refcount,
+    // so a failure here cannot leak a refcount for an unregistered session.
+    await this.prune();
+    await this.evictForCapacity();
     let entry = this.projectStores.get(canonicalRoot);
     if (!entry) {
       const store = this.createStore();
@@ -81,8 +85,6 @@ export class SessionManager {
       this.projectStores.set(canonicalRoot, entry);
     }
     entry.refCount += 1;
-    await this.prune();
-    await this.evictForCapacity();
     const session = {
       token,
       sessionId: createHash("sha256").update(token).digest("hex").slice(0, 16),
