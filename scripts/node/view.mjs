@@ -195,6 +195,10 @@ async function ensureDaemon(deps) {
       while ((await healthCheck(existing, { fetch: deps.fetch })) && deps.now() < deadline) {
         await deps.sleep(POLL_INTERVAL_MS);
       }
+      // Post-deadline re-check: if the old daemon is still healthy, shutdown failed.
+      if (await healthCheck(existing, { fetch: deps.fetch })) {
+        throw new ViewError("VIEW_DAEMON_VERSION_CONFLICT");
+      }
       await removeState(runtimeDir, deps.fsApi);
       return { state: await startDaemonCoordinated(runtimeDir, deps), reused: false };
     }
@@ -268,11 +272,17 @@ export async function runView(options = {}) {
     const session = await createViewerSession(state, { workspaceRoot, idleMinutes, fetch: deps.fetch });
     return { ok: true, json, output: json ? formatJson(session, reused) : formatHuman(session) };
   } catch (error) {
+    const json = argv.includes("--json");
     if (error instanceof ViewError) {
-      const json = options.json ?? argv.includes("--json");
       return { ok: false, json, error: { code: error.code, correction: CORRECTIONS[error.code] ?? "" } };
     }
-    throw error;
+    // Map runtime errors carrying a known VIEW_ code (e.g. DaemonStateError: VIEW_STATE_UNSAFE).
+    const code = error && typeof error.code === "string" ? error.code : null;
+    if (code && Object.prototype.hasOwnProperty.call(CORRECTIONS, code)) {
+      return { ok: false, json, error: { code, correction: CORRECTIONS[code] } };
+    }
+    // Unexpected error: report safely without leaking internals or absolute paths.
+    return { ok: false, json, error: { code: "VIEW_SESSION_CREATE_FAILED", correction: CORRECTIONS.VIEW_SESSION_CREATE_FAILED } };
   }
 }
 

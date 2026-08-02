@@ -302,3 +302,65 @@ test("a held startup lock with no healthy daemon is recovered when stale", async
     });
   });
 });
+
+test("returns VIEW_DAEMON_VERSION_CONFLICT when the old daemon ignores shutdown", async () => {
+  await withTempDir(async (runtimeDir) => {
+    await withTempDir(async (projectDir) => {
+      await makeProject(projectDir);
+      await writeState(runtimeDir, {
+        schemaVersion: 1, daemonVersion: "9.9.9", pid: 4321, port: 65432,
+        controlToken: CONTROL_TOKEN, startedAt: new Date().toISOString(),
+      });
+      let now = 1_000;
+      const fetch = async (url, options = {}) => {
+        const auth = options.headers?.Authorization;
+        if (url.endsWith("/control/health")) {
+          return auth === `Bearer ${CONTROL_TOKEN}`
+            ? { ok: true, async json() { return { pid: 4321, schemaVersion: 1, daemonVersion: "9.9.9" }; } }
+            : { ok: false, status: 401, async json() { return {}; } };
+        }
+        if (url.endsWith("/control/shutdown")) {
+          // Accepts the shutdown request but never actually exits (stays healthy).
+          return { ok: true, async json() { return {}; } };
+        }
+        return { ok: false, status: 404, async json() { return {}; } };
+      };
+      let spawned = 0;
+      const result = await runView({
+        argv: [],
+        cwd: projectDir,
+        runtimeDir,
+        fetch,
+        spawn: () => { spawned += 1; return { unref() {} }; },
+        now: () => now,
+        sleep: async () => { now += 1_000; await new Promise((r) => setImmediate(r)); },
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.error.code, "VIEW_DAEMON_VERSION_CONFLICT");
+      assert.equal(spawned, 0, "must not spawn a replacement while the old daemon is still alive");
+    });
+  });
+});
+
+test("returns VIEW_STATE_UNSAFE when the runtime directory is unsafe", async () => {
+  await withTempDir(async (projectDir) => {
+    await makeProject(projectDir);
+    const unsafeFs = {
+      async lstat() { return { isSymbolicLink: () => true, isDirectory: () => false, uid: 501, mode: 0o700 }; },
+      async stat() { return { isDirectory: () => true, uid: 501, mode: 0o700 }; },
+      async mkdir() {},
+      async chmod() {},
+    };
+    const { fake, options } = baseDeps("/tmp/unused-view-cli", projectDir, {
+      fsApi: unsafeFs,
+      tmpdir: "/tmp",
+      uid: 501,
+      platform: "darwin",
+    });
+    delete options.runtimeDir; // force getRuntimeDir to run and validate
+    const result = await runView(options);
+    assert.equal(result.ok, false);
+    assert.equal(result.error.code, "VIEW_STATE_UNSAFE");
+    assert.equal(fake.world.spawned, 0);
+  });
+});
