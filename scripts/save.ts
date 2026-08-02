@@ -28,7 +28,6 @@ import { ensureDir, walk, exists } from "https://deno.land/std@0.224.0/fs/mod.ts
 import { join, extname, dirname } from "https://deno.land/std@0.224.0/path/mod.ts";
 import {
   filterSensitive,
-  PROTOCOL_VERSION,
   V3_PROTOCOL_VERSION,
   CONTEXT_MAP_FILE,
 } from "./context-map.ts";
@@ -331,7 +330,7 @@ async function initStorage(cwd: string, mode?: string): Promise<StorageConfig | 
     await ensureDir(join(cwd, ".handoff"));
 
     const config: StorageConfig = {
-      version: PROTOCOL_VERSION,
+      version: V3_PROTOCOL_VERSION,
       storage: { mode: "direct", path: ".handoff" },
     };
     validateConfigOrExit(config);
@@ -403,7 +402,7 @@ async function initStorage(cwd: string, mode?: string): Promise<StorageConfig | 
     }
 
     const config: StorageConfig = {
-      version: PROTOCOL_VERSION,
+      version: V3_PROTOCOL_VERSION,
       storage: { mode: "submodule", path: ".handoff", remote: remoteUrl },
     };
     validateConfigOrExit(config);

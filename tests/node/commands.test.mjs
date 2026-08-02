@@ -69,7 +69,7 @@ test("init: direct mode creates .handoff/ and a portable config without promptin
 
   const raw = await readFile(join(dir, ".handoff.config.json"), "utf-8");
   const config = JSON.parse(raw);
-  assertEqual(config.version, PROTOCOL_VERSION);
+  assertEqual(config.version, "3.0.0", "init writes the v3 schema version");
   assertEqual(config.storage.mode, "direct");
   assertEqual(config.storage.path, ".handoff");
   assertNotIncludes(raw, dir, "config must not embed machine-specific absolute paths");

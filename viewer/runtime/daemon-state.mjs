@@ -15,7 +15,7 @@ import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 
 export const SCHEMA_VERSION = 1;
-export const DAEMON_VERSION = "2.4.0";
+export const DAEMON_VERSION = "3.0.0";
 export const STATE_FILENAME = "daemon.json";
 export const LOCK_FILENAME = "daemon.lock";
 export const DEFAULT_MAX_LOCK_AGE_MS = 30_000;

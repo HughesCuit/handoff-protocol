@@ -91,7 +91,7 @@ Deno.test("init: direct mode creates .handoff/ and a portable config without pro
 
   const raw = await Deno.readTextFile(`${dir}/.handoff.config.json`);
   const config = JSON.parse(raw);
-  assertEqual(config.version, PROTOCOL_VERSION);
+  assertEqual(config.version, "3.0.0", "init writes the v3 schema version");
   assertEqual(config.storage.mode, "direct");
   assertEqual(config.storage.path, ".handoff");
   assertNotIncludes(raw, dir, "config must not embed machine-specific absolute paths");

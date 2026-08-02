@@ -220,7 +220,7 @@ async function initStorage(cwd, mode) {
     mkdirSync(join(cwd, ".handoff"), { recursive: true });
 
     const config = {
-      version: "2.0.0",
+      version: V3_PROTOCOL_VERSION,
       storage: { mode: "direct", path: ".handoff" },
     };
     validateConfigOrExit(config);
@@ -280,7 +280,7 @@ async function initStorage(cwd, mode) {
     }
 
     const config = {
-      version: "2.0.0",
+      version: V3_PROTOCOL_VERSION,
       storage: { mode: "submodule", path: ".handoff", remote: remoteUrl },
     };
     validateConfigOrExit(config);
