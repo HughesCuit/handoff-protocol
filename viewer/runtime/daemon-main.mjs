@@ -87,7 +87,7 @@ export async function startDaemon(options = {}) {
     }, idleCheckMs);
     idleTimer.unref?.();
   } catch (error) {
-    await close();
+    await close().catch(() => {});
     throw error;
   }
 
