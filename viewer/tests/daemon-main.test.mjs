@@ -145,9 +145,9 @@ test("stays alive while a session exists, then shuts down after it expires", asy
       // Give the idle check a chance to fire; it must NOT close while a session exists.
       await new Promise((resolve) => setTimeout(resolve, 80));
       assert.ok(await readState(runtimeDir), "daemon must stay alive while a session exists");
-      // Expire the session, then the idle check should close the daemon.
+      // Expire the session by advancing the clock. The daemon's OWN idle tick must
+      // prune the expired session and shut down (no manual prune() call here).
       now += 61 * 60 * 1000;
-      await sessionManager.prune();
       const removed = await waitFor(async () => (await readState(runtimeDir)) === null);
       assert.equal(removed, true);
     } finally {
@@ -171,6 +171,28 @@ test("SIGTERM triggers a graceful close", async () => {
     const removed = await waitFor(async () => (await readState(runtimeDir)) === null);
     assert.equal(removed, true);
     await daemon.close();
+  });
+});
+
+test("closes the server and session manager if state publishing fails during startup", async () => {
+  await withTempDir(async (dir) => {
+    const badRuntimeDir = join(dir, "does-not-exist", "nested");
+    const sessionManager = emptySessionManager();
+    let sessionManagerClosed = false;
+    const originalClose = sessionManager.close.bind(sessionManager);
+    sessionManager.close = async () => {
+      sessionManagerClosed = true;
+      return originalClose();
+    };
+    await assert.rejects(() =>
+      startDaemon({
+        runtimeDir: badRuntimeDir,
+        loadAssets: async () => assets,
+        sessionManager,
+        idleCheckMs: 60_000,
+        processObject: fakeProcess(),
+      }));
+    assert.equal(sessionManagerClosed, true, "startup cleanup must close the session manager");
   });
 });
 

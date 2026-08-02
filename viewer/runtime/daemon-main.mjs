@@ -45,10 +45,6 @@ export async function startDaemon(options = {}) {
     onShutdownRequest: () => close(),
   });
 
-  const { port } = await server.start();
-  const state = createStateRecord({ pid: processObject.pid, port, controlToken });
-  await writeState(runtimeDir, state);
-
   function removeSignalHandlers() {
     for (const [signal, handler] of signalHandlers) processObject.off(signal, handler);
     signalHandlers.clear();
@@ -69,18 +65,31 @@ export async function startDaemon(options = {}) {
     return closePromise;
   }
 
-  for (const signal of ["SIGINT", "SIGTERM"]) {
-    const handler = () => {
-      void close();
-    };
-    signalHandlers.set(signal, handler);
-    processObject.once(signal, handler);
-  }
+  const { port } = await server.start();
+  let state;
+  try {
+    state = createStateRecord({ pid: processObject.pid, port, controlToken });
+    await writeState(runtimeDir, state);
 
-  idleTimer = setInterval(() => {
-    if (!sessionManager.hasSessions) void close();
-  }, idleCheckMs);
-  idleTimer.unref?.();
+    for (const signal of ["SIGINT", "SIGTERM"]) {
+      const handler = () => {
+        void close().catch(() => {});
+      };
+      signalHandlers.set(signal, handler);
+      processObject.once(signal, handler);
+    }
+
+    idleTimer = setInterval(() => {
+      void (async () => {
+        await sessionManager.prune();
+        if (!sessionManager.hasSessions) await close();
+      })().catch(() => {});
+    }, idleCheckMs);
+    idleTimer.unref?.();
+  } catch (error) {
+    await close();
+    throw error;
+  }
 
   return { close, port, controlToken, state, runtimeDir };
 }
