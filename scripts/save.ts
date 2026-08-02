@@ -25,7 +25,7 @@
 
 import { parse } from "https://deno.land/std@0.224.0/flags/mod.ts";
 import { ensureDir, walk, exists } from "https://deno.land/std@0.224.0/fs/mod.ts";
-import { join, extname } from "https://deno.land/std@0.224.0/path/mod.ts";
+import { join, extname, dirname } from "https://deno.land/std@0.224.0/path/mod.ts";
 import {
   filterSensitive,
   HANDOFF_FILES,
@@ -38,6 +38,7 @@ import {
 } from "./context-map.ts";
 import {
   buildContextJson,
+  buildInitialV3Files,
   generateViews,
   sha256Hex,
   viewTamperWarnings,
@@ -278,6 +279,25 @@ async function promptUser(message: string): Promise<string> {
 async function initStorage(cwd: string, mode?: string): Promise<StorageConfig | null> {
   let selectedMode = mode;
 
+  // Write the initial v3 layout (empty Context Map with an empty Current
+  // Goal, eight empty content files, the generated view, and v3 metadata)
+  // into a freshly initialized handoff directory. An existing handoff —
+  // including a legacy v2 one awaiting migration — is left untouched.
+  const writeInitialV3Layout = async (handoffDir: string, project: string): Promise<boolean> => {
+    if (await exists(join(handoffDir, CONTEXT_MAP_FILE))) return false;
+    const files = buildInitialV3Files({
+      project,
+      timestamp: new Date().toISOString(),
+      agent: Deno.env.get("AGENT_NAME") || "opencode",
+    });
+    for (const [rel, content] of Object.entries(files)) {
+      const path = join(handoffDir, rel);
+      await ensureDir(dirname(path));
+      await Deno.writeTextFile(path, content);
+    }
+    return true;
+  };
+
   if (!selectedMode) {
     console.log("");
     console.log("Handoff storage is not configured.");
@@ -342,6 +362,9 @@ async function initStorage(cwd: string, mode?: string): Promise<StorageConfig | 
     }
 
     console.log("Initialized direct storage mode.");
+    if (await writeInitialV3Layout(join(cwd, ".handoff"), (await readProjectInfo()).name)) {
+      console.log("Created the initial v3 layout (context-map.md, content/, views/HANDOFF.md, context.json).");
+    }
     return config;
 
   } else if (selectedMode === "submodule") {
@@ -386,6 +409,9 @@ async function initStorage(cwd: string, mode?: string): Promise<StorageConfig | 
 
     console.log(`Initialized submodule storage mode.`);
     console.log(`Remote: ${remoteUrl}`);
+    if (await writeInitialV3Layout(join(cwd, ".handoff"), (await readProjectInfo()).name)) {
+      console.log("Created the initial v3 layout (context-map.md, content/, views/HANDOFF.md, context.json).");
+    }
     return config;
   }
 

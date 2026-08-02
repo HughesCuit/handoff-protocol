@@ -48,7 +48,11 @@ import {
 } from "../../scripts/handoff-state.mjs";
 import {
   GENERATED_MARKER,
+  V3_GENERATED_MARKER,
   buildContextJson,
+  buildInitialV3Files,
+  buildV3ContextJson,
+  generateV3Views,
   generateViews,
   sha256Hex,
   viewTamperWarnings,
@@ -1699,6 +1703,117 @@ export function defineUnitTests(test, readFixture) {
     assertEqual(fresh.id, "task3", "the new task continues the sequence");
     assertEqual(fresh.origin, "agent");
     assertEqual(result.counters.task, 3);
+  });
+
+  // ── v3 views, metadata, and initial layout ─────────────────────────────────
+
+  const V3_META = {
+    timestamp: "2026-08-02T00:00:00.000Z",
+    agent: "test-agent",
+    project: "fixture-app",
+    lang: "en",
+    git: { branch: "feature/v3", latest_commit: "abc1234", commit_message: "feat: v3", is_dirty: false },
+  };
+
+  test("v3 init: the initial layout holds the Map, eight content files, the view, and metadata", () => {
+    const files = buildInitialV3Files({ project: "demo", timestamp: V3_META.timestamp, agent: "test", lang: "en" });
+    const names = Object.keys(files).sort();
+
+    assert(names.includes("context-map.md"), "Context Map missing from the initial layout");
+    for (const name of Object.values(CONTENT_FILES)) {
+      assert(names.includes(`${CONTENT_DIR}/${name}`), `content/${name} missing from the initial layout`);
+    }
+    assert(names.includes(`${"views"}/HANDOFF.md`), "views/HANDOFF.md missing from the initial layout");
+    assert(names.includes("context.json"), "context.json missing from the initial layout");
+
+    // No legacy root-level views in a fresh v3 directory.
+    for (const legacy of ["HANDOFF.md", "tasks.md", "decisions.md"]) {
+      assert(!names.includes(legacy), `legacy root file '${legacy}' must not be created in v3`);
+    }
+
+    // The initial Map parses, has all eight sections, and an empty Current Goal.
+    const map = parseContextMapV3(files["context-map.md"]);
+    assert(map, "initial Context Map must parse");
+    assertEqual(map.sections.goals.length, 0, "initial Current Goal must be empty");
+    for (const key of V3_SECTION_KEYS) {
+      assertEqual(map.sections[key].length, 0, `initial section '${key}' must be empty`);
+      const entries = parseContentFile(files[`${CONTENT_DIR}/${CONTENT_FILES[key]}`], key);
+      assertEqual(entries.length, 0, `initial content file for '${key}' must have no entries`);
+    }
+
+    const json = JSON.parse(files["context.json"]);
+    assertEqual(json.protocolVersion, "3.0.0");
+    assert(json.idCounters && typeof json.idCounters === "object", "initial counters missing");
+    for (const prefix of Object.values(ID_PREFIXES)) {
+      assertEqual(json.idCounters[prefix], 0, `initial counter for '${prefix}' must be 0`);
+    }
+  });
+
+  test("v3 views: HANDOFF.md is deterministic and carries a prominent do-not-edit notice", async () => {
+    const state = await loadHandoffState(await makeV3Io(), V3_DIR);
+    const first = generateV3Views(state, V3_META);
+    const second = generateV3Views(state, V3_META);
+
+    assertEqual(JSON.stringify(Object.keys(first)), JSON.stringify(["views/HANDOFF.md"]));
+    const handoff = first["views/HANDOFF.md"];
+    assertEqual(second["views/HANDOFF.md"], handoff, "v3 view generation is not deterministic");
+    assert(handoff.startsWith(V3_GENERATED_MARKER), "view must start with the generated marker");
+    assert(/do not edit/i.test(handoff), "view must carry a do-not-edit notice");
+    assert(/context-map\.md/.test(handoff) && /content\//.test(handoff), "notice must point at the Map and content files");
+
+    // Every node appears with label, summary, and body in stable section order.
+    const tasksAt = handoff.indexOf("## Tasks");
+    const decisionsAt = handoff.indexOf("## Decisions");
+    assert(tasksAt > -1 && decisionsAt > tasksAt, "sections must follow the canonical order");
+    assertIncludes(handoff, "task1");
+    assertIncludes(handoff, "Complete the v3 storage migration");
+    assertIncludes(handoff, "Split embedded v2 Context Map semantics into section body files without losing hierarchy or text.");
+    assertIncludes(handoff, "temporary siblings");
+    assertIncludes(handoff, "decision1");
+    assertIncludes(handoff, "Context Map is the semantic directory");
+    assertIncludes(handoff, "**Branch**: feature/v3");
+  });
+
+  test("v3 views: an empty Current Goal renders a documented placeholder", () => {
+    const files = buildInitialV3Files({ project: "demo", timestamp: V3_META.timestamp, agent: "test", lang: "en" });
+    assertIncludes(files["views/HANDOFF.md"], "No explicit goal set.");
+  });
+
+  test("v3 metadata: context.json carries the protocol version, counters, and every file hash", async () => {
+    const state = await loadHandoffState(await makeV3Io(), V3_DIR);
+    const json = buildV3ContextJson({
+      state,
+      project: V3_META.project,
+      git: V3_META.git,
+      environment: { timestamp: V3_META.timestamp, agent: V3_META.agent, lang: "en" },
+      diagnostics: {},
+    });
+
+    assertEqual(json.protocolVersion, "3.0.0");
+    assertEqual(json.timestamp, V3_META.timestamp);
+    assertEqual(json.agent, "test-agent");
+    assertEqual(json.project, "fixture-app");
+    assertEqual(json.git.branch, "feature/v3");
+
+    // Monotonic ID counters recovered from the canonical state.
+    assertEqual(json.idCounters.task, 2);
+    assertEqual(json.idCounters.goal, 1);
+    assertEqual(json.idCounters.note, 1);
+
+    // Hashes cover the Map, every content file, and the generated view.
+    const expectedFiles = ["context-map.md", ...Object.values(CONTENT_FILES).map((n) => `${CONTENT_DIR}/${n}`), "views/HANDOFF.md"];
+    assertEqual(JSON.stringify(Object.keys(json.hashes).sort()), JSON.stringify(expectedFiles.sort()));
+    assertEqual(json.hashes["context-map.md"], sha256Hex(renderContextMapV3(state.map, { lang: "en" })));
+    assertEqual(
+      json.hashes[`${CONTENT_DIR}/tasks.md`],
+      sha256Hex(renderContentFile("tasks", state.content.tasks))
+    );
+    assertEqual(json.hashes["views/HANDOFF.md"], sha256Hex(generateV3Views(state, V3_META)["views/HANDOFF.md"]));
+
+    // No semantic fields leak into metadata.
+    for (const field of ["current_goal", "status", "todos", "decisions", "risks", "notes", "goal"]) {
+      assert(!(field in json), `semantic field '${field}' must not appear in v3 context.json`);
+    }
   });
 
   // ── Semantic snapshots (v2.3) ─────────────────────────────────────────────

@@ -26,7 +26,7 @@
 
 import { execSync } from "node:child_process";
 import { mkdirSync, writeFileSync, readFileSync, readdirSync, statSync, existsSync, renameSync, rmSync } from "node:fs";
-import { join, extname, relative } from "node:path";
+import { join, extname, relative, dirname } from "node:path";
 import { createInterface } from "node:readline";
 import {
   buildInferredSections,
@@ -40,6 +40,7 @@ import {
 } from "./context-map.mjs";
 import {
   buildContextJson,
+  buildInitialV3Files,
   generateViews,
   sha256Hex,
   viewTamperWarnings,
@@ -155,6 +156,27 @@ function commitAndPushSubmodule(handoffDir) {
 
 // ── Init Flow ────────────────────────────────────────────────────────────────
 
+/**
+ * Write the initial v3 layout (empty Context Map with an empty Current Goal,
+ * eight empty content files, the generated view, and v3 metadata) into a
+ * freshly initialized handoff directory. An existing handoff — including a
+ * legacy v2 one awaiting migration — is left untouched.
+ */
+function writeInitialV3Layout(handoffDir, project) {
+  if (existsSync(join(handoffDir, MAP_FILENAME))) return false;
+  const files = buildInitialV3Files({
+    project,
+    timestamp: new Date().toISOString(),
+    agent: process.env.AGENT_NAME || "opencode",
+  });
+  for (const [rel, content] of Object.entries(files)) {
+    const path = join(handoffDir, rel);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, content);
+  }
+  return true;
+}
+
 async function promptUser(message) {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   return new Promise((resolve) => {
@@ -224,6 +246,9 @@ async function initStorage(cwd, mode) {
     }
 
     console.log("Initialized direct storage mode.");
+    if (writeInitialV3Layout(join(cwd, ".handoff"), readProjectInfo().name)) {
+      console.log("Created the initial v3 layout (context-map.md, content/, views/HANDOFF.md, context.json).");
+    }
     return config;
 
   } else if (selectedMode === "submodule") {
@@ -262,6 +287,9 @@ async function initStorage(cwd, mode) {
 
     console.log(`Initialized submodule storage mode.`);
     console.log(`Remote: ${remoteUrl}`);
+    if (writeInitialV3Layout(join(cwd, ".handoff"), readProjectInfo().name)) {
+      console.log("Created the initial v3 layout (context-map.md, content/, views/HANDOFF.md, context.json).");
+    }
     return config;
   }
 
