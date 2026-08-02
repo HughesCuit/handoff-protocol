@@ -180,3 +180,89 @@ export function parseRenderTree(markdown) {
 
   return { root, nodeCount };
 }
+
+// ── v3 directory parsing ─────────────────────────────────────────────────────
+// v3 maps carry stable protocol IDs (`task1`, `risk2`, ...) and compact
+// labels; bodies load lazily through the ContentIndex. The render tree keeps
+// the v2 viewer shape (viewer section keys, section nodes, task/risk flags)
+// but uses protocol IDs as node IDs so the frontend can request details.
+
+import { parseContextMapV3 } from "../../scripts/context-map.mjs";
+
+const V3_TO_VIEWER_SECTION = {
+  goals: "goal",
+  status: "status",
+  tasks: "tasks",
+  decisions: "decisions",
+  questions: "questions",
+  risks: "risks",
+  notes: "knowledge",
+  excluded: "excluded",
+};
+
+/** True when the content looks like a v3 directory (header or backtick IDs). */
+export function isV3ContextMap(content) {
+  const head = String(content || "").slice(0, 500);
+  if (/handoff-protocol:v3/i.test(head)) return true;
+  return /^\s*-\s+(\[[ xX]\]\s+)?`(?:goal|status|task|decision|question|risk|note|excluded)[1-9][0-9]*`/m.test(
+    String(content || ""),
+  );
+}
+
+export function parseV3RenderTree(markdown) {
+  if (!markdown || !String(markdown).trim()) {
+    throw new ContextMapParseError("EMPTY");
+  }
+  const map = parseContextMapV3(markdown);
+  if (!map) throw new ContextMapParseError("INVALID");
+
+  const root = {
+    id: "context-map",
+    section: "root",
+    text: "Context Map",
+    taskState: null,
+    risk: null,
+    excluded: false,
+    origin: "user",
+    children: [],
+  };
+  let nodeCount = 0;
+
+  for (const [v3Key, viewerKey] of Object.entries(V3_TO_VIEWER_SECTION)) {
+    const nodes = map.sections[v3Key] || [];
+    if (nodes.length === 0) continue;
+    const sectionNode = {
+      id: `section-${viewerKey}`,
+      section: viewerKey,
+      text: SECTION_LABELS[viewerKey][0],
+      taskState: null,
+      risk: null,
+      excluded: viewerKey === "excluded",
+      origin: "user",
+      children: [],
+    };
+    const stack = [];
+    for (const node of nodes) {
+      const depth = Math.max(0, Number(node.depth) || 0);
+      const treeNode = {
+        id: node.id ?? stableId([viewerKey, stack[depth - 1]?.id ?? sectionNode.id, normalize(node.label), String(nodeCount)]),
+        section: viewerKey,
+        text: node.label,
+        taskState: viewerKey === "tasks" ? (node.checked ? "done" : "open") : null,
+        risk: viewerKey === "risks" ? node.severity ?? null : null,
+        excluded: viewerKey === "excluded",
+        origin: node.origin === "agent" ? "agent" : "user",
+        children: [],
+      };
+      stack[depth] = treeNode;
+      stack.length = depth + 1;
+      const parent = depth === 0 ? sectionNode : stack[depth - 1] ?? sectionNode;
+      parent.children.push(treeNode);
+      nodeCount += 1;
+      if (nodeCount > MAX_NODES) throw new ContextMapParseError("TOO_MANY_NODES");
+    }
+    root.children.push(sectionNode);
+  }
+
+  return { root, nodeCount };
+}

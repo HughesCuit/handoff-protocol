@@ -3,6 +3,7 @@ import { timingSafeEqual } from "node:crypto";
 import { isAbsolute } from "node:path";
 
 import { DAEMON_VERSION, SCHEMA_VERSION } from "./daemon-state.mjs";
+import { NODE_ID_RE } from "../../scripts/handoff-state.mjs";
 
 const SECURITY_HEADERS = {
   "Cache-Control": "no-store",
@@ -21,7 +22,7 @@ const ASSET_TYPES = {
   "styles.css": "text/css; charset=utf-8",
 };
 
-const VIEWER_ROUTE_PATTERN = /^\/session\/([A-Za-z0-9_-]{22,})\/(|app\.mjs|model\.mjs|styles\.css|api\/context-map)$/;
+const VIEWER_ROUTE_PATTERN = /^\/session\/([A-Za-z0-9_-]{22,})\/(|app\.mjs|model\.mjs|styles\.css|api\/context-map|node\/[A-Za-z0-9]+)$/;
 const CONTROL_ROUTE_PATTERN = /^\/control\/(health|session|shutdown)$/;
 const ENCODED_PATH_CONTROL_PATTERN = /%(?:2e|2f|5c)/i;
 const MAX_CONTROL_BODY_BYTES = 8192;
@@ -240,6 +241,19 @@ export class DaemonServer {
       const snapshot = await this.sessionManager.snapshot(token);
       if (!snapshot) return this.reply(response, 404);
       return this.reply(response, 200, JSON.stringify(snapshot), JSON_TYPE);
+    }
+    if (resource.startsWith("node/")) {
+      const nodeId = resource.slice("node/".length);
+      // The ID grammar is validated here; the ID itself never becomes a path.
+      if (!NODE_ID_RE.test(nodeId)) {
+        return this.replyJson(response, 400, { error: "ID_INVALID" });
+      }
+      const detail = await this.sessionManager.nodeDetail(token, nodeId);
+      if (!detail) return this.replyJson(response, 404, { error: "NODE_NOT_FOUND" });
+      if (detail.error === "MIGRATION_REQUIRED") {
+        return this.replyJson(response, 409, detail);
+      }
+      return this.reply(response, 200, JSON.stringify(detail), JSON_TYPE);
     }
     const asset = resource === "" ? "html" : resource.slice(0, resource.indexOf("."));
     return this.reply(response, 200, this.assets[asset], {

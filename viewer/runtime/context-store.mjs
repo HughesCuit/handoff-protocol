@@ -3,8 +3,11 @@ import { watch } from "node:fs";
 
 import {
   ContextMapParseError,
+  isV3ContextMap,
   parseRenderTree,
+  parseV3RenderTree,
 } from "./context-map-parser.mjs";
+import { ContentIndex } from "./content-index.mjs";
 import {
   ContextSourceError,
   readContextMapSource,
@@ -31,6 +34,9 @@ function emptyState() {
     watchMode: "none",
     watchDiagnostic: null,
     bindingId: null,
+    layout: null,
+    contentVersion: null,
+    contentDiagnostics: [],
   };
 }
 
@@ -46,6 +52,10 @@ export class ContextMapStore {
     this.resolveSource = options.resolveSource ?? resolveContextMap;
     this.readSource = options.readSource ?? readContextMapSource;
     this.parse = options.parse ?? parseRenderTree;
+    this.parseV3 = options.parseV3 ?? parseV3RenderTree;
+    this.createContentIndex =
+      options.createContentIndex ?? (({ handoffDir }) => new ContentIndex({ handoffDir }));
+    this.contentIndex = null;
     this.rootUri = null;
     this.source = null;
     this.watcher = null;
@@ -135,15 +145,37 @@ export class ContextMapStore {
         this.state = { ...this.state, status: "synced", diagnostic: null };
         return this.snapshot();
       }
-      const tree = this.parse(content);
-      this.state = {
-        ...this.state,
-        status: "synced",
-        version,
-        tree,
-        nodeCount: tree.nodeCount,
-        diagnostic: null,
-      };
+      if (isV3ContextMap(content)) {
+        const tree = this.parseV3(content);
+        const index = this.contentIndex ?? this.createContentIndex({ handoffDir: this.source.handoffDir });
+        this.contentIndex = index;
+        await index.refresh();
+        this.state = {
+          ...this.state,
+          status: "synced",
+          version,
+          tree,
+          nodeCount: tree.nodeCount,
+          diagnostic: null,
+          layout: "v3",
+          contentVersion: index.version,
+          contentDiagnostics: [...index.diagnostics],
+        };
+      } else {
+        this.contentIndex = null;
+        const tree = this.parse(content);
+        this.state = {
+          ...this.state,
+          status: "synced",
+          version,
+          tree,
+          nodeCount: tree.nodeCount,
+          diagnostic: null,
+          layout: "v2",
+          contentVersion: null,
+          contentDiagnostics: [],
+        };
+      }
     } catch (error) {
       const code = error instanceof ContextSourceError ||
           error instanceof ContextMapParseError
@@ -156,6 +188,22 @@ export class ContextMapStore {
       };
     }
     return this.snapshot();
+  }
+
+  /**
+   * Lazily resolved node detail for a v3 layout. Unknown IDs return null;
+   * v2 layouts report MIGRATION_REQUIRED instead of reading arbitrary root
+   * files.
+   */
+  async nodeDetail(nodeId) {
+    const index = this.contentIndex;
+    if (!index) {
+      return { error: "MIGRATION_REQUIRED" };
+    }
+    await index.refresh();
+    const detail = index.get(nodeId);
+    if (!detail) return null;
+    return { ...detail, version: index.version };
   }
 
   async close() {
@@ -173,5 +221,6 @@ export class ContextMapStore {
     }
     this.rootUri = null;
     this.source = null;
+    this.contentIndex = null;
   }
 }

@@ -145,3 +145,148 @@ test("an inaccessible replacement root returns a cleared bound snapshot", async 
   assert.equal(store.snapshot().diagnostic, "ACCESS_DENIED");
   assert.notEqual(store.snapshot().bindingId, null);
 });
+
+// ── v3 layout: lazy node details ─────────────────────────────────────────────
+
+const V3_MAP = `# Context Map
+
+<!-- handoff-protocol:v3.0.0 — Semantic directory. -->
+
+## Current Goal
+
+- \`goal1\` Ship the v3 viewer
+
+## Tasks
+
+- [ ] \`task1\` **high** Wire lazy node details
+  - [x] \`task2\` Define the index
+
+## Risks
+
+- \`risk1\` **high** Orphaned content
+`;
+
+const V3_CONTENT = {
+  "current-goal.md": "# Current Goal\n\n## goal1\n\nShip the v3 viewer with lazy details.\n\nThe full goal body.\n",
+  "current-status.md": "# Current Status\n",
+  "tasks.md": "# Tasks\n\n## task1\n\nLazy detail summary.\n\nLazy detail body with **markdown**.\n\n## task2\n\nIndex summary.\n",
+  "decisions.md": "# Decisions\n",
+  "open-questions.md": "# Open Questions\n",
+  "risks.md": "# Risks\n\n## risk1\n\nRisk summary.\n",
+  "knowledge-notes.md": "# Knowledge and Notes\n",
+  "excluded.md": "# Excluded\n",
+};
+
+async function v3Fixture(overrides = {}) {
+  const root = await mkdtemp(join(tmpdir(), "viewer-store-v3-"));
+  const contentDir = join(root, ".handoff", "content");
+  await mkdir(contentDir, { recursive: true });
+  await writeFile(join(root, ".handoff", "context-map.md"), overrides.map ?? V3_MAP);
+  for (const [name, body] of Object.entries(V3_CONTENT)) {
+    await writeFile(join(contentDir, name), overrides[name] ?? body);
+  }
+  return { root, uri: pathToFileURL(root).href, contentDir };
+}
+
+test("v3: the tree uses stable protocol IDs and node details load lazily", async (t) => {
+  const item = await v3Fixture();
+  const store = new ContextMapStore({ debounceMs: 30 });
+  t.after(() => store.close());
+
+  await store.bind(item.uri);
+  const snapshot = store.snapshot();
+  assert.equal(snapshot.status, "synced");
+  assert.equal(snapshot.layout, "v3");
+  const sections = snapshot.tree.root.children;
+  const tasks = sections.find((node) => node.section === "tasks");
+  assert.equal(tasks.children[0].id, "task1");
+  assert.equal(tasks.children[0].text, "Wire lazy node details");
+  assert.equal(tasks.children[0].children[0].id, "task2");
+  assert.equal(tasks.children[0].children[0].taskState, "done");
+  const goals = sections.find((node) => node.section === "goal");
+  assert.equal(goals.children[0].id, "goal1");
+
+  const detail = await store.nodeDetail("task1");
+  assert.equal(detail.id, "task1");
+  assert.equal(detail.section, "tasks");
+  assert.equal(detail.label, "Wire lazy node details");
+  assert.equal(detail.summary, "Lazy detail summary.");
+  assert.equal(detail.body, "Lazy detail body with **markdown**.");
+  assert.equal(typeof detail.version, "string");
+  assert.equal(detail.diagnostic, null);
+
+  const missing = await store.nodeDetail("task99");
+  assert.equal(missing, null, "unknown IDs resolve to null (404)");
+});
+
+test("v3: content is parsed once per version and file changes invalidate the cache", async (t) => {
+  const item = await v3Fixture();
+  const store = new ContextMapStore({ debounceMs: 30 });
+  t.after(() => store.close());
+
+  await store.bind(item.uri);
+  const first = await store.nodeDetail("task1");
+  assert.equal(first.body, "Lazy detail body with **markdown**.");
+
+  // An unrelated refresh reuses the parsed cache (same version).
+  await store.refresh();
+  const again = await store.nodeDetail("task1");
+  assert.equal(again.version, first.version, "unchanged content must keep its version");
+
+  // A content edit invalidates the index: new version, new body.
+  await writeFile(
+    join(item.contentDir, "tasks.md"),
+    "# Tasks\n\n## task1\n\nLazy detail summary.\n\nEdited body.\n\n## task2\n\nIndex summary.\n",
+  );
+  let updated = null;
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    updated = await store.nodeDetail("task1");
+    if (updated?.body === "Edited body.") break;
+    await new Promise((resolve) => setTimeout(resolve, 30));
+  }
+  assert.equal(updated?.body, "Edited body.");
+  assert.notEqual(updated.version, first.version, "edited content must produce a new version");
+});
+
+test("v3: a missing body stays visible as a directory-only node with a diagnostic", async (t) => {
+  const item = await v3Fixture({ "risks.md": "# Risks\n" });
+  const store = new ContextMapStore({ debounceMs: 30 });
+  t.after(() => store.close());
+
+  await store.bind(item.uri);
+  const detail = await store.nodeDetail("risk1");
+  assert.equal(detail.id, "risk1");
+  assert.equal(detail.label, "Orphaned content");
+  assert.equal(detail.summary, "");
+  assert.equal(detail.body, "");
+  assert.equal(detail.diagnostic, "CONTENT_MISSING");
+});
+
+test("v3: a misplaced body is never guessed; the node reports CONTENT_MISSING", async (t) => {
+  // risk1's body lives in the tasks file (its Map section is risks).
+  const item = await v3Fixture({
+    "tasks.md": "# Tasks\n\n## task1\n\nLazy detail summary.\n\nBody.\n\n## task2\n\nIndex summary.\n\n## risk1\n\nMisplaced risk body.\n",
+    "risks.md": "# Risks\n",
+  });
+  const store = new ContextMapStore({ debounceMs: 30 });
+  t.after(() => store.close());
+
+  await store.bind(item.uri);
+  const detail = await store.nodeDetail("risk1");
+  assert.equal(detail.diagnostic, "CONTENT_MISSING");
+  assert.equal(detail.body, "", "a misplaced body must not be guessed");
+});
+
+test("v2: node details report MIGRATION_REQUIRED instead of reading root files", async (t) => {
+  const item = await fixture();
+  await writeFile(item.file, FIRST);
+  const store = new ContextMapStore({ debounceMs: 30 });
+  t.after(() => store.close());
+
+  await store.bind(item.uri);
+  assert.equal(store.snapshot().status, "synced", "v2 maps still render the tree");
+  assert.equal(store.snapshot().layout, "v2");
+  const detail = await store.nodeDetail("task1");
+  assert.equal(detail.error, "MIGRATION_REQUIRED");
+});

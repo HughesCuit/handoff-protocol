@@ -340,3 +340,50 @@ test("rejects repeated token collisions after a bounded number of attempts", asy
   assert.equal(manager.size, 1);
   await manager.close();
 });
+
+// ── v3 lazy node details through a real session ──────────────────────────────
+
+test("nodeDetail resolves through the session's own workspace only", async () => {
+  const { mkdtemp: makeTmp } = await import("node:fs/promises");
+  const { writeFile: write, mkdir: mk } = await import("node:fs/promises");
+  const { tmpdir: tmp } = await import("node:os");
+  const { join: pathJoin } = await import("node:path");
+
+  const seed = async (marker) => {
+    const root = await makeTmp(pathJoin(tmp(), "viewer-session-v3-"));
+    await mk(pathJoin(root, ".handoff", "content"), { recursive: true });
+    await write(
+      pathJoin(root, ".handoff", "context-map.md"),
+      `# Context Map\n\n<!-- handoff-protocol:v3.0.0 — Semantic directory. -->\n\n## Tasks\n\n- [ ] \`task1\` ${marker}\n`,
+    );
+    for (const name of ["current-goal.md", "current-status.md", "decisions.md", "open-questions.md", "risks.md", "knowledge-notes.md", "excluded.md"]) {
+      await write(pathJoin(root, ".handoff", "content", name), `# x\n`);
+    }
+    await write(pathJoin(root, ".handoff", "content", "tasks.md"), `# Tasks\n\n## task1\n\n${marker} summary.\n`);
+    return root;
+  };
+
+  const workspaceA = await seed("Alpha task");
+  const workspaceB = await seed("Beta task");
+  const manager = new SessionManager();
+  try {
+    const a = await manager.create(workspaceA, { idleMinutes: 30 });
+    const b = await manager.create(workspaceB, { idleMinutes: 30 });
+
+    const detailA = await manager.nodeDetail(a.token, "task1");
+    assert.equal(detailA.label, "Alpha task");
+    assert.equal(detailA.summary, "Alpha task summary.");
+
+    const detailB = await manager.nodeDetail(b.token, "task1");
+    assert.equal(detailB.label, "Beta task");
+
+    // A session can never read another workspace: task2 exists nowhere in A,
+    // and A's view of task1 is strictly its own.
+    assert.equal(await manager.nodeDetail(a.token, "task2"), null);
+    assert.notEqual(detailA.summary, detailB.summary);
+
+    assert.equal(await manager.nodeDetail("no-such-token", "task1"), null);
+  } finally {
+    await manager.close();
+  }
+});
