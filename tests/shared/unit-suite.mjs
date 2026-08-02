@@ -36,9 +36,13 @@ import {
 } from "../../scripts/content-files.mjs";
 import {
   NODE_ID_RE,
+  allocateNodeId,
+  emptyV3Content,
   indexContextMap,
   loadHandoffState,
   parseContentFile,
+  reconcileV3State,
+  recoverIdCounters,
   renderContentFile,
   validateHandoffState,
 } from "../../scripts/handoff-state.mjs";
@@ -101,6 +105,12 @@ export function assert(cond, msg) {
 export function assertEqual(actual, expected, msg) {
   if (actual !== expected) {
     throw new Error(`${msg || "not equal"}:\n  actual:   ${JSON.stringify(actual)}\n  expected: ${JSON.stringify(expected)}`);
+  }
+}
+
+export function assertNotEqual(actual, expected, msg) {
+  if (actual === expected) {
+    throw new Error(`${msg || "should differ"}: both sides are ${JSON.stringify(actual)}`);
   }
 }
 
@@ -1366,6 +1376,329 @@ export function defineUnitTests(test, readFixture) {
     const diag = validateHandoffState(state).join("\n");
     assertIncludes(diag, "CONTENT_ORPHAN");
     assertIncludes(diag, "excluded9");
+  });
+
+  // ── v3 stable IDs and ownership-aware reconciliation ───────────────────────
+
+  function makeV3State({ sections = {}, content = {} } = {}) {
+    const map = emptyContextMapV3();
+    for (const [key, nodes] of Object.entries(sections)) map.sections[key] = nodes;
+    const bodies = emptyV3Content();
+    for (const [key, entries] of Object.entries(content)) bodies[key] = entries;
+    return { version: V3_PROTOCOL_VERSION, map, content: bodies, diagnostics: [] };
+  }
+
+  test("v3 ids: allocation starts at 1 per section prefix and never fills holes", () => {
+    const counters = {};
+    assertEqual(allocateNodeId("tasks", counters), "task1");
+    assertEqual(allocateNodeId("tasks", counters), "task2");
+    assertEqual(allocateNodeId("goals", counters), "goal1");
+    assertEqual(allocateNodeId("status", counters), "status1");
+    assertEqual(allocateNodeId("decisions", counters), "decision1");
+    assertEqual(allocateNodeId("questions", counters), "question1");
+    assertEqual(allocateNodeId("risks", counters), "risk1");
+    assertEqual(allocateNodeId("notes", counters), "note1");
+    assertEqual(allocateNodeId("excluded", counters), "excluded1");
+    // Holes are never filled and counters never decrement.
+    const holed = { task: 5 };
+    assertEqual(allocateNodeId("tasks", holed), "task6");
+    let threw = false;
+    try {
+      allocateNodeId("bogus", {});
+    } catch (err) {
+      threw = true;
+      assertIncludes(err.message, "bogus");
+    }
+    assert(threw, "unknown section must be rejected");
+  });
+
+  test("v3 ids: counters recover from live nodes, bodies, and historical metadata", async () => {
+    const state = await loadHandoffState(await makeV3Io(), V3_DIR);
+
+    const missing = recoverIdCounters(state, null);
+    assertEqual(missing.counters.goal, 1);
+    assertEqual(missing.counters.status, 1);
+    assertEqual(missing.counters.task, 2);
+    assertEqual(missing.counters.decision, 1);
+    assertEqual(missing.counters.question, 1);
+    assertEqual(missing.counters.risk, 1);
+    assertEqual(missing.counters.note, 1);
+    assertEqual(missing.counters.excluded, 1);
+    assert(missing.recovered, "missing metadata counters must be reconstructed");
+
+    const healthy = recoverIdCounters(state, { idCounters: { task: 7, goal: 1 } });
+    assertEqual(healthy.counters.task, 7, "stored counters win when they exceed live state");
+    assertEqual(healthy.counters.goal, 1);
+    assert(!healthy.recovered, "valid metadata counters are not a recovery");
+
+    const ahead = recoverIdCounters(state, { idCounters: { task: 1 } });
+    assertEqual(ahead.counters.task, 2, "live nodes raise a stale counter");
+    assert(!ahead.recovered);
+
+    const damaged = recoverIdCounters(state, { idCounters: "garbage" });
+    assertEqual(damaged.counters.task, 2, "damaged metadata falls back to live state");
+    assert(damaged.recovered, "damaged metadata counters must be flagged as recovered");
+  });
+
+  test("v3 reconcile: renamed and moved nodes keep their IDs", () => {
+    const existing = makeV3State({
+      sections: {
+        tasks: [{ id: "task1", label: "Renamed by the user", origin: "user", depth: 0, checked: false }],
+        notes: [{ id: "task2", label: "Moved into notes", origin: "user", depth: 0 }],
+      },
+      content: {
+        tasks: [{ id: "task1", summary: "Original summary.", body: "Original body.", origin: "user" }],
+        notes: [{ id: "task2", summary: "Moved summary.", body: "", origin: "user" }],
+      },
+    });
+    const result = reconcileV3State({ existing, inferred: {} });
+    assertEqual(result.map.sections.tasks.length, 1);
+    assertEqual(result.map.sections.tasks[0].id, "task1", "a rename must keep the ID");
+    assertEqual(result.map.sections.tasks[0].label, "Renamed by the user");
+    assertEqual(result.map.sections.notes[0].id, "task2", "a move must keep the ID");
+    assertEqual(result.content.tasks[0].summary, "Original summary.", "user body must be untouched");
+    assertEqual(result.content.notes[0].id, "task2", "the body follows its node to the new section");
+    assertEqual(
+      result.content.tasks.filter((e) => e.id === "task2").length,
+      0,
+      "a moved body must not linger in the old section"
+    );
+  });
+
+  test("v3 reconcile: a task state flip changes only the directory", () => {
+    const existing = makeV3State({
+      sections: {
+        tasks: [{ id: "task1", label: "Wire the migration", origin: "agent", depth: 0, checked: false }],
+      },
+      content: {
+        tasks: [{ id: "task1", summary: "Keep this summary.", body: "Keep this body.", origin: "agent" }],
+      },
+    });
+    const result = reconcileV3State({
+      existing,
+      inferred: { tasks: [{ label: "Wire the migration", checked: true }] },
+    });
+    assertEqual(result.map.sections.tasks.length, 1, "state flip must not duplicate the node");
+    assertEqual(result.map.sections.tasks[0].id, "task1");
+    assertEqual(result.map.sections.tasks[0].checked, true);
+    assertEqual(result.content.tasks[0].summary, "Keep this summary.", "content must be untouched");
+    assertEqual(result.content.tasks[0].body, "Keep this body.", "content must be untouched");
+  });
+
+  test("v3 reconcile: a summary/body update changes only the content entry", () => {
+    const existing = makeV3State({
+      sections: {
+        notes: [{ id: "note1", label: "Shared loader", origin: "agent", depth: 0 }],
+      },
+      content: {
+        notes: [{ id: "note1", summary: "Old summary.", body: "Old body.", origin: "agent" }],
+      },
+    });
+    const result = reconcileV3State({
+      existing,
+      inferred: { notes: [{ label: "Shared loader", summary: "New summary.", body: "New body." }] },
+    });
+    const node = result.map.sections.notes[0];
+    assertEqual(node.id, "note1");
+    assertEqual(node.label, "Shared loader");
+    assertEqual(node.depth, 0);
+    assertEqual(result.content.notes[0].summary, "New summary.");
+    assertEqual(result.content.notes[0].body, "New body.");
+  });
+
+  test("v3 reconcile: a user-edited label wins over an inferred replacement", () => {
+    const existing = makeV3State({
+      sections: {
+        tasks: [{ id: "task1", label: "User refined label", origin: "user", depth: 0, checked: false }],
+      },
+      content: {
+        tasks: [{ id: "task1", summary: "User summary.", body: "", origin: "user" }],
+      },
+    });
+    const result = reconcileV3State({
+      existing,
+      inferred: { tasks: [{ label: "Agent replacement", summary: "Agent summary." }] },
+    });
+    assertEqual(result.map.sections.tasks.length, 2, "the inference is appended, never a takeover");
+    assertEqual(result.map.sections.tasks[0].id, "task1");
+    assertEqual(result.map.sections.tasks[0].label, "User refined label");
+    assertEqual(result.map.sections.tasks[1].origin, "agent");
+    assertEqual(result.map.sections.tasks[1].label, "Agent replacement");
+    assertNotEqual(
+      result.map.sections.tasks[1].id,
+      "task1",
+      "the appended inference must allocate a fresh ID"
+    );
+    assertEqual(result.content.tasks[0].summary, "User summary.", "user body must win");
+  });
+
+  test("v3 reconcile: id-targeted inference against a user-owned node is rejected", () => {
+    const existing = makeV3State({
+      sections: {
+        decisions: [{ id: "decision1", label: "User decision", origin: "user", depth: 0 }],
+      },
+      content: {
+        decisions: [{ id: "decision1", summary: "User rationale.", body: "", origin: "user" }],
+      },
+    });
+    const result = reconcileV3State({
+      existing,
+      inferred: { decisions: [{ id: "decision1", label: "Agent override", summary: "Agent rationale." }] },
+    });
+    assertEqual(result.map.sections.decisions.length, 1);
+    assertEqual(result.map.sections.decisions[0].label, "User decision");
+    assertEqual(result.content.decisions[0].summary, "User rationale.");
+    const diag = result.diagnostics.join("\n");
+    assertIncludes(diag, "INFERENCE_REJECTED");
+    assertIncludes(diag, "decision1");
+  });
+
+  test("v3 reconcile: a deleted node is not recreated from its leftover body", () => {
+    const existing = makeV3State({
+      sections: { tasks: [] },
+      content: { tasks: [{ id: "task5", summary: "Leftover body.", body: "", origin: "agent" }] },
+    });
+    const result = reconcileV3State({ existing, inferred: {} });
+    assertEqual(result.map.sections.tasks.length, 0, "the deleted node must stay deleted");
+    assertEqual(result.content.tasks.length, 1, "the orphan body is retained, never auto-deleted");
+    assertEqual(result.content.tasks[0].id, "task5");
+    const diag = result.diagnostics.join("\n");
+    assertIncludes(diag, "CONTENT_ORPHAN");
+    assertIncludes(diag, "task5");
+  });
+
+  test("v3 reconcile: deleted IDs are never reused for new nodes", () => {
+    const existing = makeV3State({
+      sections: {
+        tasks: [{ id: "task1", label: "Survivor", origin: "user", depth: 0, checked: false }],
+      },
+      content: { tasks: [{ id: "task1", summary: "S.", body: "", origin: "user" }] },
+    });
+    const result = reconcileV3State({
+      existing,
+      inferred: { tasks: [{ label: "Brand new task" }] },
+      metadata: { idCounters: { task: 3 } },
+    });
+    const appended = result.map.sections.tasks.at(-1);
+    assertEqual(appended.label, "Brand new task");
+    assertEqual(appended.id, "task4", "allocation must continue past the historical high-water mark");
+    assertEqual(result.counters.task, 4);
+  });
+
+  test("v3 reconcile: empty Current Goal stays empty without an explicit user goal", () => {
+    const inferred = {
+      goals: [{ label: "release: prepare 3.0.0" }],
+      status: [{ label: "in-progress" }],
+    };
+    const result = reconcileV3State({ existing: null, inferred });
+    assertEqual(result.map.sections.goals.length, 0, "inference must never invent a goal");
+    const diag = result.diagnostics.join("\n");
+    assertIncludes(diag, "INFERENCE_REJECTED", "the rejected goal inference must be reported");
+
+    const explicit = reconcileV3State({ existing: null, inferred: {}, userIntent: { goal: "Ship v3" } });
+    assertEqual(explicit.map.sections.goals.length, 1);
+    assertEqual(explicit.map.sections.goals[0].id, "goal1");
+    assertEqual(explicit.map.sections.goals[0].label, "Ship v3");
+    assertEqual(explicit.map.sections.goals[0].origin, "user", "an explicit goal is user-owned");
+
+    const updated = reconcileV3State({
+      existing: explicit,
+      inferred: { goals: [{ label: "commit-derived goal" }] },
+      userIntent: { goal: "Ship v3.0.0 instead" },
+    });
+    assertEqual(updated.map.sections.goals.length, 1, "singleton goal must not duplicate");
+    assertEqual(updated.map.sections.goals[0].id, "goal1", "an explicit goal update keeps the ID");
+    assertEqual(updated.map.sections.goals[0].label, "Ship v3.0.0 instead");
+  });
+
+  test("v3 reconcile: user-owned status suppresses inference like v2 singletons", () => {
+    const existing = makeV3State({
+      sections: { status: [{ id: "status1", label: "User status", origin: "user", depth: 0 }] },
+      content: { status: [{ id: "status1", summary: "User status body.", body: "", origin: "user" }] },
+    });
+    const result = reconcileV3State({
+      existing,
+      inferred: { status: [{ label: "in-progress - 3 file(s) modified" }] },
+    });
+    assertEqual(result.map.sections.status.length, 1);
+    assertEqual(result.map.sections.status[0].label, "User status");
+
+    const agentExisting = makeV3State({
+      sections: { status: [{ id: "status1", label: "old status", origin: "agent", depth: 0 }] },
+      content: { status: [{ id: "status1", summary: "old", body: "", origin: "agent" }] },
+    });
+    const updated = reconcileV3State({
+      existing: agentExisting,
+      inferred: { status: [{ label: "in-progress - 3 file(s) modified" }] },
+    });
+    assertEqual(updated.map.sections.status.length, 1, "agent status is updated in place");
+    assertEqual(updated.map.sections.status[0].id, "status1", "status update keeps the ID");
+    assertEqual(updated.map.sections.status[0].label, "in-progress - 3 file(s) modified");
+  });
+
+  test("v3 reconcile: semantic duplicates are not appended", () => {
+    const existing = makeV3State({
+      sections: { excluded: [{ id: "excluded1", label: "No vector database in v3", origin: "user", depth: 0 }] },
+      content: { excluded: [{ id: "excluded1", summary: "S.", body: "", origin: "user" }] },
+    });
+    const result = reconcileV3State({
+      existing,
+      inferred: { excluded: [{ label: "**high** No vector database in v3." }] },
+    });
+    assertEqual(result.map.sections.excluded.length, 1, "a semantic duplicate must not be appended");
+  });
+
+  test("v3 reconcile: user-owned bodies are never overwritten by inference", () => {
+    const existing = makeV3State({
+      sections: {
+        tasks: [{ id: "task1", label: "Stable task", origin: "user", depth: 0, checked: false }],
+      },
+      content: { tasks: [{ id: "task1", summary: "User body.", body: "User detail.", origin: "user" }] },
+    });
+    const result = reconcileV3State({
+      existing,
+      inferred: { tasks: [{ label: "Stable task", summary: "Agent rewrite.", body: "Agent detail." }] },
+    });
+    assertEqual(result.map.sections.tasks.length, 1);
+    assertEqual(result.content.tasks[0].summary, "User body.");
+    assertEqual(result.content.tasks[0].body, "User detail.");
+    assertIncludes(result.diagnostics.join("\n"), "INFERENCE_REJECTED");
+  });
+
+  test("v3 reconcile: output renders and reparses through the production parsers", () => {
+    const existing = makeV3State({
+      sections: {
+        tasks: [
+          { id: "task1", label: "Parent", origin: "user", depth: 0, checked: false, priority: "high" },
+          { id: "task2", label: "Child", origin: "agent", depth: 1, checked: true },
+        ],
+        risks: [{ id: "risk1", label: "Risky", origin: "agent", depth: 0, severity: "high" }],
+      },
+      content: {
+        tasks: [
+          { id: "task1", summary: "Parent summary.", body: "Parent body.", origin: "user" },
+          { id: "task2", summary: "Child summary.", body: "", origin: "agent" },
+        ],
+        risks: [{ id: "risk1", summary: "Risk summary.", body: "", origin: "agent" }],
+      },
+    });
+    const result = reconcileV3State({
+      existing,
+      inferred: { tasks: [{ label: "Fresh task", summary: "Fresh summary." }] },
+    });
+    const reparsed = parseContextMapV3(renderContextMapV3(result.map));
+    for (const key of V3_SECTION_KEYS) {
+      assertEqual(reparsed.sections[key].length, result.map.sections[key].length, `drift in ${key}`);
+    }
+    for (const key of V3_SECTION_KEYS) {
+      const rendered = renderContentFile(key, result.content[key]);
+      const entries = parseContentFile(rendered, key);
+      assertEqual(entries.length, result.content[key].length, `content drift in ${key}`);
+    }
+    const fresh = result.map.sections.tasks.at(-1);
+    assertEqual(fresh.id, "task3", "the new task continues the sequence");
+    assertEqual(fresh.origin, "agent");
+    assertEqual(result.counters.task, 3);
   });
 
   // ── Semantic snapshots (v2.3) ─────────────────────────────────────────────

@@ -37,7 +37,9 @@ import {
   V3_PROTOCOL_VERSION,
   V3_SECTION_KEYS,
   V3_SECTION_LABELS,
+  emptyContextMapV3,
   nodeFingerprint,
+  normalizeNodeText,
   parseContextMapV3,
 } from "./context-map.mjs";
 import {
@@ -318,4 +320,320 @@ export async function loadHandoffState(io, handoffDir) {
   const state = { version: V3_PROTOCOL_VERSION, map, content };
   state.diagnostics = validateHandoffState(state);
   return state;
+}
+
+// ── Stable ID allocation ─────────────────────────────────────────────────────
+
+/** Empty content bucket for all eight sections. */
+export function emptyV3Content() {
+  const content = {};
+  for (const key of V3_SECTION_KEYS) content[key] = [];
+  return content;
+}
+
+/**
+ * Reconstruct the per-prefix high-water counters. Valid `metadata.idCounters`
+ * entries win; live Map/body IDs raise stale values. Returns
+ * `{ counters, recovered }` where `recovered` flags missing or damaged
+ * metadata (ID_COUNTER_RECOVERED territory). Counters are monotonic: they
+ * never decrement and holes are never filled.
+ */
+export function recoverIdCounters(state, metadata) {
+  const counters = {};
+  for (const prefix of Object.values(ID_PREFIXES)) counters[prefix] = 0;
+
+  let recovered = false;
+  const stored = metadata && metadata.idCounters;
+  if (stored == null) {
+    recovered = true;
+  } else if (typeof stored === "object" && !Array.isArray(stored)) {
+    for (const [prefix, value] of Object.entries(stored)) {
+      if (!(prefix in counters)) continue;
+      if (Number.isInteger(value) && value > 0) counters[prefix] = value;
+      else recovered = true;
+    }
+  } else {
+    recovered = true;
+  }
+
+  if (state) {
+    const ids = [];
+    if (state.map) {
+      for (const key of V3_SECTION_KEYS) {
+        for (const node of (state.map.sections && state.map.sections[key]) || []) {
+          if (node.id != null) ids.push(node.id);
+        }
+      }
+    }
+    if (state.content) {
+      for (const key of V3_SECTION_KEYS) {
+        for (const entry of state.content[key] || []) ids.push(entry.id);
+      }
+    }
+    for (const id of ids) {
+      const match = typeof id === "string" && id.match(NODE_ID_RE);
+      if (match) counters[match[1]] = Math.max(counters[match[1]], parseInt(match[2], 10));
+    }
+  }
+
+  return { counters, recovered };
+}
+
+/**
+ * Allocate the next ID for a section, advancing the counter in place.
+ * IDs are never reused, even after their node is deleted.
+ */
+export function allocateNodeId(sectionKey, counters) {
+  const prefix = ID_PREFIXES[sectionKey];
+  if (!prefix) throw new Error(`unknown section '${sectionKey}' — cannot allocate a node ID`);
+  const next = (Number(counters[prefix]) || 0) + 1;
+  counters[prefix] = next;
+  return `${prefix}${next}`;
+}
+
+// ── Ownership-aware reconciliation ───────────────────────────────────────────
+
+const V3_SINGLETON_SECTIONS = new Set(["goals", "status"]);
+
+function normalizeUserIntent(userIntent) {
+  if (!userIntent) return {};
+  if (typeof userIntent === "string") {
+    const note = userIntent.trim();
+    return note ? { notes: note } : {};
+  }
+  const intent = {};
+  for (const key of V3_SECTION_KEYS) {
+    const value = userIntent[key] ?? (key === "goals" ? userIntent.goal : undefined);
+    if (typeof value === "string" && value.trim()) intent[key] = value.trim();
+  }
+  return intent;
+}
+
+function normalizeLabel(label) {
+  return normalizeNodeText(label);
+}
+
+/**
+ * Reconcile an existing v3 state with fresh agent inference and explicit
+ * user intent. Ownership domains are independent:
+ *
+ *   - Directory (ID, label, parent, order, task state, priority, severity):
+ *     user edits always win; agent-owned nodes may be updated in place
+ *     (keeping their ID) or replaced by fresh inference.
+ *   - Content (summary, body): user-owned entries are never overwritten;
+ *     agent-owned entries follow supported inference.
+ *
+ * Current Goal is special: only an explicit user goal or an existing valid
+ * goal populates it — inference (including commit-derived text) is rejected
+ * and reported. A deleted node is never recreated from its leftover body;
+ * orphan bodies are retained and reported, not auto-deleted.
+ *
+ * Returns `{ map, content, counters, diagnostics }`.
+ */
+export function reconcileV3State({ existing, inferred, userIntent, metadata } = {}) {
+  const priorMap = (existing && existing.map) || emptyContextMapV3();
+  const priorContent = (existing && existing.content) || emptyV3Content();
+  const intent = normalizeUserIntent(userIntent);
+  const { counters, recovered } = recoverIdCounters(
+    existing ? { map: priorMap, content: priorContent } : null,
+    metadata
+  );
+
+  const diagnostics = [];
+  if (recovered) {
+    diagnostics.push("ID_COUNTER_RECOVERED: metadata counters were reconstructed from durable state");
+  }
+  const reject = (msg) => diagnostics.push(`INFERENCE_REJECTED: ${msg}`);
+
+  const priorEntryById = new Map();
+  for (const key of V3_SECTION_KEYS) {
+    for (const entry of priorContent[key] || []) priorEntryById.set(entry.id, entry);
+  }
+
+  const resultMap = emptyContextMapV3();
+  const resultContent = emptyV3Content();
+  const contentUpdates = new Map(); // node id -> inferred entry
+
+  for (const key of V3_SECTION_KEYS) {
+    const priorNodes = priorMap.sections[key] || [];
+    const userNodes = priorNodes.filter((n) => n.origin !== "agent");
+    const agentNodes = priorNodes.filter((n) => n.origin === "agent");
+    const inferredNodes = ((inferred && inferred[key]) || []).filter((n) => n);
+    const intentLabel = intent[key];
+
+    let nodes;
+
+    if (key === "goals") {
+      // Only an explicit user goal or an existing valid goal populates this
+      // section. Commit-derived or otherwise inferred goals are rejected.
+      if (intentLabel) {
+        const current = priorNodes[0];
+        nodes = [
+          current
+            ? { ...current, label: intentLabel, origin: "user" }
+            : { id: allocateNodeId("goals", counters), label: intentLabel, origin: "user", depth: 0 },
+        ];
+      } else {
+        nodes = priorNodes.slice();
+        for (const inf of inferredNodes) {
+          reject(
+            `goal '${String(inf.label || "").slice(0, 60)}' — Current Goal only comes from an explicit user goal`
+          );
+        }
+      }
+    } else if (V3_SINGLETON_SECTIONS.has(key) && userNodes.length > 0) {
+      nodes = userNodes.slice();
+      for (const inf of inferredNodes) {
+        reject(`status '${String(inf.label || "").slice(0, 60)}' — a user-owned status suppresses inference`);
+      }
+    } else if (inferredNodes.length === 0) {
+      nodes = priorNodes.slice();
+    } else {
+      nodes = userNodes.slice();
+      const seen = new Set(userNodes.map((n) => normalizeLabel(n.label)));
+      const agentByNorm = new Map(agentNodes.map((n) => [normalizeLabel(n.label), n]));
+      const singletonAgent = key === "status" ? agentNodes[0] || null : null;
+      let singletonAgentUsed = false;
+
+      for (const inf of inferredNodes) {
+        const label = String(inf.label ?? inf.text ?? "").trim();
+
+        if (inf.id != null) {
+          const target = priorNodes.find((n) => n.id === inf.id);
+          if (!target) {
+            reject(`'${inf.id}' does not name an existing node`);
+            continue;
+          }
+          if (target.origin === "user") {
+            reject(`'${inf.id}' is user-owned — inferred changes to it were rejected`);
+            continue;
+          }
+          if (label) target.label = label;
+          if (key === "tasks" && inf.checked !== undefined) target.checked = !!inf.checked;
+          if (key === "tasks" && inf.priority) target.priority = inf.priority;
+          if (key === "risks" && inf.severity) target.severity = inf.severity;
+          if (!nodes.includes(target)) {
+            nodes.push(target);
+            seen.add(normalizeLabel(target.label));
+          }
+          contentUpdates.set(target.id, inf);
+          continue;
+        }
+
+        if (!label) continue;
+        const norm = normalizeLabel(label);
+
+        if (seen.has(norm)) {
+          const matched = nodes.find((n) => normalizeLabel(n.label) === norm);
+          if (matched && matched.origin === "agent") {
+            if (key === "tasks" && inf.checked !== undefined) matched.checked = !!inf.checked;
+            if (key === "tasks" && inf.priority) matched.priority = inf.priority;
+            if (key === "risks" && inf.severity) matched.severity = inf.severity;
+            contentUpdates.set(matched.id, inf);
+          } else if (
+            matched &&
+            (inf.summary !== undefined || inf.body !== undefined ||
+              (key === "tasks" && inf.checked !== undefined && inf.checked !== !!matched.checked))
+          ) {
+            reject(`'${matched.id || label}' is user-owned — inferred changes to it were rejected`);
+          }
+          continue;
+        }
+
+        const agentMatch = agentByNorm.get(norm);
+        if (agentMatch) {
+          if (key === "tasks") {
+            agentMatch.checked = !!inf.checked;
+            if (inf.priority) agentMatch.priority = inf.priority;
+          }
+          if (key === "risks" && inf.severity) agentMatch.severity = inf.severity;
+          nodes.push(agentMatch);
+          seen.add(norm);
+          contentUpdates.set(agentMatch.id, inf);
+          continue;
+        }
+
+        if (singletonAgent && !singletonAgentUsed) {
+          // Singleton section (status): update the agent node in place,
+          // keeping its ID, rather than appending a second node.
+          singletonAgentUsed = true;
+          singletonAgent.label = label;
+          nodes.push(singletonAgent);
+          seen.add(norm);
+          contentUpdates.set(singletonAgent.id, inf);
+          continue;
+        }
+
+        const node = {
+          id: allocateNodeId(key, counters),
+          label,
+          origin: "agent",
+          depth: Math.max(0, Number(inf.depth) || 0),
+        };
+        if (key === "tasks") {
+          node.checked = !!inf.checked;
+          if (inf.priority) node.priority = inf.priority;
+        }
+        if (key === "risks" && inf.severity) node.severity = inf.severity;
+        nodes.push(node);
+        seen.add(norm);
+        contentUpdates.set(node.id, inf);
+      }
+    }
+
+    // Explicit user intent appends (or, for singletons, replaces) nodes.
+    if (intentLabel && key !== "goals") {
+      if (V3_SINGLETON_SECTIONS.has(key) && nodes.length > 0) {
+        nodes = [{ ...nodes[0], label: intentLabel, origin: "user" }];
+      } else if (!nodes.some((n) => normalizeLabel(n.label) === normalizeLabel(intentLabel))) {
+        nodes.push({
+          id: allocateNodeId(key, counters),
+          label: intentLabel,
+          origin: "user",
+          depth: 0,
+          ...(key === "tasks" ? { checked: false } : {}),
+        });
+      }
+    }
+
+    resultMap.sections[key] = nodes;
+  }
+
+  // Content reconciliation: entries follow their node into the node's current
+  // section; user-owned entries pass through verbatim; orphan bodies are
+  // retained in their original file and reported, never auto-deleted.
+  const placedIds = new Set();
+  for (const key of V3_SECTION_KEYS) {
+    for (const node of resultMap.sections[key]) {
+      if (node.id == null) continue;
+      placedIds.add(node.id);
+      const priorEntry = priorEntryById.get(node.id) || null;
+      const update = contentUpdates.get(node.id);
+      if (priorEntry && priorEntry.origin === "user") {
+        resultContent[key].push(priorEntry);
+      } else if (update && (update.summary !== undefined || update.body !== undefined)) {
+        resultContent[key].push({
+          id: node.id,
+          summary: update.summary ?? (priorEntry ? priorEntry.summary : "") ?? "",
+          body: update.body ?? (priorEntry ? priorEntry.body : "") ?? "",
+          origin: "agent",
+        });
+      } else if (priorEntry) {
+        resultContent[key].push(priorEntry);
+      }
+    }
+  }
+  for (const key of V3_SECTION_KEYS) {
+    for (const entry of priorContent[key] || []) {
+      if (!placedIds.has(entry.id)) resultContent[key].push(entry); // orphan, retained
+    }
+  }
+
+  const state = { version: V3_PROTOCOL_VERSION, map: resultMap, content: resultContent };
+  return {
+    map: resultMap,
+    content: resultContent,
+    counters,
+    diagnostics: [...diagnostics, ...validateHandoffState(state)],
+  };
 }
