@@ -79,9 +79,11 @@ import {
 } from "../../scripts/snapshots.mjs";
 import {
   DEFAULT_BUDGET,
+  EFFORT_LEVELS,
   MIN_BUDGET,
   compileContext,
   estimateTokens,
+  validateEffort,
 } from "../../scripts/context-compiler.mjs";
 import {
   DIFF_FORMATS,
@@ -2126,6 +2128,207 @@ export function defineUnitTests(test, readFixture) {
     const second = planV2ToV3Migration(inputs);
     assertEqual(JSON.stringify(first), JSON.stringify(second), "planV2ToV3Migration is not deterministic");
     assertEqual(JSON.stringify(inputs), before, "planV2ToV3Migration mutated its inputs");
+  });
+
+  // ── v3 effort-aware context compiler ───────────────────────────────────────
+
+  function compilerV3State() {
+    return makeV3State({
+      sections: {
+        goals: [{ id: "goal1", label: "Ship the v3 release", origin: "user", depth: 0 }],
+        status: [{ id: "status1", label: "Compiler green", origin: "agent", depth: 0 }],
+        tasks: [
+          { id: "task1", label: "Wire the context compiler", origin: "agent", depth: 0, checked: false, priority: "high" },
+          { id: "task2", label: "Normalization lowercases keywords", origin: "agent", depth: 1, checked: false },
+          { id: "task3", label: "Grandchild cleanup", origin: "agent", depth: 2, checked: true },
+          { id: "task4", label: "Done long ago", origin: "agent", depth: 0, checked: true },
+        ],
+        decisions: [
+          { id: "decision1", label: "Keyword overlap scoring", origin: "user", depth: 0 },
+          { id: "decision2", label: "Normalization lowercases focus", origin: "agent", depth: 1 },
+          { id: "decision3", label: "Unrelated storage choice", origin: "user", depth: 0 },
+        ],
+        risks: [
+          { id: "risk1", label: "Token blowout", origin: "agent", depth: 0, severity: "high" },
+          { id: "risk2", label: "Minor formatting", origin: "agent", depth: 0, severity: "low" },
+        ],
+      },
+      content: {
+        goals: [{ id: "goal1", summary: "Goal summary.", body: "Goal body.", origin: "user" }],
+        status: [{ id: "status1", summary: "Status summary.", body: "", origin: "agent" }],
+        tasks: [
+          { id: "task1", summary: "Compiler summary.", body: "Compiler body details.", origin: "agent" },
+          { id: "task2", summary: "Normalization summary.", body: "Normalization body with zebra-only-body-keyword.", origin: "agent" },
+          { id: "task3", summary: "Grandchild cleanup done.", body: "Wrapped up earlier.", origin: "agent" },
+          { id: "task4", summary: "Done summary.", body: "Done body.", origin: "agent" },
+        ],
+        decisions: [
+          { id: "decision1", summary: "Scoring summary.", body: "Scoring body.", origin: "user" },
+          { id: "decision2", summary: "Lowercase summary.", body: "zebra-only-body-keyword details.", origin: "agent" },
+          { id: "decision3", summary: "Storage summary.", body: "Storage body.", origin: "user" },
+        ],
+        risks: [
+          { id: "risk1", summary: "Blowout summary.", body: "Blowout body.", origin: "agent" },
+          { id: "risk2", summary: "Formatting summary.", body: "Formatting body.", origin: "agent" },
+        ],
+      },
+    });
+  }
+
+  function compileV3(args) {
+    return compileContext({ state: compilerV3State(), ...args });
+  }
+
+  function entryOf(result, key, id) {
+    return (result.state.content[key] || []).find((e) => e.id === id) || null;
+  }
+
+  test("compiler v3: effort levels validate and med is the default", () => {
+    assertEqual(JSON.stringify([...EFFORT_LEVELS]), JSON.stringify(["min", "low", "med", "high", "max"]));
+    for (const ok of EFFORT_LEVELS) assertEqual(validateEffort(ok), ok);
+    for (const bad of ["MIN", "medium", "", "extreme", 42, null]) {
+      let threw = false;
+      try {
+        validateEffort(bad);
+      } catch (err) {
+        threw = true;
+        assert(/effort/i.test(err.message), `error should name the effort, got: ${err.message}`);
+      }
+      assert(threw, `effort ${JSON.stringify(bad)} must be rejected`);
+    }
+    const implicit = compileV3({ focus: "keyword overlap scoring" });
+    const explicit = compileV3({ focus: "keyword overlap scoring", effort: "med" });
+    assertEqual(implicit.effort, "med", "omitted effort must default to med");
+    assertEqual(JSON.stringify(implicit), JSON.stringify(explicit), "default and explicit med diverge");
+  });
+
+  test("compiler v3: min returns the directory only, with the ancestor path intact", () => {
+    const r = compileV3({ focus: "zebra-only-body-keyword", effort: "min" });
+    assertEqual(r.effort, "min");
+    for (const key of V3_SECTION_KEYS) {
+      assertEqual((r.state.content[key] || []).length, 0, `min must strip all bodies (${key})`);
+    }
+    assert(r.selectedIds.includes("decision2"), "matching node not selected");
+    assert(r.selectedIds.includes("decision1"), "a selected node must retain its full ancestor path");
+    assert(r.state.map.sections.decisions.length === 2, "directory entries remain without bodies");
+    assert(!r.selectedIds.includes("decision3"), "unmatched node must stay omitted");
+  });
+
+  test("compiler v3: low keeps summaries and strips detail bodies", () => {
+    const r = compileV3({ focus: "keyword overlap scoring", effort: "low" });
+    const decision = entryOf(r, "decisions", "decision1");
+    assert(decision, "selected node missing from low output");
+    assertEqual(decision.summary, "Scoring summary.");
+    assertEqual(decision.body, "", "low must strip the detail body");
+    const goal = entryOf(r, "goals", "goal1");
+    assertEqual(goal.summary, "Goal summary.");
+    assertEqual(goal.body, "");
+  });
+
+  test("compiler v3: med keeps complete bodies for selected nodes", () => {
+    const r = compileV3({ focus: "keyword overlap scoring", effort: "med" });
+    const decision = entryOf(r, "decisions", "decision1");
+    assertEqual(decision.body, "Scoring body.", "med must keep the complete body");
+    assert(!r.selectedIds.includes("decision3"), "unmatched node must stay omitted");
+    assert(!r.selectedIds.includes("task3"), "descendants are not pulled in at med");
+    assert(!r.selectedIds.includes("task4"), "completed tasks are not core");
+  });
+
+  test("compiler v3: high adds ancestors and direct subtrees with complete bodies", () => {
+    const focus = "zebra-only-body-keyword";
+    const med = compileV3({ focus, effort: "med" });
+    assert(med.selectedIds.includes("task2"), "matching task not selected at med");
+    assert(!med.selectedIds.includes("task3"), "med must not include the direct child");
+
+    const high = compileV3({ focus: "zebra-only-body-keyword", effort: "high" });
+    assert(high.selectedIds.includes("task2"), "matching task not selected at high");
+    assert(high.selectedIds.includes("task1"), "ancestor not preserved at high");
+    assert(high.selectedIds.includes("task3"), "high must include the direct subtree");
+    assertEqual(entryOf(high, "tasks", "task3").body, "Wrapped up earlier.", "high must keep complete bodies");
+    assert(!high.selectedIds.includes("task4"), "unrelated completed task must stay omitted");
+  });
+
+  test("compiler v3: max returns the complete map and every body", () => {
+    const r = compileV3({ effort: "max" });
+    assertEqual(r.fallbackReason, null, "max is an explicit choice, not a fallback");
+    assertEqual(r.selectedIds.length, 11, `max must select every node, got: ${JSON.stringify(r.selectedIds)}`);
+    assertEqual(r.omittedCount, 0);
+    assertEqual(entryOf(r, "decisions", "decision3").body, "Storage body.");
+    assertEqual(entryOf(r, "tasks", "task4").body, "Done body.");
+  });
+
+  test("compiler v3: focus matches across label, summary, body, and ancestor path", () => {
+    // Body-only keyword.
+    const byBody = compileV3({ focus: "zebra-only-body-keyword", effort: "med" });
+    assert(byBody.selectedIds.includes("decision2"), "body keyword did not select its node");
+
+    // Summary keyword.
+    const bySummary = compileV3({ focus: "lowercase summary", effort: "med" });
+    assert(bySummary.selectedIds.includes("decision2"), "summary keyword did not select its node");
+
+    // Ancestor path contributes the missing keyword ("keyword" lives on the parent).
+    const byPath = compileV3({ focus: "keyword lowercases", effort: "med" });
+    assertEqual(byPath.fallbackReason, null, "ancestor-path scoring should prevent fallback");
+    assert(byPath.selectedIds.includes("decision2"), "branch matching via ancestor path not selected");
+    assert(byPath.selectedIds.includes("decision1"), "ancestor not included");
+  });
+
+  test("compiler v3: selection is deterministic and preserves document order", () => {
+    const first = compileV3({ focus: "keyword overlap scoring", effort: "med" });
+    const second = compileV3({ focus: "keyword overlap scoring", effort: "med" });
+    assertEqual(JSON.stringify(first), JSON.stringify(second), "compilation is not deterministic");
+    const expected = ["goal1", "status1", "task1", "task2", "decision1", "decision2", "risk1"];
+    assertEqual(JSON.stringify(first.selectedIds), JSON.stringify(expected), "selected IDs must follow document order");
+  });
+
+  test("compiler v3: an explicit budget degrades bodies before omitting and reports every step", () => {
+    const state = compilerV3State();
+    const big = "paragraph ".repeat(600); // ~1650 estimated tokens
+    state.content.decisions.find((e) => e.id === "decision1").body = big;
+    state.content.decisions.find((e) => e.id === "decision2").body = big;
+    const r = compileContext({ state, focus: "keyword overlap scoring", effort: "med", budget: MIN_BUDGET });
+
+    for (const core of ["goal1", "status1", "task1", "task2", "risk1"]) {
+      assert(r.selectedIds.includes(core), `core node '${core}' was dropped to satisfy the budget`);
+    }
+    assert(r.degradations.length > 0, "budget pressure must report degradation steps");
+    assert(r.degradations.some((d) => d.to === "summary"), "full bodies must degrade to summaries first");
+    for (const d of r.degradations) {
+      assert(d.id && ["summary", "directory"].includes(d.to), `malformed degradation: ${JSON.stringify(d)}`);
+    }
+    // Degradation is paragraph-granular: entries keep either their complete
+    // body, their summary, or nothing — never a mid-paragraph cut.
+    for (const key of V3_SECTION_KEYS) {
+      for (const entry of r.state.content[key] || []) {
+        const original = state.content[key].find((e) => e.id === entry.id);
+        assert(entry.body === "" || entry.body === original.body, `body of '${entry.id}' was truncated mid-paragraph`);
+      }
+    }
+  });
+
+  test("compiler v3: --full selects all nodes but an explicit budget still degrades", () => {
+    const state = compilerV3State();
+    state.content.decisions.find((e) => e.id === "decision1").body = "paragraph ".repeat(600);
+    const r = compileContext({ state, full: true, effort: "max", budget: MIN_BUDGET });
+    assertEqual(r.fallbackReason, null, "--full is an explicit choice, not a fallback");
+    assertEqual(r.selectedIds.length, 11, "--full must select every node");
+    assert(r.degradations.length > 0, "an explicit budget must still force reported degradation");
+  });
+
+  test("compiler v3: without an explicit budget there is no hidden hard cap", () => {
+    const state = compilerV3State();
+    state.content.decisions.find((e) => e.id === "decision1").body = "paragraph ".repeat(2000);
+    const r = compileContext({ state, focus: "keyword overlap scoring", effort: "med" });
+    assert(!r.overflow, "no explicit budget means no cap to overflow");
+    assertEqual(r.degradations.length, 0, "no budget means no degradation");
+    assert(entryOf(r, "decisions", "decision1").body.length > 1000, "the complete body loads without a budget");
+  });
+
+  test("compiler v3: no reliable match falls back to the full map with a reason", () => {
+    const r = compileV3({ focus: "quokka zzz", effort: "med" });
+    assert(r.fallbackReason, "expected a fallback reason when nothing matches reliably");
+    assertEqual(r.omittedCount, 0, "fallback must return the full map");
+    assertEqual(r.selectedIds.length, 11, "fallback must select every node");
   });
 
   // ── Semantic snapshots (v2.3) ─────────────────────────────────────────────

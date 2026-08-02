@@ -32,8 +32,10 @@ import {
   compileContext,
   compileV3Context,
   DEFAULT_BUDGET,
+  EFFORT_LEVELS,
   MIN_BUDGET,
   validateBudget,
+  validateEffort,
 } from "../context-compiler.mjs";
 import { loadHandoffState } from "../handoff-state.mjs";
 import { detectLayout } from "../migrate-v3.mjs";
@@ -266,16 +268,18 @@ async function load(mode, compileOpts = null) {
           ...(state.map.sections.tasks || []).filter((n) => !n.checked).map((n) => n.label),
         ].map((t) => normalizeNodeText(t)).join(" ");
         const focus = compileOpts.full ? "" : (compileOpts.focus ?? defaultFocus);
-        const compiled = compileV3Context({ state, focus, budget: compileOpts.budget, full: compileOpts.full });
+        const compiled = compileV3Context({ state, focus, budget: compileOpts.budget, full: compileOpts.full, effort: compileOpts.effort });
         effective = { ...state, map: compiled.state.map, content: compiled.state.content };
         compileDiagnostics = {
           focus: compileOpts.full ? "(full map)" : focus,
-          budget: compileOpts.budget ?? DEFAULT_BUDGET,
+          effort: compiled.effort,
+          budget: compileOpts.budget ?? "(no cap)",
           selectedPaths: compiled.selectedIds,
           omittedCount: compiled.omittedCount,
           estimatedTokens: compiled.estimatedTokens,
           overflow: compiled.overflow,
           fallbackReason: compiled.fallbackReason,
+          degradations: compiled.degradations,
         };
       }
       ctx = v3StateToContext(effective, ctx);
@@ -393,22 +397,30 @@ function parseCliArgs(argv) {
   let focus;
   let budget;
   let full = false;
+  let effort;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--full") {
       full = true;
-    } else if (arg === "--focus" || arg === "--budget") {
+    } else if (arg === "--focus" || arg === "--budget" || arg === "--effort") {
       const value = argv[i + 1];
-      // An empty --focus is rejected like a missing one (parity with the
-      // Deno CLI, which cannot distinguish a bare flag from an empty value).
-      if (value === undefined || (arg === "--focus" && value === "")) {
+      // An empty --focus/--effort is rejected like a missing one (parity with
+      // the Deno CLI, which cannot distinguish a bare flag from an empty value).
+      if (value === undefined || (arg !== "--budget" && value === "")) {
         console.error(`Error: ${arg} requires a value`);
         process.exit(1);
       }
       i++;
       if (arg === "--focus") {
         focus = value;
+      } else if (arg === "--effort") {
+        try {
+          effort = validateEffort(value);
+        } catch {
+          console.error(`Error: invalid --effort value '${value}': expected one of ${EFFORT_LEVELS.join(", ")}`);
+          process.exit(1);
+        }
       } else {
         try {
           budget = validateBudget(Number(value));
@@ -426,8 +438,8 @@ function parseCliArgs(argv) {
   }
 
   if (positionals.length) opts.mode = positionals[0];
-  if (focus !== undefined || budget !== undefined || full) {
-    opts.compile = { focus, budget, full };
+  if (focus !== undefined || budget !== undefined || full || effort !== undefined) {
+    opts.compile = { focus, budget, full, effort };
   }
   return opts;
 }
@@ -448,11 +460,16 @@ try {
     const c = result.compiled;
     lines.push("", "Context compiler:");
     lines.push(`  Focus: ${filterSensitive(c.focus)}`);
-    lines.push(`  Budget: ${c.budget} estimated tokens`);
+    if (c.effort) lines.push(`  Effort: ${c.effort}`);
+    lines.push(typeof c.budget === "number" ? `  Budget: ${c.budget} estimated tokens` : `  Budget: ${c.budget}`);
     lines.push(`  Selected: ${c.selectedPaths.join(", ")}`);
     lines.push(`  Omitted: ${c.omittedCount} node(s)`);
     lines.push(`  Estimated tokens: ${c.estimatedTokens}`);
     lines.push(`  Overflow: ${c.overflow ? "yes" : "no"}`);
+    if (c.degradations && c.degradations.length > 0) {
+      lines.push(`  Degradations: ${c.degradations.length} step(s)`);
+      for (const d of c.degradations) lines.push(`    - ${d.id}: ${d.from} → ${d.to}`);
+    }
     if (c.fallbackReason) lines.push(`  Fallback: ${c.fallbackReason}`);
   }
   console.log(lines.join("\n"));

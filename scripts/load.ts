@@ -34,9 +34,11 @@ import {
 import {
   compileContext,
   compileV3Context,
+  EFFORT_LEVELS,
   DEFAULT_BUDGET,
   MIN_BUDGET,
   validateBudget,
+  validateEffort,
 } from "./context-compiler.mjs";
 import { sha256Hex, viewTamperWarnings } from "./views.mjs";
 import { loadHandoffState } from "./handoff-state.mjs";
@@ -97,20 +99,23 @@ interface LoadResult {
   compiled?: CompileDiagnostics | null;
 }
 
-/** Compiler flags parsed from the CLI (`--focus/--budget/--full`). */
+/** Compiler flags parsed from the CLI (`--focus/--budget/--full/--effort`). */
 interface CompileRequest {
   focus?: string;
   budget?: number;
   full: boolean;
+  effort?: string;
 }
 
 /** Diagnostics returned alongside the load result after a compilation. */
 interface CompileDiagnostics {
   focus: string;
-  budget: number;
+  budget: number | string;
   selectedPaths: string[];
   omittedCount: number;
   estimatedTokens: number;
+  effort?: string;
+  degradations?: { id: string; from: string; to: string }[];
   overflow: boolean;
   fallbackReason: string | null;
 }
@@ -566,11 +571,16 @@ function formatOutput(result: LoadResult, mode: string): string {
     lines.push("");
     lines.push("Context compiler:");
     lines.push(`  Focus: ${filterSensitive(c.focus)}`);
-    lines.push(`  Budget: ${c.budget} estimated tokens`);
+    if (c.effort) lines.push(`  Effort: ${c.effort}`);
+    lines.push(typeof c.budget === "number" ? `  Budget: ${c.budget} estimated tokens` : `  Budget: ${c.budget}`);
     lines.push(`  Selected: ${c.selectedPaths.join(", ")}`);
     lines.push(`  Omitted: ${c.omittedCount} node(s)`);
     lines.push(`  Estimated tokens: ${c.estimatedTokens}`);
     lines.push(`  Overflow: ${c.overflow ? "yes" : "no"}`);
+    if (c.degradations && c.degradations.length > 0) {
+      lines.push(`  Degradations: ${c.degradations.length} step(s)`);
+      for (const d of c.degradations) lines.push(`    - ${d.id}: ${d.from} → ${d.to}`);
+    }
     if (c.fallbackReason) lines.push(`  Fallback: ${c.fallbackReason}`);
   }
 
@@ -728,23 +738,27 @@ async function load(mode: string, compile: CompileRequest | null = null): Promis
           ...(((state as never) as { map: { sections: { tasks: { label: string; checked?: boolean }[] } } }).map.sections.tasks || []).filter((n) => !n.checked).map((n) => n.label),
         ].map((t) => normalizeNodeText(t)).join(" ");
         const focus = compile.full ? "" : (compile.focus ?? defaultFocus);
-        const compiled = compileV3Context({ state, focus, budget: compile.budget, full: compile.full } as never) as {
+        const compiled = compileV3Context({ state, focus, budget: compile.budget, full: compile.full, effort: compile.effort } as never) as {
           state: { map: unknown; content: unknown };
           selectedIds: string[];
           omittedCount: number;
           estimatedTokens: number;
           overflow: boolean;
           fallbackReason: string | null;
+          effort: string;
+          degradations: { id: string; from: string; to: string }[];
         };
         effective = { ...(state as object), map: compiled.state.map, content: compiled.state.content } as never;
         compileDiagnostics = {
           focus: compile.full ? "(full map)" : focus,
-          budget: compile.budget ?? DEFAULT_BUDGET,
+          budget: compile.budget ?? "(no cap)",
           selectedPaths: compiled.selectedIds,
           omittedCount: compiled.omittedCount,
           estimatedTokens: compiled.estimatedTokens,
           overflow: compiled.overflow,
           fallbackReason: compiled.fallbackReason,
+          effort: compiled.effort,
+          degradations: compiled.degradations,
         };
       }
       ctx = v3StateToContext(effective as never, ctx);
@@ -912,12 +926,12 @@ async function load(mode: string, compile: CompileRequest | null = null): Promis
 async function main() {
   const args = parse(Deno.args, {
     default: { _: ["default"] },
-    string: ["focus", "budget"],
+    string: ["focus", "budget", "effort"],
     boolean: ["full"],
   });
 
   // /handoff load [auto|merge] [--focus "current task"] [--budget N] [--full]
-  const allowedFlags = new Set(["_", "focus", "budget", "full"]);
+  const allowedFlags = new Set(["_", "focus", "budget", "full", "effort"]);
   for (const key of Object.keys(args)) {
     if (!allowedFlags.has(key)) {
       console.error(`Error: Unknown flag '--${key}'`);
@@ -940,8 +954,13 @@ async function main() {
     Deno.exit(1);
   }
 
+  if (args.effort !== undefined && args.effort === "") {
+    console.error("Error: --effort requires a value");
+    Deno.exit(1);
+  }
+
   let compile: CompileRequest | null = null;
-  if (args.focus !== undefined || args.budget !== undefined || args.full) {
+  if (args.focus !== undefined || args.budget !== undefined || args.full || args.effort !== undefined) {
     let budget: number | undefined;
     if (args.budget !== undefined) {
       try {
@@ -951,7 +970,16 @@ async function main() {
         Deno.exit(1);
       }
     }
-    compile = { focus: args.focus, budget, full: !!args.full };
+    let effort: string | undefined;
+    if (args.effort !== undefined) {
+      try {
+        effort = validateEffort(String(args.effort));
+      } catch {
+        console.error(`Error: invalid --effort value '${args.effort}': expected one of ${EFFORT_LEVELS.join(", ")}`);
+        Deno.exit(1);
+      }
+    }
+    compile = { focus: args.focus, budget, full: !!args.full, effort };
   }
 
   try {

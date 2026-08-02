@@ -621,6 +621,31 @@ Deno.test("load: without compiler flags the output carries no compiler diagnosti
   }
 });
 
+Deno.test("load --effort: invalid values and empty values are rejected", async () => {
+  for (const args of [["--effort", "bogus"], ["--effort", "MIN"], ["--effort", ""]]) {
+    const res = await runLoadArgs(new URL("v3/basic", fixturesDir).pathname, args);
+    assertEqual(res.code, 1, `args ${JSON.stringify(args)} must exit 1: ${res.stdout}${res.stderr}`);
+    assertIncludes(res.stderr, "effort");
+  }
+});
+
+Deno.test("load --effort: min loads the directory only, med keeps bodies", async () => {
+  const min = await runLoadArgs(new URL("v3/basic", fixturesDir).pathname, ["--effort", "min", "--focus", "migration"]);
+  assertEqual(min.code, 0, `load failed: ${min.stderr}`);
+  assertIncludes(min.stdout, "Effort: min");
+  assertIncludes(min.stdout, "Selected: goal1, status1, task1, task2, question1, risk1");
+  assertIncludes(min.stdout, "Budget: (no cap)");
+
+  const med = await runLoadArgs(new URL("v3/basic", fixturesDir).pathname, ["--effort", "med", "--focus", "migration"]);
+  assertEqual(med.code, 0, `load failed: ${med.stderr}`);
+  assertIncludes(med.stdout, "Effort: med");
+
+  // The default effort is med.
+  const implicit = await runLoadArgs(new URL("v3/basic", fixturesDir).pathname, ["--focus", "migration"]);
+  assertEqual(implicit.code, 0, `load failed: ${implicit.stderr}`);
+  assertIncludes(implicit.stdout, "Effort: med");
+});
+
 Deno.test("load: unknown flags are rejected", async () => {
   const res = await runLoadArgs(fixturePath("map-only"), ["--bogus"]);
   assertEqual(res.code, 1, `unknown flag must exit 1: ${res.stdout}${res.stderr}`);

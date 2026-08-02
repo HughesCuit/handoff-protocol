@@ -593,6 +593,31 @@ test("load: without compiler flags the output carries no compiler diagnostics", 
   }
 });
 
+test("load --effort: invalid values and empty values are rejected", () => {
+  for (const args of [["--effort", "bogus"], ["--effort", "MIN"], ["--effort"]]) {
+    const res = runLoadArgs(join(fixturesDir, "v3", "basic"), args);
+    assertEqual(res.status, 1, `args ${JSON.stringify(args)} must exit 1: ${res.stdout}${res.stderr}`);
+    assertIncludes(res.stderr, "effort");
+  }
+});
+
+test("load --effort: min loads the directory only, med keeps bodies", () => {
+  const min = runLoadArgs(join(fixturesDir, "v3", "basic"), ["--effort", "min", "--focus", "migration"]);
+  assertEqual(min.status, 0, `load failed: ${min.stderr}`);
+  assertIncludes(min.stdout, "Effort: min");
+  assertIncludes(min.stdout, "Selected: goal1, status1, task1, task2, question1, risk1");
+  assertIncludes(min.stdout, "Budget: (no cap)");
+
+  const med = runLoadArgs(join(fixturesDir, "v3", "basic"), ["--effort", "med", "--focus", "migration"]);
+  assertEqual(med.status, 0, `load failed: ${med.stderr}`);
+  assertIncludes(med.stdout, "Effort: med");
+
+  // The default effort is med.
+  const implicit = runLoadArgs(join(fixturesDir, "v3", "basic"), ["--focus", "migration"]);
+  assertEqual(implicit.status, 0, `load failed: ${implicit.stderr}`);
+  assertIncludes(implicit.stdout, "Effort: med");
+});
+
 test("load: unknown flags are rejected", () => {
   const res = runLoadArgs(join(fixturesDir, "handoffs", "map-only"), ["--bogus"]);
   assertEqual(res.status, 1, `unknown flag must exit 1: ${res.stdout}${res.stderr}`);

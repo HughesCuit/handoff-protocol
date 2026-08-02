@@ -158,7 +158,7 @@ Save current work context to `.handoff/`.
 6. Write a semantic snapshot under `.handoff/history/snapshots/` if the semantic state changed
 7. For submodule mode: commit and push to submodule repo (including `context-map.md`)
 
-### /handoff load [mode] [--focus TEXT] [--budget N] [--full]
+### /handoff load [mode] [--focus TEXT] [--effort LEVEL] [--budget N] [--full]
 
 Read and restore context from `.handoff/`.
 
@@ -169,10 +169,16 @@ Read and restore context from `.handoff/`.
 
 **Options (context compiler):**
 - `--focus TEXT` - Compile the map down to the nodes relevant to this text. Current Goal and Current Status (and their ancestors) are always kept; other nodes are selected by deterministic keyword-overlap scoring.
-- `--budget N` - Estimated token limit for the compiled map. Default `4000`, minimum `512`; lower or non-numeric values are rejected.
-- `--full` - Return the entire map; overrides `--focus` and `--budget`.
+- `--effort LEVEL` - Per-load detail level: `min`, `low`, `med`, `high`, `max`. Default: `med`. Effort controls context compilation only — it is chosen on every load, is never persisted to project configuration, and body files always retain their complete canonical content.
+  - `min` - Context Map directory only; no bodies.
+  - `low` - Directory plus first-paragraph summaries for selected nodes.
+  - `med` - Complete bodies for selected nodes.
+  - `high` - Complete bodies for selected nodes, their ancestors, and their direct subtrees.
+  - `max` - Complete Map and all body entries.
+- `--budget N` - Estimated token limit for the compiled context. Minimum `512`; lower or non-numeric values are rejected. When omitted there is no hidden hard cap — effort alone determines detail. When supplied, the budget is a hard limit that can degrade higher efforts: full bodies degrade to summaries, then to directory-only, and every degradation is reported.
+- `--full` - Select all nodes; does not disable an explicitly supplied `--budget`.
 
-If no non-core node matches the focus reliably, the compiler safely falls back to the full map and reports the reason — focused load never omits core state. Without compiler flags the output carries no compiler diagnostics. Compilation is strictly read-only.
+Choose `min`/`low` for constrained context windows and `high`/`max` only when the task benefits from broad history. If no non-core node matches the focus reliably, the compiler safely falls back to the full map and reports the reason — focused load never omits core state. Without compiler flags the output carries no compiler diagnostics. Compilation is strictly read-only.
 
 **Pre-checks:**
 1. Read `.handoff.config.json` to determine storage mode

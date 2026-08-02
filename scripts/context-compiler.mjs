@@ -148,7 +148,7 @@ function fullResult(entries, map, overflow, fallbackReason) {
  * Throws RangeError for budgets below MIN_BUDGET and TypeError for a
  * missing/malformed map.
  */
-export function compileContext(map, options = {}) {
+export function compileV2Context(map, options = {}) {
   if (!map || !map.sections) {
     throw new TypeError("compileContext requires a parsed context map");
   }
@@ -227,16 +227,43 @@ export function compileContext(map, options = {}) {
   return result(pruned, selectedPaths, entries.length - selectedPaths.length, used, used > budget, null);
 }
 
-// ── v3 compilation ───────────────────────────────────────────────────────────
+// ── v3 effort-aware compilation ──────────────────────────────────────────────
 // v3 compiles the canonical state (directory + bodies). Selection follows the
 // same deterministic rules as v2 — core nodes (Current Goal, Current Status,
 // incomplete Tasks, high-severity Risks) are always kept, other nodes score
 // by normalized keyword overlap across label, summary, body, and ancestor
 // labels — but reports stable node IDs instead of positional paths, and the
-// compiled result carries the matching body entries. Effort-aware loading
-// (min/low/med/high/max) extends this path; see EFFORT_LEVELS when present.
+// compiled result carries body entries at the requested effort:
+//
+//   min  — directory only; no bodies.
+//   low  — selected nodes plus first-paragraph summaries.
+//   med  — selected nodes plus complete bodies (default).
+//   high — selected nodes, their ancestors, and their direct subtrees with
+//          complete bodies.
+//   max  — the complete Map and all body entries.
+//
+// Effort controls compilation, never persistence. Without an explicit
+// --budget there is no hidden hard token cap. With an explicit budget the
+// compiler preserves the Map, Current Goal, Current Status, active Tasks,
+// and high-severity Risks first, then degrades full bodies to summaries
+// before omitting lower-scored bodies (directory-only) — every degradation
+// is reported, paragraphs are never split mid-character, and core nodes are
+// never dropped (overflow is reported instead).
 
 import { V3_SECTION_KEYS } from "./context-map.mjs";
+
+/** Per-load effort levels, cheapest first. */
+export const EFFORT_LEVELS = Object.freeze(["min", "low", "med", "high", "max"]);
+
+/** Validate an --effort value; throws RangeError naming the effort. */
+export function validateEffort(value) {
+  if (typeof value !== "string" || !EFFORT_LEVELS.includes(value)) {
+    throw new RangeError(
+      `Invalid effort: expected one of ${EFFORT_LEVELS.join(", ")}, got ${JSON.stringify(value)}`
+    );
+  }
+  return value;
+}
 
 function v3EntryFor(content, key, id) {
   for (const entry of (content && content[key]) || []) {
@@ -261,6 +288,7 @@ function flattenV3(state) {
         index,
         node,
         id: node.id,
+        core: isCoreV3Node(key, node),
         body: node.id != null ? v3EntryFor(state.content, key, node.id) : null,
       });
     });
@@ -268,119 +296,188 @@ function flattenV3(state) {
   return entries;
 }
 
-function v3NodeTokens(entry) {
+/** Token cost of one entry at a materialization level ("full"|"summary"|"directory"). */
+function v3NodeTokens(entry, level) {
+  if (level === "directory") return estimateTokens(entry.node.label);
   const body = entry.body || { summary: "", body: "" };
+  if (level === "summary") return estimateTokens(`${entry.node.label}\n${body.summary}`);
   return estimateTokens(`${entry.node.label}\n${body.summary}\n${body.body}`);
 }
 
-function v3Result(map, content, selectedIds, omittedCount, estimatedTokens, overflow, fallbackReason) {
-  return {
-    state: { map, content },
-    selectedIds,
-    omittedCount,
-    estimatedTokens,
-    overflow,
-    fallbackReason,
-  };
-}
-
-function fullV3Result(entries, state, overflow, fallbackReason) {
-  const tokens = entries.reduce((sum, e) => sum + v3NodeTokens(e), 0);
-  return v3Result(
-    state.map,
-    state.content,
-    entries.map((e) => e.id).filter((id) => id != null),
-    0,
-    tokens,
-    overflow,
-    fallbackReason
-  );
-}
-
 /**
- * Compile a canonical v3 state down to the nodes relevant to `focus` within
- * an estimated token budget. Same selection contract as the v2 compiler;
- * `selectedIds` holds stable node IDs in document order and `state` carries
- * the pruned directory plus the matching body entries (complete bodies).
+ * Compile a canonical v3 state down to the nodes relevant to `focus` at the
+ * requested effort, within an optional explicit token budget.
  *
- * Throws RangeError for budgets below MIN_BUDGET and TypeError for a
- * missing/malformed state.
+ * Returns `{ state: { map, content }, selectedIds, omittedCount,
+ * estimatedTokens, effort, overflow, fallbackReason, degradations }` where
+ * `degradations` lists `{ id, from, to }` steps ("body" → "summary" →
+ * "directory") forced by the budget. Throws RangeError for an invalid effort
+ * or budget and TypeError for a missing/malformed state.
  */
-export function compileV3Context({ state, focus, budget, full = false } = {}) {
+export function compileV3Context({ state, focus, effort = "med", budget, full = false } = {}) {
+  const level = validateEffort(effort);
   if (!state || !state.map || !state.map.sections) {
     throw new TypeError("compileV3Context requires a canonical v3 state");
   }
-  const limit = budget == null ? DEFAULT_BUDGET : validateBudget(budget);
+  const hasBudget = budget != null;
+  const limit = hasBudget ? validateBudget(budget) : null;
   const entries = flattenV3(state);
+  const allIds = entries.map((e) => e.id).filter((id) => id != null);
 
-  if (full) return fullV3Result(entries, state, false, null);
+  // ── Selection ────────────────────────────────────────────────────────────
+  const selected = new Set();
+  const scores = new Map(); // id -> reliability score (non-core only)
+  let fallbackReason = null;
 
-  const required = new Set();
-  for (const e of entries) {
-    if (!isCoreV3Node(e.key, e.node)) continue;
-    if (e.id != null) required.add(e.id);
-    const nodes = state.map.sections[e.key];
-    for (const a of ancestorIndexes(nodes, e.index)) {
+  const addWithAncestors = (entry) => {
+    if (entry.id != null) selected.add(entry.id);
+    const nodes = state.map.sections[entry.key];
+    for (const a of ancestorIndexes(nodes, entry.index)) {
       const ancestor = nodes[a];
-      if (ancestor.id != null) required.add(ancestor.id);
+      if (ancestor.id != null) selected.add(ancestor.id);
+    }
+  };
+
+  if (full || level === "max") {
+    for (const id of allIds) selected.add(id);
+  } else {
+    for (const e of entries) if (e.core) addWithAncestors(e);
+
+    const nonCore = entries.filter((e) => e.id != null && !selected.has(e.id));
+    const keywords = extractKeywords(focus);
+
+    if (keywords.length === 0) {
+      if (nonCore.length > 0) {
+        for (const id of allIds) selected.add(id);
+        fallbackReason = "no usable focus keywords; returned the full map";
+      } else {
+        for (const id of allIds) selected.add(id);
+      }
+    } else {
+      const scored = nonCore.map((e) => {
+        const nodes = state.map.sections[e.key];
+        const body = e.body || { summary: "", body: "" };
+        const haystack = [
+          ...ancestorIndexes(nodes, e.index).map((a) => nodes[a].label),
+          e.node.label,
+          body.summary,
+          body.body,
+        ].join(" ").toLowerCase();
+        const matched = keywords.filter((k) => haystack.includes(k)).length;
+        return { entry: e, score: matched / keywords.length };
+      });
+
+      const candidates = scored
+        .filter((s) => s.score >= RELIABLE_MATCH_THRESHOLD)
+        .sort((a, b) => b.score - a.score);
+
+      if (candidates.length === 0 && nonCore.length > 0) {
+        for (const id of allIds) selected.add(id);
+        fallbackReason = "no non-core node matched the focus reliably; returned the full map";
+      } else {
+        for (const { entry, score } of candidates) {
+          scores.set(entry.id, score);
+          addWithAncestors(entry);
+        }
+      }
+    }
+
+    // high: pull the direct subtrees of every selected node into the
+    // selection (ancestors are already included by addWithAncestors).
+    if (level === "high" && !fallbackReason) {
+      for (const e of entries) {
+        if (e.id == null || selected.has(e.id)) continue;
+        const nodes = state.map.sections[e.key];
+        const parents = ancestorIndexes(nodes, e.index);
+        const directParent = parents.length > 0 ? nodes[parents[parents.length - 1]] : null;
+        if (directParent && directParent.id != null && selected.has(directParent.id)) {
+          selected.add(e.id);
+        }
+      }
     }
   }
 
-  const nonCore = entries.filter((e) => e.id == null || !required.has(e.id));
-  const keywords = extractKeywords(focus);
-
-  if (keywords.length === 0) {
-    if (nonCore.length === 0) return fullV3Result(entries, state, false, null);
-    const tokens = entries.reduce((sum, e) => sum + v3NodeTokens(e), 0);
-    return fullV3Result(entries, state, tokens > limit, "no usable focus keywords; returned the full map");
+  // ── Materialization ──────────────────────────────────────────────────────
+  // levelAt[id] = "full" | "summary" | "directory" (min starts directory-only;
+  // low starts at summary; med/high/max start at full).
+  const startLevel = level === "min" ? "directory" : level === "low" ? "summary" : "full";
+  const levelAt = new Map();
+  for (const e of entries) {
+    if (e.id != null && selected.has(e.id)) levelAt.set(e.id, startLevel);
   }
 
-  const scored = nonCore.map((e) => {
-    const nodes = state.map.sections[e.key];
-    const body = e.body || { summary: "", body: "" };
-    const haystack = [
-      ...ancestorIndexes(nodes, e.index).map((a) => nodes[a].label),
-      e.node.label,
-      body.summary,
-      body.body,
-    ].join(" ").toLowerCase();
-    const matched = keywords.filter((k) => haystack.includes(k)).length;
-    return { entry: e, score: matched / keywords.length };
-  });
+  const totalTokens = () =>
+    entries.reduce((sum, e) => (e.id != null && levelAt.has(e.id) ? sum + v3NodeTokens(e, levelAt.get(e.id)) : sum), 0);
 
-  const candidates = scored
-    .filter((s) => s.score >= RELIABLE_MATCH_THRESHOLD)
-    .sort((a, b) => b.score - a.score);
+  const degradations = [];
+  if (hasBudget && totalTokens() > limit) {
+    // Degradation order: lowest-scored non-core first, core last; document
+    // order breaks ties. Every step is reported.
+    const ordered = entries
+      .filter((e) => e.id != null && levelAt.has(e.id))
+      .map((e) => ({ entry: e, score: e.core ? Infinity : scores.get(e.id) ?? 0 }))
+      .sort((a, b) => a.score - b.score || a.entry.key.localeCompare(b.entry.key) || a.entry.index - b.entry.index);
 
-  if (candidates.length === 0 && nonCore.length > 0) {
-    const tokens = entries.reduce((sum, e) => sum + v3NodeTokens(e), 0);
-    return fullV3Result(entries, state, tokens > limit, "no non-core node matched the focus reliably; returned the full map");
+    if (startLevel === "full") {
+      for (const { entry } of ordered) {
+        if (totalTokens() <= limit) break;
+        if (levelAt.get(entry.id) !== "full") continue;
+        if (!entry.body || !entry.body.body) continue;
+        levelAt.set(entry.id, "summary");
+        degradations.push({ id: entry.id, from: "body", to: "summary" });
+      }
+    }
+    if (totalTokens() > limit && startLevel !== "min") {
+      for (const { entry } of ordered) {
+        if (totalTokens() <= limit) break;
+        if (levelAt.get(entry.id) === "directory") continue;
+        const from = levelAt.get(entry.id) === "full" ? "body" : "summary";
+        if (from === "body" && (!entry.body || (!entry.body.summary && !entry.body.body))) continue;
+        if (from === "summary" && (!entry.body || !entry.body.summary)) continue;
+        levelAt.set(entry.id, "directory");
+        degradations.push({ id: entry.id, from, to: "directory" });
+      }
+    }
   }
 
-  const selected = new Set(required);
-  let used = 0;
-  for (const e of entries) if (e.id != null && required.has(e.id)) used += v3NodeTokens(e);
-
-  for (const { entry } of candidates) {
-    const nodes = state.map.sections[entry.key];
-    const pending = [entry, ...ancestorIndexes(nodes, entry.index).map((a) => {
-      const ancestor = nodes[a];
-      return { key: entry.key, node: ancestor, id: ancestor.id, body: ancestor.id != null ? v3EntryFor(state.content, entry.key, ancestor.id) : null };
-    })].filter((e) => e.id != null && !selected.has(e.id));
-    const cost = pending.reduce((sum, e) => sum + v3NodeTokens(e), 0);
-    if (used + cost > limit) continue;
-    for (const e of pending) selected.add(e.id);
-    used += cost;
-  }
-
+  // ── Pruned output ────────────────────────────────────────────────────────
   const prunedMap = { sections: {}, extras: [] };
   const prunedContent = {};
   for (const key of V3_SECTION_KEYS) {
     prunedMap.sections[key] = (state.map.sections[key] || []).filter((n) => n.id != null && selected.has(n.id));
-    prunedContent[key] = ((state.content && state.content[key]) || []).filter((e) => selected.has(e.id));
+    if (level === "min") {
+      prunedContent[key] = [];
+    } else {
+      prunedContent[key] = ((state.content && state.content[key]) || [])
+        .filter((e) => selected.has(e.id) && levelAt.get(e.id) !== "directory")
+        .map((e) => (levelAt.get(e.id) === "summary" ? { ...e, body: "" } : e));
+    }
   }
 
   const selectedIds = entries.filter((e) => e.id != null && selected.has(e.id)).map((e) => e.id);
-  const omitted = entries.filter((e) => e.id != null && !selected.has(e.id)).length;
-  return v3Result(prunedMap, prunedContent, selectedIds, omitted, used, used > limit, null);
+  const omittedCount = entries.filter((e) => e.id != null && !selected.has(e.id)).length;
+  const estimatedTokens = totalTokens();
+
+  return {
+    state: { map: prunedMap, content: prunedContent },
+    selectedIds,
+    omittedCount,
+    estimatedTokens,
+    effort: level,
+    overflow: hasBudget ? estimatedTokens > limit : false,
+    fallbackReason,
+    degradations,
+  };
+}
+
+/**
+ * Unified compiler entry point. A v3 call passes a single options object
+ * (`{ state, focus?, effort?, budget?, full? }`); a v2 call passes a parsed
+ * v2 map plus options (`compileContext(map, { focus?, budget?, full? })`).
+ */
+export function compileContext(input, options = {}) {
+  if (input && typeof input === "object" && input.state !== undefined) {
+    return compileV3Context(input);
+  }
+  return compileV2Context(input, options);
 }
