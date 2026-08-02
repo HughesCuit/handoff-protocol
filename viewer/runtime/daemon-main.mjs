@@ -34,6 +34,7 @@ export async function startDaemon(options = {}) {
   const controlToken = options.controlToken ?? randomBytes(32).toString("base64url");
   const processObject = options.processObject ?? process;
   const idleCheckMs = options.idleCheckMs ?? DEFAULT_IDLE_CHECK_MS;
+  const startupLockOwner = options.startupLockOwner;
 
   let closePromise = null;
   let idleTimer = null;
@@ -62,7 +63,7 @@ export async function startDaemon(options = {}) {
       removeSignalHandlers();
       await server.close();
       await removeState(runtimeDir);
-      await releaseStartupLock(runtimeDir);
+      if (startupLockOwner) await releaseStartupLock(runtimeDir, startupLockOwner);
     })();
     return closePromise;
   }
@@ -72,6 +73,7 @@ export async function startDaemon(options = {}) {
   try {
     state = createStateRecord({ pid: processObject.pid, port, controlToken });
     await writeState(runtimeDir, state);
+    if (startupLockOwner) await releaseStartupLock(runtimeDir, startupLockOwner);
 
     for (const signal of ["SIGINT", "SIGTERM"]) {
       const handler = () => {
@@ -84,7 +86,7 @@ export async function startDaemon(options = {}) {
     idleTimer = setInterval(() => {
       void (async () => {
         await sessionManager.prune();
-        if (!sessionManager.hasSessions) await close();
+        if (!sessionManager.hasActivity) await close();
       })().catch(() => {});
     }, idleCheckMs);
     idleTimer.unref?.();
@@ -97,5 +99,5 @@ export async function startDaemon(options = {}) {
 }
 
 if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  await startDaemon();
+  await startDaemon({ startupLockOwner: process.env.HANDOFF_VIEW_STARTUP_LOCK_OWNER });
 }

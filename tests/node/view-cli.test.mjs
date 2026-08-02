@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { parseArgs, runView, ViewError } from "../../scripts/node/view.mjs";
-import { DAEMON_VERSION, writeState, acquireStartupLock } from "../../viewer/runtime/daemon-state.mjs";
+import { DAEMON_VERSION, writeState, acquireStartupLock, readLock } from "../../viewer/runtime/daemon-state.mjs";
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -320,6 +320,48 @@ test("a held startup lock with no healthy daemon is recovered when stale", async
       const result = await runView(options);
       assert.equal(result.ok, true, JSON.stringify(result.error));
       assert.equal(fake.world.spawned, 1, "must recover the stale lock and start a daemon");
+    });
+  });
+});
+
+test("a timed-out spawned starter retains its owned lock for safe recovery", async () => {
+  await withTempDir(async (runtimeDir) => {
+    await withTempDir(async (projectDir) => {
+      await makeProject(projectDir);
+      let now = 1_000;
+      let spawnOptions;
+      const result = await runView({
+        argv: [],
+        cwd: projectDir,
+        runtimeDir,
+        fetch: async () => ({ ok: false, status: 503, async json() { return {}; } }),
+        spawn: (_execPath, _args, options) => {
+          spawnOptions = options;
+          return { unref() {} };
+        },
+        now: () => now,
+        sleep: async () => { now += 1_000; },
+        env: { PATH: "/usr/bin" },
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.error.code, "VIEW_DAEMON_START_TIMEOUT");
+      const lock = await readLock(runtimeDir, { now: () => now });
+      assert.ok(lock, "the still-starting child must retain startup coordination");
+      assert.equal(spawnOptions.env.HANDOFF_VIEW_STARTUP_LOCK_OWNER, lock.ownerId);
+    });
+  });
+});
+
+test("a stale legacy file lock fails with VIEW_STATE_UNSAFE instead of timing out forever", async () => {
+  await withTempDir(async (runtimeDir) => {
+    await withTempDir(async (projectDir) => {
+      await makeProject(projectDir);
+      await writeFile(join(runtimeDir, "daemon.lock"), JSON.stringify({ pid: 1, lockedAt: 1 }));
+      const { fake, options } = baseDeps(runtimeDir, projectDir, { now: () => Date.now() + 60_000 });
+      const result = await runView(options);
+      assert.equal(result.ok, false);
+      assert.equal(result.error.code, "VIEW_STATE_UNSAFE");
+      assert.equal(fake.world.spawned, 0);
     });
   });
 });

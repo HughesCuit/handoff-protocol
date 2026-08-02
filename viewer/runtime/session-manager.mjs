@@ -29,6 +29,7 @@ export class SessionManager {
     this.sessions = new Map();
     this.projectStores = new Map();
     this.createTail = Promise.resolve();
+    this.pendingCreations = 0;
   }
 
   get hasSessions() {
@@ -39,9 +40,16 @@ export class SessionManager {
     return this.sessions.size;
   }
 
+  get hasActivity() {
+    return this.hasSessions || this.pendingCreations > 0;
+  }
+
   async create(workspaceRoot, { idleMinutes = DEFAULT_IDLE_MINUTES } = {}) {
     validateIdleMinutes(idleMinutes);
-    const creation = this.createTail.then(() => this.createSession(workspaceRoot, idleMinutes));
+    this.pendingCreations += 1;
+    const creation = this.createTail
+      .then(() => this.createSession(workspaceRoot, idleMinutes))
+      .finally(() => { this.pendingCreations -= 1; });
     this.createTail = creation.catch(() => {});
     return creation;
   }

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, stat, symlink } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,6 +8,7 @@ import {
   acquireStartupLock,
   createStateRecord,
   DAEMON_VERSION,
+  LOCK_FILENAME,
   getRuntimeDir,
   healthCheck,
   isStaleLock,
@@ -156,35 +157,26 @@ test("removeState removes the file and ignores a missing file", async () => {
 
 test("acquireStartupLock is exclusive: first wins, second loses", async () => {
   await withTempDir(async (dir) => {
-    assert.equal(await acquireStartupLock(dir, { now: () => 1, pid: 100 }), true);
+    assert.equal(typeof await acquireStartupLock(dir, { now: () => 1, pid: 100 }), "string");
     assert.equal(await acquireStartupLock(dir, { now: () => 2, pid: 200 }), false);
   });
 });
 
 test("acquireStartupLock removes a partial lock when writing fails, allowing reacquire", async () => {
   await withTempDir(async (dir) => {
-    const { open } = await import("node:fs/promises");
     const failingFs = {
-      open,
-      rm: (await import("node:fs/promises")).rm,
-    };
-    const realOpen = failingFs.open;
-    failingFs.open = async (...args) => {
-      const handle = await realOpen(...args);
-      return {
-        writeFile: async () => {
-          throw new Error("ENOSPC");
-        },
-        close: () => handle.close(),
-      };
+      mkdir,
+      rm,
+      async writeFile() { throw new Error("ENOSPC"); },
     };
     await assert.rejects(
       () => acquireStartupLock(dir, { fsApi: failingFs, now: () => 1, pid: 1 }),
       /ENOSPC/,
     );
     // The partial lock must not block a subsequent acquisition.
-    assert.equal(await acquireStartupLock(dir, { now: () => 2, pid: 2 }), true);
-    await releaseStartupLock(dir);
+    const owner = await acquireStartupLock(dir, { now: () => 2, pid: 2 });
+    assert.equal(typeof owner, "string");
+    await releaseStartupLock(dir, owner);
   });
 });
 
@@ -193,6 +185,7 @@ test("readLock reports the lock owner pid and age", async () => {
     await acquireStartupLock(dir, { now: () => 1_000, pid: 777 });
     const lock = await readLock(dir, { now: () => 6_000 });
     assert.equal(lock.pid, 777);
+    assert.equal(typeof lock.ownerId, "string");
     assert.equal(lock.ageMs, 5_000);
   });
 });
@@ -205,11 +198,88 @@ test("readLock returns null when no lock exists", async () => {
 
 test("releaseStartupLock removes the lock so it can be reacquired", async () => {
   await withTempDir(async (dir) => {
-    await acquireStartupLock(dir, { now: () => 1, pid: 1 });
-    await releaseStartupLock(dir);
+    const owner = await acquireStartupLock(dir, { now: () => 1, pid: 1 });
+    await releaseStartupLock(dir, owner);
     assert.equal(await readLock(dir), null);
-    assert.equal(await acquireStartupLock(dir, { now: () => 2, pid: 2 }), true);
-    await releaseStartupLock(dir); // no throw on missing
+    const nextOwner = await acquireStartupLock(dir, { now: () => 2, pid: 2 });
+    assert.equal(typeof nextOwner, "string");
+    await releaseStartupLock(dir, owner); // no throw on non-matching owner
+    assert.equal((await readLock(dir)).ownerId, nextOwner);
+    await releaseStartupLock(dir, nextOwner);
+  });
+});
+
+test("releaseStartupLock refuses to remove a lock owned by another starter", async () => {
+  await withTempDir(async (dir) => {
+    const owner = await acquireStartupLock(dir, { now: () => 1, pid: 111 });
+    assert.equal(typeof owner, "string");
+    assert.equal(await releaseStartupLock(dir, "different-owner"), false);
+    assert.equal((await readLock(dir)).pid, 111);
+    assert.equal(await releaseStartupLock(dir, owner), true);
+    assert.equal(await readLock(dir), null);
+  });
+});
+
+test("an empty crash-leftover startup lock can be reaped safely", async () => {
+  await withTempDir(async (dir) => {
+    await mkdir(join(dir, LOCK_FILENAME));
+    assert.equal(await releaseStartupLock(dir, null), true);
+    const owner = await acquireStartupLock(dir, { now: () => 2, pid: 2 });
+    assert.equal(typeof owner, "string");
+    await releaseStartupLock(dir, owner);
+  });
+});
+
+test("an old owner cannot delete a replacement starter lock", async () => {
+  await withTempDir(async (dir) => {
+    const oldOwner = await acquireStartupLock(dir, { now: () => 1, pid: 1 });
+    let replacementOwner;
+    const racingFs = {
+      async rm(path, options) {
+        await rm(path, options);
+        await rmdir(join(dir, LOCK_FILENAME));
+        replacementOwner = await acquireStartupLock(dir, { now: () => 2, pid: 2 });
+      },
+      rmdir,
+    };
+    await releaseStartupLock(dir, oldOwner, racingFs);
+    assert.equal((await readLock(dir))?.ownerId, replacementOwner);
+  });
+});
+
+test("releaseStartupLock rejects path-like owner ids without touching sibling files", async () => {
+  await withTempDir(async (dir) => {
+    await mkdir(join(dir, LOCK_FILENAME));
+    const sentinel = join(dir, "sentinel.json");
+    await writeFile(sentinel, "keep");
+    assert.equal(await releaseStartupLock(dir, "../sentinel"), false);
+    await access(sentinel);
+  });
+});
+
+test("a stale lock directory with a corrupt marker can be recovered", async () => {
+  await withTempDir(async (dir) => {
+    const lockDir = join(dir, LOCK_FILENAME);
+    await mkdir(lockDir);
+    await writeFile(join(lockDir, `${"A".repeat(32)}.json`), "{");
+    const lock = await readLock(dir, { now: () => Date.now() + 60_000 });
+    assert.equal(lock?.malformed, true);
+    const { recoverStaleStartupLock } = await import("../runtime/daemon-state.mjs");
+    assert.equal(typeof recoverStaleStartupLock, "function");
+    assert.equal(await recoverStaleStartupLock(dir, lock), true);
+    assert.equal(typeof await acquireStartupLock(dir), "string");
+  });
+});
+
+test("a stale lock directory with a schema-invalid marker can be recovered", async () => {
+  await withTempDir(async (dir) => {
+    const lockDir = join(dir, LOCK_FILENAME);
+    await mkdir(lockDir);
+    await writeFile(join(lockDir, `${"B".repeat(32)}.json`), JSON.stringify({ pid: 1 }));
+    const lock = await readLock(dir, { now: () => Date.now() + 60_000 });
+    assert.equal(lock?.malformed, true);
+    const { recoverStaleStartupLock } = await import("../runtime/daemon-state.mjs");
+    assert.equal(await recoverStaleStartupLock(dir, lock), true);
   });
 });
 

@@ -92,13 +92,14 @@ test("startDaemon publishes a valid, healthy state record", async () => {
 test("close removes the state and lock files and is idempotent", async () => {
   await withTempDir(async (runtimeDir) => {
     const { acquireStartupLock } = await import("../runtime/daemon-state.mjs");
-    await acquireStartupLock(runtimeDir, { now: () => 1, pid: 1 });
+    const startupLockOwner = await acquireStartupLock(runtimeDir, { now: () => 1, pid: 1 });
     const daemon = await startDaemon({
       runtimeDir,
       loadAssets: async () => assets,
       sessionManager: emptySessionManager(),
       idleCheckMs: 60_000,
       processObject: fakeProcess(),
+      startupLockOwner,
     });
     assert.ok(await readState(runtimeDir));
     await daemon.close();
@@ -151,6 +152,46 @@ test("stays alive while a session exists, then shuts down after it expires", asy
       const removed = await waitFor(async () => (await readState(runtimeDir)) === null);
       assert.equal(removed, true);
     } finally {
+      await daemon.close();
+    }
+  });
+});
+
+test("does not auto-shutdown while a session is still being created", async () => {
+  await withTempDir(async (runtimeDir) => {
+    let releaseBind;
+    const bindGate = new Promise((resolve) => { releaseBind = resolve; });
+    const sessionManager = new SessionManager({
+      fsApi: accessibleDirectoryFs,
+      createStore: () => ({
+        ...fakeStore(),
+        async bind() { await bindGate; },
+      }),
+    });
+    const daemon = await startDaemon({
+      runtimeDir,
+      loadAssets: async () => assets,
+      sessionManager,
+      controlToken: "secret-token",
+      idleCheckMs: 20,
+      processObject: fakeProcess(),
+    });
+    try {
+      const pending = fetch(`http://127.0.0.1:${daemon.port}/control/session`, {
+        method: "POST",
+        headers: { Authorization: "Bearer secret-token" },
+        body: JSON.stringify({ workspaceRoot: "/workspace/alpha", idleMinutes: 1 }),
+      });
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      releaseBind();
+      const response = await pending;
+      assert.equal(response.status, 200);
+      const { url } = await response.json();
+      const viewer = await fetch(url);
+      assert.equal(viewer.status, 200, "a successfully returned Viewer URL must remain reachable");
+      assert.ok(await readState(runtimeDir), "daemon state must remain published for the new session");
+    } finally {
+      releaseBind();
       await daemon.close();
     }
   });

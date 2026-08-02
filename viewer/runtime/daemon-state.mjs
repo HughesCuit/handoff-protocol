@@ -1,11 +1,12 @@
-import { constants } from "node:fs";
+import { randomBytes } from "node:crypto";
 import {
   chmod,
   lstat,
   mkdir,
-  open,
+  readdir,
   readFile,
   rename,
+  rmdir,
   rm,
   stat,
   writeFile,
@@ -22,6 +23,7 @@ export const HEALTH_TIMEOUT_MS = 2_000;
 
 const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
+const LOCK_OWNER_PATTERN = /^[A-Za-z0-9_-]{32}$/;
 
 export class DaemonStateError extends Error {
   constructor(code) {
@@ -35,9 +37,10 @@ const defaultFs = {
   chmod,
   lstat,
   mkdir,
-  open,
+  readdir,
   readFile,
   rename,
+  rmdir,
   rm,
   stat,
   writeFile,
@@ -163,14 +166,11 @@ export async function acquireStartupLock(runtimeDir, options = {}) {
   const fsApi = options.fsApi ?? defaultFs;
   const now = options.now ?? Date.now;
   const pid = options.pid ?? process.pid;
+  const ownerId = options.ownerId ?? randomBytes(24).toString("base64url");
+  if (!LOCK_OWNER_PATTERN.test(ownerId)) throw new DaemonStateError("VIEW_STATE_UNSAFE");
   const target = join(runtimeDir, LOCK_FILENAME);
-  let handle;
   try {
-    handle = await fsApi.open(
-      target,
-      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
-      FILE_MODE,
-    );
+    await fsApi.mkdir(target, { mode: DIR_MODE });
   } catch (error) {
     if (error?.code === "EEXIST") return false;
     throw error;
@@ -178,45 +178,117 @@ export async function acquireStartupLock(runtimeDir, options = {}) {
   try {
     const payload = JSON.stringify({
       pid,
+      ownerId,
       lockedAt: now(),
       startedAt: new Date(now()).toISOString(),
     });
-    await handle.writeFile(payload);
+    await fsApi.writeFile(join(target, `${ownerId}.json`), payload, { flag: "wx", mode: FILE_MODE });
   } catch (error) {
-    await handle.close().catch(() => {});
-    await fsApi.rm(target, { force: true });
+    await fsApi.rm(target, { recursive: true, force: true });
     throw error;
   }
-  await handle.close();
-  return true;
+  return ownerId;
 }
 
 export async function readLock(runtimeDir, options = {}) {
   const fsApi = options.fsApi ?? defaultFs;
   const now = options.now ?? Date.now;
-  let raw;
+  const target = join(runtimeDir, LOCK_FILENAME);
+  let info;
   try {
-    raw = await fsApi.readFile(join(runtimeDir, LOCK_FILENAME), "utf8");
+    info = await fsApi.lstat(target);
   } catch (error) {
     if (error?.code === "ENOENT") return null;
     throw error;
   }
+  if (!info.isDirectory()) {
+    return {
+      pid: null,
+      ownerId: null,
+      lockedAt: info.mtimeMs,
+      startedAt: null,
+      ageMs: now() - info.mtimeMs,
+      legacy: true,
+    };
+  }
+  const entries = await fsApi.readdir(target);
+  const markers = entries.filter((entry) => LOCK_OWNER_PATTERN.test(entry.slice(0, -5)) && entry.endsWith(".json"));
+  if (markers.length !== 1) {
+    return {
+      pid: null,
+      ownerId: null,
+      lockedAt: info.mtimeMs,
+      startedAt: null,
+      ageMs: now() - info.mtimeMs,
+      empty: entries.length === 0,
+    };
+  }
+  let raw;
   try {
+    raw = await fsApi.readFile(join(target, markers[0]), "utf8");
     const parsed = JSON.parse(raw);
-    if (!Number.isInteger(parsed.pid) || !Number.isInteger(parsed.lockedAt)) return null;
+    if (!Number.isInteger(parsed.pid) || !Number.isInteger(parsed.lockedAt) ||
+      typeof parsed.ownerId !== "string" || parsed.ownerId !== markers[0].slice(0, -5)) {
+      return {
+        pid: null,
+        ownerId: markers[0].slice(0, -5),
+        lockedAt: info.mtimeMs,
+        startedAt: null,
+        ageMs: now() - info.mtimeMs,
+        malformed: true,
+      };
+    }
     return {
       pid: parsed.pid,
+      ownerId: parsed.ownerId,
       lockedAt: parsed.lockedAt,
       startedAt: parsed.startedAt,
       ageMs: now() - parsed.lockedAt,
     };
   } catch {
-    return null;
+    return {
+      pid: null,
+      ownerId: markers[0].slice(0, -5),
+      lockedAt: info.mtimeMs,
+      startedAt: null,
+      ageMs: now() - info.mtimeMs,
+      malformed: true,
+    };
   }
 }
 
-export async function releaseStartupLock(runtimeDir, fsApi = defaultFs) {
-  await fsApi.rm(join(runtimeDir, LOCK_FILENAME), { force: true });
+export async function releaseStartupLock(runtimeDir, ownerId, fsApi = defaultFs) {
+  const target = join(runtimeDir, LOCK_FILENAME);
+  if (ownerId === null) {
+    try {
+      await fsApi.rmdir(target);
+      return true;
+    } catch (error) {
+      if (error?.code === "ENOENT" || error?.code === "ENOTEMPTY" || error?.code === "EEXIST") return false;
+      throw error;
+    }
+  }
+  if (typeof ownerId !== "string" || !LOCK_OWNER_PATTERN.test(ownerId)) return false;
+  try {
+    await fsApi.rm(join(target, `${ownerId}.json`));
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+  try {
+    await fsApi.rmdir(target);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT" || error?.code === "ENOTEMPTY" || error?.code === "EEXIST") return false;
+    throw error;
+  }
+}
+
+export async function recoverStaleStartupLock(runtimeDir, lock, fsApi = defaultFs) {
+  if (!lock || lock.legacy) return false;
+  if (lock.empty) return releaseStartupLock(runtimeDir, null, fsApi);
+  if (typeof lock.ownerId === "string") return releaseStartupLock(runtimeDir, lock.ownerId, fsApi);
+  return false;
 }
 
 export function isStaleLock(lock, { maxLockAgeMs = DEFAULT_MAX_LOCK_AGE_MS, daemonHealthy = false } = {}) {

@@ -13,6 +13,7 @@ import {
   isStaleLock,
   readLock,
   readState,
+  recoverStaleStartupLock,
   releaseStartupLock,
   removeState,
 } from "../../viewer/runtime/daemon-state.mjs";
@@ -141,10 +142,11 @@ async function pollForHealthyState(runtimeDir, deps, timeoutMs) {
   }
 }
 
-async function spawnDaemon(deps) {
+async function spawnDaemon(deps, startupLockOwner) {
   const child = deps.spawn(deps.execPath, [deps.daemonMainPath], {
     detached: true,
     stdio: "ignore",
+    env: { ...deps.env, HANDOFF_VIEW_STARTUP_LOCK_OWNER: startupLockOwner },
   });
   child.unref?.();
   return child;
@@ -152,16 +154,19 @@ async function spawnDaemon(deps) {
 
 async function startDaemonCoordinated(runtimeDir, deps) {
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const gotLock = await acquireStartupLock(runtimeDir, {
+    const lockOwner = await acquireStartupLock(runtimeDir, {
       fsApi: deps.fsApi,
       now: deps.now,
     });
-    if (gotLock) {
+    if (lockOwner) {
+      let spawned = false;
       try {
-        await spawnDaemon(deps);
+        await spawnDaemon(deps, lockOwner);
+        spawned = true;
         return await pollForHealthyState(runtimeDir, deps, STARTUP_TIMEOUT_MS);
-      } finally {
-        await releaseStartupLock(runtimeDir, deps.fsApi);
+      } catch (error) {
+        if (!spawned) await releaseStartupLock(runtimeDir, lockOwner, deps.fsApi);
+        throw error;
       }
     }
     const existingState = await readState(runtimeDir, deps.fsApi);
@@ -170,7 +175,8 @@ async function startDaemonCoordinated(runtimeDir, deps) {
     }
     const lock = await readLock(runtimeDir, { fsApi: deps.fsApi, now: deps.now });
     if (isStaleLock(lock, { daemonHealthy: false })) {
-      await releaseStartupLock(runtimeDir, deps.fsApi);
+      const released = await recoverStaleStartupLock(runtimeDir, lock, deps.fsApi);
+      if (!released) throw new ViewError("VIEW_STATE_UNSAFE");
       continue;
     }
     // A live starter holds the lock; wait for it to publish a healthy state.
@@ -252,6 +258,7 @@ export async function runView(options = {}) {
     sleep: options.sleep ?? realSleep,
     fsApi: options.fsApi,
     execPath: options.execPath ?? process.execPath,
+    env: options.env ?? process.env,
     daemonMainPath: options.daemonMainPath ?? DAEMON_MAIN_PATH,
     resolveSource: options.resolveSource,
     readSource: options.readSource,
