@@ -130,6 +130,25 @@ A config that passes validation contains no machine-specific paths and no secret
 
 ## Installation
 
+### Skills CLI (Recommended)
+
+The fastest way to install the `handoff` skill is with the [Skills CLI](https://github.com/vercel-labs/skills):
+
+```bash
+npx skills add HughesCuit/handoff-protocol
+```
+
+The interactive CLI detects the supported agents on your machine and asks for the installation scope (project-level or global). Use `-y` to accept the defaults, or `-g` for a global (user-level) install.
+
+Install for a specific agent:
+
+```bash
+npx skills add HughesCuit/handoff-protocol --agent codex
+npx skills add HughesCuit/handoff-protocol --agent claude-code
+npx skills add HughesCuit/handoff-protocol --agent opencode
+npx skills add HughesCuit/handoff-protocol --agent kimi-code-cli
+```
+
 ### Context Map Viewer
 
 `/handoff view` opens the current project's `.handoff/context-map.md` as a live,
@@ -161,7 +180,11 @@ change the Handoff storage format or modify Handoff state.
 > `context-map-viewer@handoff-protocol`; no plugin, MCP, or Marketplace setup is
 > required anymore.
 
-### Project-Level Install (Recommended)
+### Manual installation
+
+For pinned, offline, or unsupported-host setups, install the skill manually.
+
+#### Project-Level Install (clone + symlink)
 
 Clone the repo into your project, then run the install script. It creates symlinks so all supported agents share the same skill — no per-agent duplication.
 
@@ -184,18 +207,18 @@ To uninstall: `bash handoff-protocol/uninstall.sh`
 
 > **Tip:** Add `handoff-protocol/` as a git submodule if you want to pin a specific version across your team.
 
-### Global Install (All Projects)
+#### Global Install (All Projects)
 
 If you prefer a one-time global install instead of per-project:
 
-#### Codex
+##### Codex
 
 ```bash
 python3 ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github.py \
   --repo HughesCuit/handoff-protocol --path . --name handoff
 ```
 
-#### OpenCode / Claude Code
+##### OpenCode / Claude Code
 
 ```bash
 git clone https://github.com/HughesCuit/handoff-protocol.git ~/.opencode/skills/handoff
