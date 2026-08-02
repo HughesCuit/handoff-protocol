@@ -393,10 +393,7 @@ async function runV2Diff(paths, io, options = {}) {
 // summaryEdited, bodyEdited, taskStateChanged, and attributesChanged
 // (priority/severity).
 
-import {
-  V3_SECTION_KEYS,
-  filterSensitive as filterSensitiveV3,
-} from "./context-map.mjs";
+import { V3_SECTION_KEYS } from "./context-map.mjs";
 import { loadHandoffState } from "./handoff-state.mjs";
 import { buildV3Snapshot, v3SnapshotDigest } from "./snapshots.mjs";
 import { CONTENT_DIR } from "./content-files.mjs";
@@ -476,10 +473,13 @@ export function diffV3States(beforeState, afterState) {
   return model;
 }
 
+// Filter every text field individually (reusing the v2 field-by-field
+// sanitizer) — never the serialized JSON, where a redaction could consume a
+// structural quote and corrupt the document.
 function sanitizeV3Model(model) {
   const clean = {};
   for (const key of V3_DIFF_CLASSES) {
-    clean[key] = (model[key] || []).map((entry) => JSON.parse(filterSensitiveV3(JSON.stringify(entry))));
+    clean[key] = (model[key] || []).map(sanitizeEntry);
   }
   return clean;
 }
@@ -487,7 +487,7 @@ function sanitizeV3Model(model) {
 /** Render the v3 diff model as stable JSON (string). */
 export function renderV3DiffJson(model, meta = {}) {
   const snapshot = meta.snapshotId
-    ? { id: filterSensitiveV3(String(meta.snapshotId)), captured_at: meta.capturedAt || null }
+    ? { id: filterSensitive(String(meta.snapshotId)), captured_at: meta.capturedAt || null }
     : null;
   return JSON.stringify({ snapshot, ...sanitizeV3Model(model) }, null, 2);
 }
@@ -498,7 +498,7 @@ export function renderV3DiffMarkdown(model, meta = {}) {
   const counts = V3_DIFF_CLASSES.map((key) => `${m[key].length} ${key.replace(/([A-Z])/g, " $1").toLowerCase()}`);
   const lines = ["# Context diff", ""];
   if (meta.snapshotId) {
-    lines.push(`Compared against snapshot \`${filterSensitiveV3(String(meta.snapshotId))}\`` +
+    lines.push(`Compared against snapshot \`${filterSensitive(String(meta.snapshotId))}\`` +
       (meta.capturedAt ? ` (captured ${meta.capturedAt})` : "") + ".");
     lines.push("");
   }

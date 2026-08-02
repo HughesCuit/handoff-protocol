@@ -2548,6 +2548,43 @@ export function defineUnitTests(test, readFixture) {
     }
   });
 
+  test("diff v3: redacting cookie/PEM content never corrupts the rendered JSON", () => {
+    // Regression: filtering the serialized JSON (instead of field-by-field)
+    // let a greedy `cookie: ...` redaction consume a structural quote and
+    // crash renderV3DiffJson with "Unterminated string in JSON".
+    const secretLabel = "set cookie: session=abc123def456";
+    const pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIBsecretkeymaterial\n-----END RSA PRIVATE KEY-----";
+    const before = buildV3Snapshot(v3SnapState());
+    const after = buildV3Snapshot(v3SnapState((s) => {
+      s.map.sections.notes.push({ id: "note1", label: secretLabel, origin: "user", depth: 0 });
+      s.content.notes.push({ id: "note1", summary: secretLabel, body: pem, origin: "user" });
+    }));
+    const model = diffV3States(before, after);
+
+    let json;
+    try {
+      json = renderV3DiffJson(model, { snapshotId: "snap-x" });
+    } catch (err) {
+      assert.fail(`renderV3DiffJson threw on secret-bearing content: ${err.message}`);
+    }
+    // The rendered document must still be valid JSON.
+    const parsed = JSON.parse(json);
+    assert(Array.isArray(parsed.added), "rendered v3 diff JSON is structurally corrupt");
+    assertNotIncludes(json, "abc123def456", "cookie value leaked");
+    assertNotIncludes(json, "MIIBsecretkeymaterial", "PEM material leaked");
+    assertIncludes(json, "[REDACTED]");
+
+    // Markdown rendering must not throw either.
+    let md;
+    try {
+      md = renderV3DiffMarkdown(model, { snapshotId: "snap-x" });
+    } catch (err) {
+      assert.fail(`renderV3DiffMarkdown threw on secret-bearing content: ${err.message}`);
+    }
+    assertNotIncludes(md, "abc123def456", "cookie value leaked into markdown");
+    assertNotIncludes(md, "MIIBsecretkeymaterial", "PEM material leaked into markdown");
+  });
+
   test("diff v3: runDiff compares v3 snapshots with the current state and never mutates", async () => {
     const before = v3SnapState();
     const io = makeFakeIo({});
