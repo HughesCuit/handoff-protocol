@@ -182,9 +182,12 @@ export async function acquireStartupLock(runtimeDir, options = {}) {
       startedAt: new Date(now()).toISOString(),
     });
     await handle.writeFile(payload);
-  } finally {
-    await handle.close();
+  } catch (error) {
+    await handle.close().catch(() => {});
+    await fsApi.rm(target, { force: true });
+    throw error;
   }
+  await handle.close();
   return true;
 }
 

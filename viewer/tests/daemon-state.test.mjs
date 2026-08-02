@@ -161,6 +161,33 @@ test("acquireStartupLock is exclusive: first wins, second loses", async () => {
   });
 });
 
+test("acquireStartupLock removes a partial lock when writing fails, allowing reacquire", async () => {
+  await withTempDir(async (dir) => {
+    const { open } = await import("node:fs/promises");
+    const failingFs = {
+      open,
+      rm: (await import("node:fs/promises")).rm,
+    };
+    const realOpen = failingFs.open;
+    failingFs.open = async (...args) => {
+      const handle = await realOpen(...args);
+      return {
+        writeFile: async () => {
+          throw new Error("ENOSPC");
+        },
+        close: () => handle.close(),
+      };
+    };
+    await assert.rejects(
+      () => acquireStartupLock(dir, { fsApi: failingFs, now: () => 1, pid: 1 }),
+      /ENOSPC/,
+    );
+    // The partial lock must not block a subsequent acquisition.
+    assert.equal(await acquireStartupLock(dir, { now: () => 2, pid: 2 }), true);
+    await releaseStartupLock(dir);
+  });
+});
+
 test("readLock reports the lock owner pid and age", async () => {
   await withTempDir(async (dir) => {
     await acquireStartupLock(dir, { now: () => 1_000, pid: 777 });
