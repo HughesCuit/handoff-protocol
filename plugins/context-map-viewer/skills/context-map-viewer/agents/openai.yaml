@@ -1,4 +1,0 @@
-interface:
-  display_name: "Context Map Viewer"
-  short_description: "Open the live Handoff Context Map viewer"
-  default_prompt: "Open the current workspace Context Map viewer."

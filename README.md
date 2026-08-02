@@ -130,29 +130,36 @@ A config that passes validation contains no machine-specific paths and no secret
 
 ## Installation
 
-### Context Map Viewer for Codex
+### Context Map Viewer
 
-This repository also contains the optional
-[`context-map-viewer`](plugins/context-map-viewer/) Codex plugin. It opens the
-current project's `.handoff/context-map.md` as a live, read-only mind map with
-search, folding, pan, zoom, and side-browser presentation by default in Codex.
-The inline MCP App remains a compatibility fallback and requests
-picture-in-picture when the host supports it.
+`/handoff view` opens the current project's `.handoff/context-map.md` as a live,
+read-only mind map with Tree/Map/Both modes, search, folding, pan, zoom, and
+long-node details. It works in any agent host — Codex, OpenCode, Claude Code, a
+terminal agent, or others — with no MCP App or plugin dependency.
 
-```bash
-codex plugin marketplace add /absolute/path/to/handoff-protocol
-codex plugin add context-map-viewer@handoff-protocol
+```text
+/handoff view
+/handoff view --idle-minutes 60
+/handoff view --json
 ```
 
-Restart the ChatGPT desktop app, start a new Codex task, and ask to open the
-Context Map viewer. Codex creates a local temporary browser session and opens
-its returned URL in the side browser. The URL listens only on `127.0.0.1` at a
-random port, is scoped by an opaque token, and exists only in memory; do not
-copy, persist, reconstruct, or reuse it in another task. The viewer polls for
-updates every 750 ms and expires after 30 minutes of idle time. If it has
-expired, ask to open the viewer again for a new URL. If the side browser is not
-available, Codex uses the inline MCP App fallback. This presentation layer does
-not change the Handoff storage format or modify Handoff state.
+The command starts or reuses one user-level local Viewer daemon and returns a
+temporary, token-scoped loopback URL for the current project. **The agent, not
+the command, decides how to open that URL** — in a side browser, system browser,
+external browser, or simply presented to you. The URL listens only on
+`127.0.0.1` at a random port, is scoped by an opaque token, and exists only in
+memory; do not copy, persist, reconstruct, or reuse it in another task. The
+viewer polls for updates every 750 ms and expires after its own idle deadline
+(default 30 minutes, configurable 1–1440). If it has expired, run `/handoff
+view` again for a new URL. The daemon auto-shuts-down when no sessions remain;
+it is not a permanent service. This presentation layer is read-only and does not
+change the Handoff storage format or modify Handoff state.
+
+> **Note:** The standalone `context-map-viewer` Codex plugin (final release
+> `0.2.0`) has been replaced by this host-independent `/handoff view` command as
+> of Handoff Protocol v2.4.0. Codex users should remove
+> `context-map-viewer@handoff-protocol`; no plugin, MCP, or Marketplace setup is
+> required anymore.
 
 ### Project-Level Install (Recommended)
 
@@ -218,6 +225,7 @@ git clone https://github.com/HughesCuit/handoff-protocol.git ~/.claude/skills/ha
 | `/handoff adapter obsidian status` | Show adapter link state |
 | `/handoff adapter obsidian unlink` | Remove only the adapter-created link |
 | `/handoff diff [--from latest\|SNAPSHOT_ID] [--format markdown\|json]` | Semantic diff of the map against a snapshot |
+| `/handoff view [--idle-minutes N] [--json]` | Open the Context Map as a live mind map via a local Viewer daemon URL (agent opens it) |
 
 ## How It Works
 
