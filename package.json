@@ -45,7 +45,8 @@
     "viewer:build": "node viewer/scripts/build.mjs",
     "pretest": "npm run viewer:build",
     "test": "node --test \"tests/node/**/*.test.mjs\" \"viewer/tests/**/*.test.mjs\"",
-    "test:deno": "deno test --allow-read --allow-write --allow-run --allow-env tests/deno/"
+    "test:deno": "deno test --allow-read --allow-write --allow-run --allow-env tests/deno/",
+    "test:skills": "npx --yes skills@latest add . --list"
   },
   "devDependencies": {
     "esbuild": "^0.28.1",
