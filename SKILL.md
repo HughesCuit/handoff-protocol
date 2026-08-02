@@ -4,7 +4,7 @@ description: Cross-agent context handoff protocol. Save and restore work context
 license: MIT
 metadata:
   author: handoff-protocol
-  version: "2.3.0"
+  version: "2.4.1"
 ---
 
 # Handoff Protocol Skill
