@@ -1,6 +1,6 @@
 {
   "name": "handoff-protocol",
-  "version": "2.3.0",
+  "version": "2.4.0",
   "description": "Cross-agent context handoff protocol for AI coding agents",
   "keywords": [
     "ai",
@@ -25,13 +25,15 @@
   "files": [
     "assets",
     "docs",
+    "!docs/superpowers",
+    "!docs/superpowers/**",
     "examples",
     "references",
     "scripts",
     "tests",
-    "plugins/context-map-viewer",
-    "!plugins/context-map-viewer/node_modules",
-    "!plugins/context-map-viewer/node_modules/**",
+    "viewer",
+    "!viewer/node_modules",
+    "!viewer/node_modules/**",
     "!tests/fixtures",
     "install.sh",
     "install-codex.sh",
@@ -40,7 +42,13 @@
     "CONTRIBUTING.md"
   ],
   "scripts": {
-    "test": "node --test \"tests/node/**/*.test.mjs\"",
+    "viewer:build": "node viewer/scripts/build.mjs",
+    "pretest": "npm run viewer:build",
+    "test": "node --test \"tests/node/**/*.test.mjs\" \"viewer/tests/**/*.test.mjs\"",
     "test:deno": "deno test --allow-read --allow-write --allow-run --allow-env tests/deno/"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1",
+    "happy-dom": "^20.11.1"
   }
 }

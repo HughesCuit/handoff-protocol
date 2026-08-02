@@ -229,6 +229,28 @@ Compare a semantic snapshot against the current Context Map and report added, re
 - Comparison works on normalized semantic state, so localized headings and generated fingerprints never produce phantom changes; output is deterministic across Node and Deno
 - Output is sensitive-data filtered before display
 
+### /handoff view [--idle-minutes N] [--json]
+
+Open the current project's `.handoff/context-map.md` as a live, read-only mind map. Starts or reuses one user-level local Viewer daemon and returns a temporary, token-scoped loopback URL for the current project. **The Agent, not the command, decides how to open that URL** — in a side browser, system browser, external browser, or simply presented to the user. The command never opens a browser itself and never requires an MCP App or plugin.
+
+**Options:**
+- `--idle-minutes N` - Idle expiry for the new Viewer session. Default `30`; accepted values are integers from `1` through `1440` inclusive.
+- `--json` - Emit exactly one JSON object on stdout (`{status, url, sessionId, source, idleMinutes, daemonReused}`). Diagnostics go to stderr.
+
+**Execution:**
+1. Resolve the current project root exactly as `save` and `load` do
+2. Run `scripts/node/view.mjs` (Node.js) with the requested flags
+3. Present the returned URL to the user or open it with the Agent's native browser capability. Do not persist, reconstruct, or reuse the URL in another task.
+
+**Node.js-only:** The Deno-facing `scripts/view.ts` recognizes `view` but returns the stable error `VIEW_REQUIRES_NODE` with an actionable Node command (`node scripts/node/view.mjs`). All other Handoff Deno commands are unchanged.
+
+**Safety rules:**
+- Loopback-only (`127.0.0.1`, random port), read-only, token-scoped, in-memory; no LAN, no auth-for-remote, no permanent daemon/service
+- The daemon auto-shuts-down when no sessions remain; sessions expire after their own idle deadline
+- The URL listens only on loopback at a random port and is scoped by an opaque token; do not copy, persist, or reuse it across tasks
+- Never prints secrets, source contents, control tokens, or absolute project paths
+- Does not change `.handoff/`, `context-map.md`, or the v2 schema
+
 ## Output Format
 
 When loading, generate:
@@ -323,12 +345,14 @@ Enhanced functionality (optional). Two runtimes supported:
 - `scripts/load.ts`
 - `scripts/adapter.ts` - Obsidian adapter commands (`obsidian link|status|unlink`)
 - `scripts/diff.ts` - Semantic context diff (`--from latest|<snapshot-id>`, `--format markdown|json`)
+- `scripts/view.ts` - View stub; returns `VIEW_REQUIRES_NODE` (Viewer daemon is Node.js-only)
 
 **Node.js:**
 - `scripts/node/save.mjs`
 - `scripts/node/load.mjs`
 - `scripts/node/adapter.mjs` - Obsidian adapter commands (`obsidian link|status|unlink`)
 - `scripts/node/diff.mjs` - Semantic context diff (`--from latest|<snapshot-id>`, `--format markdown|json`)
+- `scripts/node/view.mjs` - Context Map Viewer daemon CLI (`--idle-minutes N`, `--json`)
 
 **Shared core (runtime-agnostic ESM imported by both runtimes, so behavior stays identical):**
 - `scripts/context-map.mjs` - Context Map parsing, reconciliation, rendering, and sanitization.

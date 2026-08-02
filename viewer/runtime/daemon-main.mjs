@@ -1,0 +1,103 @@
+import { randomBytes } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+import {
+  getRuntimeDir,
+  createStateRecord,
+  releaseStartupLock,
+  removeState,
+  writeState,
+} from "./daemon-state.mjs";
+import { DaemonServer } from "./daemon-server.mjs";
+import { SessionManager } from "./session-manager.mjs";
+
+const DEFAULT_IDLE_CHECK_MS = 10_000;
+
+async function defaultLoadAssets() {
+  const base = new URL("../dist/", import.meta.url);
+  const [html, app, model, styles] = await Promise.all([
+    readFile(new URL("index.html", base), "utf8"),
+    readFile(new URL("app.mjs", base), "utf8"),
+    readFile(new URL("model.mjs", base), "utf8"),
+    readFile(new URL("styles.css", base), "utf8"),
+  ]);
+  return { html, app, model, styles };
+}
+
+export async function startDaemon(options = {}) {
+  const runtimeDir = options.runtimeDir ?? (await getRuntimeDir());
+  const loadAssets = options.loadAssets ?? defaultLoadAssets;
+  const assets = await loadAssets();
+  const sessionManager = options.sessionManager ?? new SessionManager();
+  const controlToken = options.controlToken ?? randomBytes(32).toString("base64url");
+  const processObject = options.processObject ?? process;
+  const idleCheckMs = options.idleCheckMs ?? DEFAULT_IDLE_CHECK_MS;
+  const startupLockOwner = options.startupLockOwner;
+
+  let closePromise = null;
+  let idleTimer = null;
+  const signalHandlers = new Map();
+
+  const server = new DaemonServer({
+    sessionManager,
+    assets,
+    controlToken,
+    pid: processObject.pid,
+    onShutdownRequest: () => close(),
+  });
+
+  function removeSignalHandlers() {
+    for (const [signal, handler] of signalHandlers) processObject.off(signal, handler);
+    signalHandlers.clear();
+  }
+
+  async function close() {
+    if (closePromise) return closePromise;
+    closePromise = (async () => {
+      if (idleTimer) {
+        clearInterval(idleTimer);
+        idleTimer = null;
+      }
+      removeSignalHandlers();
+      await server.close();
+      await removeState(runtimeDir);
+      if (startupLockOwner) await releaseStartupLock(runtimeDir, startupLockOwner);
+    })();
+    return closePromise;
+  }
+
+  const { port } = await server.start();
+  let state;
+  try {
+    state = createStateRecord({ pid: processObject.pid, port, controlToken });
+    await writeState(runtimeDir, state);
+    if (startupLockOwner) await releaseStartupLock(runtimeDir, startupLockOwner);
+
+    for (const signal of ["SIGINT", "SIGTERM"]) {
+      const handler = () => {
+        void close().catch(() => {});
+      };
+      signalHandlers.set(signal, handler);
+      processObject.once(signal, handler);
+    }
+
+    idleTimer = setInterval(() => {
+      void (async () => {
+        await sessionManager.prune();
+        if (!sessionManager.hasActivity) await close();
+      })().catch(() => {});
+    }, idleCheckMs);
+    idleTimer.unref?.();
+  } catch (error) {
+    await close().catch(() => {});
+    throw error;
+  }
+
+  return { close, port, controlToken, state, runtimeDir };
+}
+
+if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await startDaemon({ startupLockOwner: process.env.HANDOFF_VIEW_STARTUP_LOCK_OWNER });
+}
