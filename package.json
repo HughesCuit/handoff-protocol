@@ -1,6 +1,6 @@
 {
   "name": "handoff-protocol",
-  "version": "2.4.0",
+  "version": "2.4.1",
   "description": "Cross-agent context handoff protocol for AI coding agents",
   "keywords": [
     "ai",
@@ -45,7 +45,8 @@
     "viewer:build": "node viewer/scripts/build.mjs",
     "pretest": "npm run viewer:build",
     "test": "node --test \"tests/node/**/*.test.mjs\" \"viewer/tests/**/*.test.mjs\"",
-    "test:deno": "deno test --allow-read --allow-write --allow-run --allow-env tests/deno/"
+    "test:deno": "deno test --allow-read --allow-write --allow-run --allow-env tests/deno/",
+    "test:skills": "node scripts/verify-skills-discovery.mjs"
   },
   "devDependencies": {
     "esbuild": "^0.28.1",

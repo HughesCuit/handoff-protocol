@@ -1,10 +1,10 @@
 ---
 name: handoff
-description: Cross-agent context handoff protocol. Save and restore work context across AI coding agents (OpenCode, Codex, MimoCode, Claude Code, OpenHands, Cursor Agent, etc.). Use when switching between agents or collaborating with other AI assistants.
+description: Cross-agent context handoff protocol. Save and restore work context across AI coding agents. Core workflow verified on Codex, Claude Code, OpenCode, and Kimi Code CLI; compatible with OpenHands and Cursor, and expected to work in other hosts that support basic skills. Use when switching between agents or collaborating with other AI assistants.
 license: MIT
 metadata:
   author: handoff-protocol
-  version: "2.3.0"
+  version: "2.4.1"
 ---
 
 # Handoff Protocol Skill

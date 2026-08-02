@@ -23,7 +23,7 @@ and survive later saves.
 
 ## Features
 
-- **Universal**: Works across OpenCode, Codex, Claude Code, OpenHands, Cursor Agent
+- **Cross-agent**: Core workflow verified on Codex, Claude Code, OpenCode, and Kimi Code CLI — see [Agent Compatibility](#agent-compatibility) for honest tiers
 - **Standard**: Unix-style commands, machine-readable formats (JSON Schema)
 - **Canonical Context Map** (v2): Human-editable `context-map.md` is the only writable semantic source — your edits win over agent inference, and generated views make tampering visible
 - **Focused Load**: `/handoff load --focus "current task"` compiles the map down to relevant nodes within a token budget, never omitting goal/status, and falls back to full context safely
@@ -34,6 +34,26 @@ and survive later saves.
 - **Smart**: Auto-analyzes codebase comments for TODO/FIXME, infers goals from git history
 - **Flexible Storage**: Direct mode for private repos, submodule mode for public repos
 - **Simple**: Works via prompt alone, scripts optional (Deno + Node.js)
+
+## Agent Compatibility
+
+Handoff uses basic `SKILL.md` semantics — it does not require Claude-only hooks
+or `context: fork`, so it runs in any host that supports basic skills,
+filesystem access, and command execution.
+
+| Tier | Agents | Claim |
+|------|--------|-------|
+| Core verified | Codex, Claude Code, OpenCode, Kimi Code CLI | Installation and the core handoff workflow are explicitly supported and used for release documentation. |
+| Compatible | OpenHands, Cursor | Basic `SKILL.md`, filesystem, and shell workflow is supported; host UX may differ. |
+| Skills CLI ecosystem | Other targets reported by the Skills CLI | Expected to work when the host supports basic skills, filesystem access, and command execution; not individually certified by this project. |
+
+The Skills CLI's full, changing target list lives in the [official Skills CLI
+repository](https://github.com/vercel-labs/skills); this project certifies only
+the tiers above rather than copying every name.
+
+`/handoff view` additionally requires Node.js and a host capable of opening or
+presenting the returned loopback URL (for example a side browser or the system
+browser).
 
 ## Quick Start
 
@@ -130,12 +150,32 @@ A config that passes validation contains no machine-specific paths and no secret
 
 ## Installation
 
+### Skills CLI (Recommended)
+
+The fastest way to install the `handoff` skill is with the [Skills CLI](https://github.com/vercel-labs/skills):
+
+```bash
+npx skills add HughesCuit/handoff-protocol
+```
+
+The interactive CLI detects the supported agents on your machine and asks for the installation scope (project-level or global). Use `-y` to accept the defaults, or `-g` for a global (user-level) install.
+
+Install for a specific agent:
+
+```bash
+npx skills add HughesCuit/handoff-protocol --agent codex
+npx skills add HughesCuit/handoff-protocol --agent claude-code
+npx skills add HughesCuit/handoff-protocol --agent opencode
+npx skills add HughesCuit/handoff-protocol --agent kimi-code-cli
+```
+
 ### Context Map Viewer
 
 `/handoff view` opens the current project's `.handoff/context-map.md` as a live,
 read-only mind map with Tree/Map/Both modes, search, folding, pan, zoom, and
-long-node details. It works in any agent host — Codex, OpenCode, Claude Code, a
-terminal agent, or others — with no MCP App or plugin dependency.
+long-node details. It has no MCP App or plugin dependency; it works wherever the
+core handoff workflow runs (see [Agent Compatibility](#agent-compatibility)),
+provided the host can open or present the returned loopback URL.
 
 ```text
 /handoff view
@@ -161,7 +201,11 @@ change the Handoff storage format or modify Handoff state.
 > `context-map-viewer@handoff-protocol`; no plugin, MCP, or Marketplace setup is
 > required anymore.
 
-### Project-Level Install (Recommended)
+### Manual installation
+
+For pinned, offline, or unsupported-host setups, install the skill manually.
+
+#### Project-Level Install (clone + symlink)
 
 Clone the repo into your project, then run the install script. It creates symlinks so all supported agents share the same skill — no per-agent duplication.
 
@@ -184,18 +228,18 @@ To uninstall: `bash handoff-protocol/uninstall.sh`
 
 > **Tip:** Add `handoff-protocol/` as a git submodule if you want to pin a specific version across your team.
 
-### Global Install (All Projects)
+#### Global Install (All Projects)
 
 If you prefer a one-time global install instead of per-project:
 
-#### Codex
+##### Codex
 
 ```bash
 python3 ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github.py \
   --repo HughesCuit/handoff-protocol --path . --name handoff
 ```
 
-#### OpenCode / Claude Code
+##### OpenCode / Claude Code
 
 ```bash
 git clone https://github.com/HughesCuit/handoff-protocol.git ~/.opencode/skills/handoff
