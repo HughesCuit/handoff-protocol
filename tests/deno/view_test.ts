@@ -29,6 +29,7 @@ function runView(args = []) {
 Deno.test("view returns VIEW_REQUIRES_NODE with an actionable Node command", async () => {
   const result = await runView();
   assertEqual(result.code, 1, "view must exit with code 1");
+  assertEqual(result.stdout, "", "human mode must print to stderr, not stdout");
   assertIncludes(result.stderr, "VIEW_REQUIRES_NODE");
   assertIncludes(result.stderr, "node scripts/node/view.mjs");
 });
@@ -36,10 +37,9 @@ Deno.test("view returns VIEW_REQUIRES_NODE with an actionable Node command", asy
 Deno.test("view --json emits one stable JSON error object on stdout", async () => {
   const result = await runView(["--json"]);
   assertEqual(result.code, 1, "view --json must exit with code 1");
+  assertEqual(result.stdout.trim().split("\n").length, 1, "JSON output must be a single line");
   const parsed = JSON.parse(result.stdout);
   assertEqual(parsed.status, "error");
   assertEqual(parsed.error, "VIEW_REQUIRES_NODE");
   assertEqual(parsed.nodeCommand, "node scripts/node/view.mjs");
-  assert(!result.stdout.includes("\\n") || result.stdout.trim().split("\n").length === 1,
-    "JSON output must be a single object");
 });
