@@ -186,3 +186,61 @@ Deno.test("diff: a flag-like token is never bound as a flag value", async () => 
   assertEqual(trailing.code, 1, "trailing --from with no value must be rejected");
   assertIncludes(trailing.stderr, "--from requires a value");
 });
+
+// ── v3 stable-ID diff ────────────────────────────────────────────────────────
+
+Deno.test("diff: a v3 layout reports stable-ID change categories and stays read-only", async () => {
+  const dir = await Deno.makeTempDir({ prefix: "handoff-diff-v3-deno-" });
+  await Deno.writeTextFile(`${dir}/package.json`, JSON.stringify({ name: "diff-v3" }) + "\n");
+  await Deno.writeTextFile(
+    `${dir}/.handoff.config.json`,
+    JSON.stringify({ version: "2.0.0", storage: { mode: "direct", path: ".handoff" } }, null, 2) + "\n"
+  );
+  await Deno.mkdir(`${dir}/src`, { recursive: true });
+  await Deno.writeTextFile(`${dir}/src/app.ts`, "// TODO: wire the v3 diff\n");
+
+  const saveOut = await new Deno.Command(deno, {
+    args: ["run", "--allow-read", "--allow-write", "--allow-run", "--allow-env", new URL("scripts/save.ts", root).pathname],
+    cwd: dir,
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+  const save = { code: saveOut.code, stderr: new TextDecoder().decode(saveOut.stderr) };
+  assertEqual(save.code, 0, `save failed: ${save.stderr}`);
+
+  const mapPath = `${dir}/.handoff/context-map.md`;
+  const tasksPath = `${dir}/.handoff/content/tasks.md`;
+  const snapDir = `${dir}/.handoff/history/snapshots`;
+  const snapNames = async () => {
+    const names: string[] = [];
+    for await (const entry of Deno.readDir(snapDir)) names.push(entry.name);
+    return names;
+  };
+  const before = await snapNames();
+  assertEqual(before.length, 1, "save should record one v3 snapshot");
+  const snapshotBody = await Deno.readTextFile(`${snapDir}/${before[0]}`);
+
+  // Unsaved edits: complete task1 and edit its summary.
+  await Deno.writeTextFile(mapPath, (await Deno.readTextFile(mapPath)).replace("- [ ] `task1`", "- [x] `task1`"));
+  await Deno.writeTextFile(tasksPath, (await Deno.readTextFile(tasksPath)).replace("wire the v3 diff", "wire the v3 diff (edited)"));
+
+  const md = await runDiff(dir);
+  assertEqual(md.code, 0, `diff failed: ${md.stderr}`);
+  assertIncludes(md.stdout, "Task state changed");
+  assertIncludes(md.stdout, "Summary edited");
+  assertIncludes(md.stdout, "task1");
+
+  const json = await runDiff(dir, ["--format", "json"]);
+  assertEqual(json.code, 0, `diff failed: ${json.stderr}`);
+  const parsed = JSON.parse(json.stdout);
+  for (const key of ["added", "deleted", "moved", "labelEdited", "summaryEdited", "bodyEdited", "taskStateChanged", "attributesChanged"]) {
+    assert(Array.isArray(parsed[key]), `json.${key} must be an array`);
+  }
+  assertEqual(parsed.taskStateChanged.length, 1);
+  assertEqual(parsed.taskStateChanged[0].id, "task1");
+  assertEqual(parsed.summaryEdited.length, 1);
+
+  // Read-only: the snapshot is untouched and no new snapshot appeared.
+  assertEqual((await snapNames()).length, 1, "diff wrote a snapshot");
+  assertEqual(await Deno.readTextFile(`${snapDir}/${before[0]}`), snapshotBody, "diff mutated the snapshot");
+});

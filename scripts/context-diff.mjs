@@ -306,7 +306,7 @@ async function snapshotMatchesDigest(io, snapshotsDir, name, digest) {
  *
  * Returns { ok, output, model, snapshot, format } or { ok: false, error }.
  */
-export async function runDiff(paths, io, options = {}) {
+async function runV2Diff(paths, io, options = {}) {
   if (!paths || !paths.handoffDir) throw new Error("runDiff requires paths.handoffDir");
   if (!io) throw new Error("runDiff requires an io adapter");
 
@@ -384,4 +384,255 @@ export async function runDiff(paths, io, options = {}) {
   const meta = { snapshotId: id, capturedAt: snapshot.captured_at || null };
   const output = format === "json" ? renderDiffJson(model, meta) : renderDiffMarkdown(model, meta);
   return { ok: true, output, model, format, snapshot: { id, captured_at: meta.capturedAt } };
+}
+
+// ── v3 stable-ID semantic diff ───────────────────────────────────────────────
+// v3 snapshots normalize the complete canonical state (directory + bodies),
+// so the v3 diff matches nodes by stable ID and splits changes into precise
+// categories: added, deleted, moved (section/parent), labelEdited,
+// summaryEdited, bodyEdited, taskStateChanged, and attributesChanged
+// (priority/severity).
+
+import {
+  V3_SECTION_KEYS,
+  filterSensitive as filterSensitiveV3,
+} from "./context-map.mjs";
+import { loadHandoffState } from "./handoff-state.mjs";
+import { buildV3Snapshot, v3SnapshotDigest } from "./snapshots.mjs";
+import { CONTENT_DIR } from "./content-files.mjs";
+
+/** Stable v3 diff categories, in reporting order. */
+export const V3_DIFF_CLASSES = [
+  "added",
+  "deleted",
+  "moved",
+  "labelEdited",
+  "summaryEdited",
+  "bodyEdited",
+  "taskStateChanged",
+  "attributesChanged",
+];
+
+/**
+ * Diff two normalized v3 snapshot states (`buildV3Snapshot` outputs) by
+ * stable node ID. A node may appear in several categories (e.g. labelEdited
+ * and bodyEdited); moves are reported once and never as add+delete.
+ */
+export function diffV3States(beforeState, afterState) {
+  const model = {};
+  for (const key of V3_DIFF_CLASSES) model[key] = [];
+
+  const before = new Map(((beforeState && beforeState.nodes) || []).map((n) => [n.id, n]));
+  const after = new Map(((afterState && afterState.nodes) || []).map((n) => [n.id, n]));
+
+  for (const [id, node] of after) {
+    if (!before.has(id)) {
+      model.added.push({ id, section: node.section, after: node.label });
+    }
+  }
+  for (const [id, node] of before) {
+    if (!after.has(id)) {
+      model.deleted.push({ id, section: node.section, before: node.label });
+    }
+  }
+  for (const [id, bn] of before) {
+    const an = after.get(id);
+    if (!an) continue;
+    if (bn.section !== an.section || (bn.parentId ?? null) !== (an.parentId ?? null)) {
+      model.moved.push({
+        id,
+        text: an.label,
+        before: { section: bn.section, parentId: bn.parentId ?? null },
+        after: { section: an.section, parentId: an.parentId ?? null },
+      });
+    }
+    if (bn.label !== an.label) {
+      model.labelEdited.push({ id, section: an.section, before: bn.label, after: an.label });
+    }
+    if ((bn.summary ?? "") !== (an.summary ?? "")) {
+      model.summaryEdited.push({ id, section: an.section, before: bn.summary ?? "", after: an.summary ?? "" });
+    }
+    if ((bn.body ?? "") !== (an.body ?? "")) {
+      model.bodyEdited.push({ id, section: an.section, before: bn.body ?? "", after: an.body ?? "" });
+    }
+    if ((bn.taskState ?? null) !== (an.taskState ?? null)) {
+      model.taskStateChanged.push({
+        id,
+        section: an.section,
+        text: an.label,
+        task: { before: !!bn.taskState, after: !!an.taskState },
+      });
+    }
+    if ((bn.priority ?? null) !== (an.priority ?? null) || (bn.severity ?? null) !== (an.severity ?? null)) {
+      model.attributesChanged.push({
+        id,
+        section: an.section,
+        text: an.label,
+        before: { priority: bn.priority ?? null, severity: bn.severity ?? null },
+        after: { priority: an.priority ?? null, severity: an.severity ?? null },
+      });
+    }
+  }
+  return model;
+}
+
+function sanitizeV3Model(model) {
+  const clean = {};
+  for (const key of V3_DIFF_CLASSES) {
+    clean[key] = (model[key] || []).map((entry) => JSON.parse(filterSensitiveV3(JSON.stringify(entry))));
+  }
+  return clean;
+}
+
+/** Render the v3 diff model as stable JSON (string). */
+export function renderV3DiffJson(model, meta = {}) {
+  const snapshot = meta.snapshotId
+    ? { id: filterSensitiveV3(String(meta.snapshotId)), captured_at: meta.capturedAt || null }
+    : null;
+  return JSON.stringify({ snapshot, ...sanitizeV3Model(model) }, null, 2);
+}
+
+/** Render the v3 diff model as a Markdown report (string) for human review. */
+export function renderV3DiffMarkdown(model, meta = {}) {
+  const m = sanitizeV3Model(model);
+  const counts = V3_DIFF_CLASSES.map((key) => `${m[key].length} ${key.replace(/([A-Z])/g, " $1").toLowerCase()}`);
+  const lines = ["# Context diff", ""];
+  if (meta.snapshotId) {
+    lines.push(`Compared against snapshot \`${filterSensitiveV3(String(meta.snapshotId))}\`` +
+      (meta.capturedAt ? ` (captured ${meta.capturedAt})` : "") + ".");
+    lines.push("");
+  }
+  lines.push(`Summary: ${counts.join(", ")}.`, "");
+
+  const section = (title, entries, render) => {
+    lines.push(`## ${title} (${entries.length})`, "");
+    if (entries.length === 0) lines.push("- (none)");
+    for (const entry of entries) lines.push(render(entry));
+    lines.push("");
+  };
+
+  section("Added", m.added, (e) => `- [${e.section}] \`${e.id}\` ${e.after}`);
+  section("Deleted", m.deleted, (e) => `- [${e.section}] \`${e.id}\` ${e.before}`);
+  section("Moved", m.moved, (e) =>
+    `- \`${e.id}\` ${e.text} (${e.before.section}/${e.before.parentId ?? "-"} → ${e.after.section}/${e.after.parentId ?? "-"})`);
+  section("Label edited", m.labelEdited, (e) => `- [${e.section}] \`${e.id}\` ${e.before} → ${e.after}`);
+  section("Summary edited", m.summaryEdited, (e) => `- [${e.section}] \`${e.id}\` ${e.before} → ${e.after}`);
+  section("Body edited", m.bodyEdited, (e) => `- [${e.section}] \`${e.id}\` body changed`);
+  section("Task state changed", m.taskStateChanged, (e) =>
+    `- [${e.section}] \`${e.id}\` ${e.text} (${e.task.before ? "done" : "open"} → ${e.task.after ? "done" : "open"})`);
+  section("Attributes changed", m.attributesChanged, (e) =>
+    `- [${e.section}] \`${e.id}\` ${e.text} (priority ${e.before.priority ?? "-"} → ${e.after.priority ?? "-"}, severity ${e.before.severity ?? "-"} → ${e.after.severity ?? "-"})`);
+
+  if (V3_DIFF_CLASSES.every((key) => m[key].length === 0)) {
+    lines.push("No changes since the snapshot.", "");
+  }
+  return lines.join("\n");
+}
+
+/** True when a snapshot file carries a v3 normalized state. */
+function isV3Snapshot(snapshot) {
+  return !!(snapshot && snapshot.state && Array.isArray(snapshot.state.nodes));
+}
+
+/**
+ * Run `/handoff diff` against a v3 layout. Same baseline-selection contract
+ * as the v2 path; v2 snapshots (state.sections) are never eligible v3
+ * baselines. Strictly read-only.
+ */
+async function runV3Diff(paths, io, options, format) {
+  let state;
+  try {
+    state = await loadHandoffState(io, paths.handoffDir);
+  } catch (err) {
+    return failure(`could not load the v3 handoff state: ${err.message}`);
+  }
+  const current = buildV3Snapshot(state);
+  const currentDigest = v3SnapshotDigest(current);
+
+  const snapshotsDir = `${paths.handoffDir}/${SNAPSHOT_DIR}`;
+  const allNames = ((await io.listDir(snapshotsDir)) || []).filter((name) => SNAPSHOT_FILE_RE.test(name)).sort();
+
+  // Only v3 snapshots (state.nodes) are eligible baselines.
+  const names = [];
+  for (const name of allNames) {
+    try {
+      const parsed = JSON.parse(await io.readFile(`${snapshotsDir}/${name}`));
+      if (isV3Snapshot(parsed)) names.push(name);
+    } catch {
+      // Unreadable snapshots are skipped as baselines.
+    }
+  }
+
+  const noBaseline = () => failure(
+    "no v3 semantic snapshots found",
+    "Run `/handoff save` at least once to record a v3 snapshot before diffing."
+  );
+
+  const from = options.from;
+  let id;
+  if (from === undefined) {
+    if (names.length === 0) return noBaseline();
+    let pick = names.length - 1;
+    try {
+      const latest = JSON.parse(await io.readFile(`${snapshotsDir}/${names[pick]}`));
+      const digest = typeof latest.digest === "string" ? latest.digest : v3SnapshotDigest(latest.state);
+      if (digest === currentDigest) pick -= 1;
+    } catch {
+      // Fall through: the newest snapshot stays the baseline.
+    }
+    if (pick < 0) {
+      return failure(
+        "no earlier snapshot to compare against: the newest snapshot already matches the current state",
+        "Use --from latest to compare against the newest snapshot anyway, or make a change and run `/handoff save` first."
+      );
+    }
+    id = names[pick].replace(/\.json$/, "");
+  } else if (from === "latest") {
+    if (names.length === 0) return noBaseline();
+    id = names.at(-1).replace(/\.json$/, "");
+  } else {
+    if (!SNAPSHOT_ID_RE.test(from)) {
+      return failure(`invalid snapshot id '${from}'`, "Snapshot ids look like 2026-08-02T00-00-00-000Z-abcdef12.");
+    }
+    if (!names.includes(`${from}.json`)) {
+      return failure(`unknown snapshot '${from}'`, "Run `/handoff save` to record snapshots, or use --from latest.");
+    }
+    id = from;
+  }
+
+  let snapshot;
+  try {
+    snapshot = parseSnapshot(await io.readFile(`${snapshotsDir}/${id}.json`), id);
+  } catch (err) {
+    return failure(err.message);
+  }
+
+  const model = diffV3States(snapshot.state, current);
+  const meta = { snapshotId: id, capturedAt: snapshot.captured_at || null };
+  const output = format === "json" ? renderV3DiffJson(model, meta) : renderV3DiffMarkdown(model, meta);
+  return { ok: true, output, model, format, snapshot: { id, captured_at: meta.capturedAt } };
+}
+
+/**
+ * Run `/handoff diff`: routes to the v3 stable-ID diff when the layout
+ * carries content/ files, otherwise to the legacy v2 content-matching diff.
+ * Strictly read-only in both paths.
+ */
+export async function runDiff(paths, io, options = {}) {
+  if (!paths || !paths.handoffDir) throw new Error("runDiff requires paths.handoffDir");
+  if (!io) throw new Error("runDiff requires an io adapter");
+  const format = options.format || "markdown";
+  if (!DIFF_FORMATS.includes(format)) {
+    return failure(`unknown format '${format}'; expected one of: ${DIFF_FORMATS.join(", ")}`);
+  }
+  let top = [];
+  try {
+    top = await io.listDir(paths.handoffDir);
+  } catch {
+    // Missing handoff dir: let the v2 path report the unreadable map.
+  }
+  if (top.includes(CONTENT_DIR)) {
+    return runV3Diff(paths, io, options, format);
+  }
+  return runV2Diff(paths, io, options);
 }

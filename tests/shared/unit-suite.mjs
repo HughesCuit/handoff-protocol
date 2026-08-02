@@ -74,8 +74,11 @@ import {
   SNAPSHOT_DIR,
   SNAPSHOT_RETENTION,
   buildSnapshot,
+  buildV3Snapshot,
   snapshotDigest,
+  v3SnapshotDigest,
   writeSnapshot,
+  writeV3Snapshot,
 } from "../../scripts/snapshots.mjs";
 import {
   DEFAULT_BUDGET,
@@ -87,9 +90,13 @@ import {
 } from "../../scripts/context-compiler.mjs";
 import {
   DIFF_FORMATS,
+  V3_DIFF_CLASSES,
   diffStates,
+  diffV3States,
   renderDiffJson,
   renderDiffMarkdown,
+  renderV3DiffJson,
+  renderV3DiffMarkdown,
   runDiff,
 } from "../../scripts/context-diff.mjs";
 import {
@@ -2329,6 +2336,269 @@ export function defineUnitTests(test, readFixture) {
     assert(r.fallbackReason, "expected a fallback reason when nothing matches reliably");
     assertEqual(r.omittedCount, 0, "fallback must return the full map");
     assertEqual(r.selectedIds.length, 11, "fallback must select every node");
+  });
+
+  // ── v3 snapshots and stable-ID semantic diff ───────────────────────────────
+
+  function v3SnapState(edit) {
+    const state = makeV3State({
+      sections: {
+        goals: [{ id: "goal1", label: "Ship v3", origin: "user", depth: 0 }],
+        tasks: [
+          { id: "task1", label: "Parent task", origin: "user", depth: 0, checked: false, priority: "high" },
+          { id: "task2", label: "Child task", origin: "agent", depth: 1, checked: true },
+        ],
+        risks: [{ id: "risk1", label: "Risky", origin: "agent", depth: 0, severity: "high" }],
+      },
+      content: {
+        goals: [{ id: "goal1", summary: "Goal summary.", body: "", origin: "user" }],
+        tasks: [
+          { id: "task1", summary: "Parent summary.", body: "Parent body.", origin: "user" },
+          { id: "task2", summary: "Child summary.", body: "Child body.", origin: "agent" },
+        ],
+        risks: [{ id: "risk1", summary: "Risk summary.", body: "Risk body.", origin: "agent" }],
+      },
+    });
+    if (edit) edit(state);
+    return state;
+  }
+
+  test("snapshots v3: content-only changes create a snapshot", async () => {
+    const io = makeFakeIo({});
+    const first = await writeV3Snapshot(v3SnapState(), SNAP_PATHS, io, { timestamp: "2026-08-02T00:00:00.000Z" });
+    assert(first.written, "first save should write a v3 snapshot");
+    const raw = io.store.get(first.path);
+    const parsed = JSON.parse(raw);
+    assertEqual(parsed.version, V3_PROTOCOL_VERSION);
+    assert(Array.isArray(parsed.state.nodes), "v3 snapshot must normalize nodes");
+    const task1 = parsed.state.nodes.find((n) => n.id === "task1");
+    assertEqual(task1.section, "tasks");
+    assertEqual(task1.priority, "high");
+    assertEqual(task1.taskState, false);
+    assertEqual(task1.summary, "Parent summary.");
+    assertEqual(task1.body, "Parent body.");
+    const task2 = parsed.state.nodes.find((n) => n.id === "task2");
+    assertEqual(task2.parentId, "task1", "hierarchy must normalize to parent IDs");
+
+    const changed = await writeV3Snapshot(
+      v3SnapState((s) => { s.content.tasks[0].body = "Edited parent body."; }),
+      SNAP_PATHS,
+      io,
+      { timestamp: "2026-08-02T01:00:00.000Z" }
+    );
+    assert(changed.written, "a body-only edit must change the semantic digest");
+    assertEqual(snapshotFiles(io).length, 2);
+  });
+
+  test("snapshots v3: normalized no-op changes do not create a duplicate snapshot", async () => {
+    const io = makeFakeIo({});
+    await writeV3Snapshot(v3SnapState(), SNAP_PATHS, io, { timestamp: "2026-08-02T00:00:00.000Z" });
+    // Re-render and reparse the state: localized headings and regenerated
+    // ownership fingerprints must not change the semantic digest.
+    const state = v3SnapState();
+    const roundTripped = {
+      version: V3_PROTOCOL_VERSION,
+      map: parseContextMapV3(renderContextMapV3(state.map, { lang: "zh" })),
+      content: Object.fromEntries(
+        V3_SECTION_KEYS.map((key) => [key, parseContentFile(renderContentFile(key, state.content[key]), key)])
+      ),
+    };
+    const second = await writeV3Snapshot(roundTripped, SNAP_PATHS, io, { timestamp: "2026-08-02T01:00:00.000Z" });
+    assert(!second.written, "a normalized no-op must not write a snapshot");
+    assertEqual(second.reason, "unchanged");
+    assertEqual(snapshotFiles(io).length, 1);
+  });
+
+  test("snapshots v3: sensitive values are filtered from labels and bodies", async () => {
+    const io = makeFakeIo({});
+    const result = await writeV3Snapshot(
+      v3SnapState((s) => {
+        s.map.sections.notes.push({ id: "note1", label: "deploy key: api_key=abcdefghijklmnop123456", origin: "user", depth: 0 });
+        s.content.notes.push({ id: "note1", summary: "token ghp_0123456789abcdef0123456789abcdef0123", body: "", origin: "user" });
+      }),
+      SNAP_PATHS,
+      io,
+      { timestamp: "2026-08-02T00:00:00.000Z" }
+    );
+    const raw = io.store.get(result.path);
+    assertNotIncludes(raw, "abcdefghijklmnop123456", "api key leaked into the snapshot");
+    assertNotIncludes(raw, "ghp_0123456789abcdef0123456789abcdef0123", "token leaked into the snapshot");
+    assertIncludes(raw, "[REDACTED]");
+  });
+
+  function v3SnapDiffModel(afterEdit) {
+    const before = buildV3Snapshot(v3SnapState());
+    const after = buildV3Snapshot(v3SnapState(afterEdit));
+    return diffV3States(before, after);
+  }
+
+  test("diff v3: added and deleted nodes are reported by stable ID", () => {
+    const model = v3SnapDiffModel((s) => {
+      s.map.sections.risks.push({ id: "risk2", label: "Fresh risk", origin: "agent", depth: 0 });
+      s.content.risks.push({ id: "risk2", summary: "Fresh summary.", body: "", origin: "agent" });
+      s.map.sections.goals = [];
+      s.content.goals = [];
+    });
+    assertEqual(model.added.length, 1);
+    assertEqual(model.added[0].id, "risk2");
+    assertEqual(model.added[0].after, "Fresh risk");
+    assertEqual(model.deleted.length, 1);
+    assertEqual(model.deleted[0].id, "goal1");
+    for (const key of V3_DIFF_CLASSES) {
+      assert(Array.isArray(model[key]), `${key} must be an array`);
+    }
+  });
+
+  test("diff v3: label, summary, and body edits are separate categories", () => {
+    const model = v3SnapDiffModel((s) => {
+      s.map.sections.tasks[0].label = "Renamed parent";
+      s.content.tasks[1].summary = "Edited child summary.";
+      s.content.risks[0].body = "Edited risk body.";
+    });
+    assertEqual(model.labelEdited.length, 1);
+    assertEqual(model.labelEdited[0].id, "task1");
+    assertEqual(model.labelEdited[0].before, "Parent task");
+    assertEqual(model.labelEdited[0].after, "Renamed parent");
+    assertEqual(model.summaryEdited.length, 1);
+    assertEqual(model.summaryEdited[0].id, "task2");
+    assertEqual(model.summaryEdited[0].after, "Edited child summary.");
+    assertEqual(model.bodyEdited.length, 1);
+    assertEqual(model.bodyEdited[0].id, "risk1");
+    assertEqual(model.bodyEdited[0].after, "Edited risk body.");
+    assertEqual(model.added.length + model.deleted.length, 0, "edits are not add+delete");
+  });
+
+  test("diff v3: a move keeps its ID and reports the section/parent change", () => {
+    const model = v3SnapDiffModel((s) => {
+      // Move task2 from under task1 (tasks) into notes, keeping the ID.
+      s.map.sections.tasks = s.map.sections.tasks.filter((n) => n.id !== "task2");
+      s.map.sections.notes.push({ id: "task2", label: "Child task", origin: "agent", depth: 0 });
+      s.content.notes.push(s.content.tasks.find((e) => e.id === "task2"));
+      s.content.tasks = s.content.tasks.filter((e) => e.id !== "task2");
+    });
+    assertEqual(model.moved.length, 1, "the move must be reported once, not as add+delete");
+    assertEqual(model.moved[0].id, "task2");
+    assertEqual(model.moved[0].before.section, "tasks");
+    assertEqual(model.moved[0].after.section, "notes");
+    assertEqual(model.moved[0].before.parentId, "task1");
+    assertEqual(model.moved[0].after.parentId, null);
+    assertEqual(model.added.length + model.deleted.length, 0, "a move is not add+delete");
+  });
+
+  test("diff v3: task state and priority/severity changes are separate categories", () => {
+    const model = v3SnapDiffModel((s) => {
+      s.map.sections.tasks[0].checked = true;
+      s.map.sections.tasks[0].priority = "low";
+      s.map.sections.risks[0].severity = "medium";
+    });
+    assertEqual(model.taskStateChanged.length, 1);
+    assertEqual(model.taskStateChanged[0].id, "task1");
+    assertEqual(model.taskStateChanged[0].task.before, false);
+    assertEqual(model.taskStateChanged[0].task.after, true);
+    assertEqual(model.attributesChanged.length, 2);
+    const taskAttr = model.attributesChanged.find((c) => c.id === "task1");
+    assertEqual(taskAttr.before.priority, "high");
+    assertEqual(taskAttr.after.priority, "low");
+    const riskAttr = model.attributesChanged.find((c) => c.id === "risk1");
+    assertEqual(riskAttr.before.severity, "high");
+    assertEqual(riskAttr.after.severity, "medium");
+    assertEqual(model.labelEdited.length, 0, "attribute changes are not label edits");
+  });
+
+  test("diff v3: JSON and Markdown render the same model with v3 headings", () => {
+    const model = v3SnapDiffModel((s) => {
+      s.map.sections.tasks[0].checked = true;
+      s.content.tasks[0].body = "Edited body.";
+    });
+    const meta = { from: "latest", snapshotId: "snap-v3", capturedAt: "2026-08-02T00:00:00.000Z" };
+
+    const json = JSON.parse(renderV3DiffJson(model, meta));
+    assertEqual(json.snapshot.id, "snap-v3");
+    for (const key of V3_DIFF_CLASSES) {
+      assert(Array.isArray(json[key]), `json.${key} must be an array`);
+      assertEqual(json[key].length, model[key].length, `json.${key} diverges from the model`);
+    }
+
+    const md = renderV3DiffMarkdown(model, meta);
+    assertIncludes(md, "Context diff");
+    assertIncludes(md, "snap-v3");
+    assertIncludes(md, "Added");
+    assertIncludes(md, "Deleted");
+    assertIncludes(md, "Moved");
+    assertIncludes(md, "Label edited");
+    assertIncludes(md, "Summary edited");
+    assertIncludes(md, "Body edited");
+    assertIncludes(md, "Task state changed");
+    assertIncludes(md, "Attributes changed");
+    assertIncludes(md, "task1");
+
+    const empty = renderV3DiffMarkdown(diffV3States(buildV3Snapshot(v3SnapState()), buildV3Snapshot(v3SnapState())), meta);
+    assertIncludes(empty, "No changes", "an empty diff should say so");
+  });
+
+  test("diff v3: output is sensitive-filtered even from a hostile snapshot", () => {
+    const before = buildV3Snapshot(v3SnapState((s) => {
+      s.map.sections.notes.push({ id: "note1", label: "deploy key: api_key=abcdefghijklmnop123456", origin: "user", depth: 0 });
+      s.content.notes.push({ id: "note1", summary: "api_key=abcdefghijklmnop123456", body: "", origin: "user" });
+    }));
+    const after = buildV3Snapshot(v3SnapState());
+    for (const out of [renderV3DiffJson(diffV3States(before, after), {}), renderV3DiffMarkdown(diffV3States(before, after), {})]) {
+      assertNotIncludes(out, "abcdefghijklmnop123456", "raw secret leaked into v3 diff output");
+      assertIncludes(out, "[REDACTED]");
+    }
+  });
+
+  test("diff v3: runDiff compares v3 snapshots with the current state and never mutates", async () => {
+    const before = v3SnapState();
+    const io = makeFakeIo({});
+    const snap = await writeV3Snapshot(before, { handoffDir: DIFF_HANDOFF_DIR }, io, {
+      timestamp: "2026-08-02T00:00:00.000Z",
+    });
+    // Current state: task1 completed, risk body edited.
+    const current = v3SnapState((s) => {
+      s.map.sections.tasks[0].checked = true;
+      s.content.risks[0].body = "Edited risk body.";
+    });
+    io.store.set(`${DIFF_HANDOFF_DIR}/context-map.md`, renderContextMapV3(current.map, { lang: "en" }));
+    for (const key of V3_SECTION_KEYS) {
+      io.store.set(`${DIFF_HANDOFF_DIR}/${CONTENT_DIR}/${CONTENT_FILES[key]}`, renderContentFile(key, current.content[key]));
+    }
+
+    const opsBefore = io.ops.length;
+    const result = await runDiff({ handoffDir: DIFF_HANDOFF_DIR }, io);
+    assert(result.ok, `runDiff failed: ${result.error}`);
+    assertEqual(result.format, "markdown");
+    assertIncludes(result.output, "Task state changed");
+    assertIncludes(result.output, "Body edited");
+    assertIncludes(result.output, "task1");
+    assertIncludes(result.output, "risk1");
+
+    const json = await runDiff({ handoffDir: DIFF_HANDOFF_DIR }, io, { format: "json" });
+    const parsed = JSON.parse(json.output);
+    assertEqual(parsed.taskStateChanged.length, 1);
+    assertEqual(parsed.bodyEdited.length, 1);
+
+    // Read-only contract: no writes, renames, or removals beyond the seeded snapshot write.
+    const opsAfter = io.ops.slice(opsBefore);
+    assertEqual(opsAfter.length, 0, `diff must not mutate state, ops: ${JSON.stringify(opsAfter)}`);
+  });
+
+  test("diff v3: v2 snapshots are not eligible baselines in a v3 layout", async () => {
+    const v2 = diffState({ goal: [{ text: "Old v2 goal", depth: 0 }] });
+    const [v2Name, v2Body] = diffSnapshotFile(v2, "2026-07-28T00-00-00-000Z");
+    const current = v3SnapState();
+    const io = makeFakeIo({
+      [`${DIFF_SNAP_DIR}/${v2Name.split("/").pop()}`]: v2Body,
+      [`${DIFF_HANDOFF_DIR}/context-map.md`]: renderContextMapV3(current.map, { lang: "en" }),
+    });
+    for (const key of V3_SECTION_KEYS) {
+      io.store.set(`${DIFF_HANDOFF_DIR}/${CONTENT_DIR}/${CONTENT_FILES[key]}`, renderContentFile(key, current.content[key]));
+    }
+
+    const result = await runDiff({ handoffDir: DIFF_HANDOFF_DIR }, io);
+    assert(!result.ok, "a v2-only snapshot history must not serve a v3 diff");
+    assertIncludes(result.error, "snapshot");
+    assert(result.guidance && result.guidance.includes("save"), `guidance should be actionable: ${result.guidance}`);
   });
 
   // ── Semantic snapshots (v2.3) ─────────────────────────────────────────────
