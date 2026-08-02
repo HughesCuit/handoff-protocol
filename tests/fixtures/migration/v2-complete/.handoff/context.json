@@ -1,0 +1,22 @@
+{
+  "version": "2.0.0",
+  "timestamp": "2026-07-30T12:00:00.000Z",
+  "agent": "opencode",
+  "project": "v2-complete-fixture",
+  "lang": "en",
+  "git": {
+    "branch": "feature/directory",
+    "latest_commit": "eee5555",
+    "commit_message": "feat: storage migration scaffolding",
+    "is_dirty": false
+  },
+  "views": {
+    "HANDOFF.md": "0000000000000000000000000000000000000000000000000000000000000001",
+    "tasks.md": "0000000000000000000000000000000000000000000000000000000000000002",
+    "decisions.md": "0000000000000000000000000000000000000000000000000000000000000003"
+  },
+  "diagnostics": {
+    "migration": [],
+    "conflicts": []
+  }
+}

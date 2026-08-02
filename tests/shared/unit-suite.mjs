@@ -66,6 +66,11 @@ import {
   planMigration,
 } from "../../scripts/migrate.mjs";
 import {
+  applyV3Migration,
+  detectLayout,
+  planV2ToV3Migration,
+} from "../../scripts/migrate-v3.mjs";
+import {
   SNAPSHOT_DIR,
   SNAPSHOT_RETENTION,
   buildSnapshot,
@@ -1814,6 +1819,313 @@ export function defineUnitTests(test, readFixture) {
     for (const field of ["current_goal", "status", "todos", "decisions", "risks", "notes", "goal"]) {
       assert(!(field in json), `semantic field '${field}' must not appear in v3 context.json`);
     }
+  });
+
+  // ── v2→v3 migration ────────────────────────────────────────────────────────
+
+  async function readV2CompleteInputs() {
+    const read = async (rel) => {
+      try {
+        return await readFixture(`migration/v2-complete/.handoff/${rel}`);
+      } catch {
+        return undefined;
+      }
+    };
+    return {
+      contextJson: await read("context.json"),
+      handoffMd: await read("HANDOFF.md"),
+      tasksMd: await read("tasks.md"),
+      decisionsMd: await read("decisions.md"),
+      contextMapMd: await read("context-map.md"),
+    };
+  }
+
+  const V3M_DIR = "/v3m/.handoff";
+  const V3M_CONFIG = "/v3m/.handoff.config.json";
+  const V3M_CONFIG_BODY = JSON.stringify({ version: "2.0.0", storage: { mode: "direct", path: ".handoff" } }, null, 2) + "\n";
+
+  function seedV2Complete(inputs) {
+    const seed = { [V3M_CONFIG]: V3M_CONFIG_BODY };
+    seed[`${V3M_DIR}/context-map.md`] = inputs.contextMapMd;
+    seed[`${V3M_DIR}/context.json`] = inputs.contextJson;
+    seed[`${V3M_DIR}/HANDOFF.md`] = inputs.handoffMd;
+    seed[`${V3M_DIR}/tasks.md`] = inputs.tasksMd;
+    seed[`${V3M_DIR}/decisions.md`] = inputs.decisionsMd;
+    return seed;
+  }
+
+  test("v3 migration: detectLayout classifies empty, legacy, v2, and v3 layouts", () => {
+    assertEqual(detectLayout([]), "empty");
+    assertEqual(detectLayout(["HANDOFF.md", "tasks.md", "context.json"]), "legacy");
+    assertEqual(detectLayout(["context-map.md", "HANDOFF.md", "context.json"]), "v2");
+    assertEqual(detectLayout(["context-map.md", "content/tasks.md", "views/HANDOFF.md", "context.json"]), "v3");
+    assertEqual(detectLayout(new Set(["context-map.md", "content/current-goal.md"])), "v3");
+  });
+
+  test("v3 migration: plan maps every v2 node to stable IDs and content files", async () => {
+    const plan = planV2ToV3Migration(await readV2CompleteInputs());
+    assert(plan.needed, "a v2 handoff should need v3 migration");
+
+    const { map, content } = plan;
+
+    assertEqual(map.sections.goals.length, 1);
+    assertEqual(map.sections.goals[0].id, "goal1");
+    assertEqual(map.sections.goals[0].label, "Ship the context directory release");
+    assertEqual(map.sections.goals[0].origin, "agent", "detected v2 ownership must carry over");
+
+    assertEqual(map.sections.status[0].id, "status1");
+    assertEqual(map.sections.status[0].label, "Implementation in progress, tests passing");
+
+    assertEqual(map.sections.tasks.length, 3);
+    assertEqual(map.sections.tasks[0].id, "task1");
+    assertEqual(map.sections.tasks[0].label, "Implement the storage migration", "label stops at the first clause delimiter");
+    assertEqual(map.sections.tasks[0].priority, "high", "priority becomes directory metadata");
+    assertEqual(map.sections.tasks[0].checked, false);
+    assertEqual(map.sections.tasks[1].id, "task2");
+    assertEqual(map.sections.tasks[1].depth, 1, "hierarchy must be preserved");
+    assertEqual(map.sections.tasks[1].checked, true, "task state must be preserved");
+    assertEqual(map.sections.tasks[2].id, "task3");
+
+    assertEqual(map.sections.decisions[0].id, "decision1");
+    assertEqual(map.sections.questions[0].id, "question1");
+    assertEqual(map.sections.risks[0].id, "risk1");
+    assertEqual(map.sections.risks[0].label, "Migration may produce orphaned content");
+    assertEqual(map.sections.notes[0].id, "note1");
+    assertEqual(
+      map.sections.notes[0].label,
+      "Deno and Node share one canonical state loader so behavior s…",
+      "long delimiter-less labels truncate at 60 code points with an ellipsis"
+    );
+    assertEqual(map.sections.excluded[0].id, "excluded1");
+
+    // Bodies hold the complete original node text (priority prefix excluded —
+    // it is directory-owned now).
+    assertEqual(
+      content.tasks[0].summary,
+      "Implement the storage migration. Validate every generated file before replacing any v2 file."
+    );
+    assertEqual(content.tasks[0].id, "task1");
+    assertEqual(content.goals[0].summary, "Ship the context directory release");
+    assertEqual(
+      content.notes[0].summary,
+      "Deno and Node share one canonical state loader so behavior stays identical across runtimes",
+      "the body keeps the full untruncated text"
+    );
+    assertEqual(content.decisions[0].summary.includes("content files own summaries and bodies"), true);
+  });
+
+  test("v3 migration: every original semantic text survives in the proposed state", async () => {
+    const inputs = await readV2CompleteInputs();
+    const plan = planV2ToV3Migration(inputs);
+    assert(plan.valid, `proposed state lost semantic text: ${JSON.stringify(plan.diagnostics.migration)}`);
+
+    const v2map = parseContextMap(inputs.contextMapMd);
+    const bodies = [];
+    for (const key of V3_SECTION_KEYS) {
+      for (const entry of plan.content[key]) bodies.push(`${entry.summary}\n${entry.body}`);
+    }
+    const allBodies = bodies.join("\n");
+    for (const key of SECTION_KEYS) {
+      for (const node of v2map.sections[key]) {
+        const cleaned = node.text.replace(/^\*\*(high|medium|low)\*\*\s+/i, "");
+        assert(allBodies.includes(cleaned), `original text lost: ${JSON.stringify(cleaned)}`);
+      }
+    }
+  });
+
+  test("v3 migration: conflicting legacy sources chain through with source attribution", async () => {
+    const plan = planV2ToV3Migration(await readHandoffInputs("conflicting"));
+    assert(plan.needed, "a conflicting legacy handoff should migrate");
+
+    // Precedence: the v2 map goal wins over context.json and HANDOFF.md.
+    assertEqual(plan.map.sections.goals.length, 1);
+    assertEqual(plan.map.sections.goals[0].label, "Ship the map-approved compiler release");
+
+    // Superseded values survive as their own attributed nodes/bodies.
+    const questionBodies = plan.content.questions.map((e) => e.summary).join("\n");
+    assertIncludes(questionBodies, "(source: context.json)");
+    assertIncludes(questionBodies, "(source: HANDOFF.md)");
+    assertIncludes(questionBodies, "JSON draft goal superseded by the map");
+    const conflictParent = plan.map.sections.questions.find((n) => n.label === MIGRATION_CONFLICT_LABEL);
+    assert(conflictParent, "Migration conflict parent node missing");
+    const children = plan.map.sections.questions.filter((n) => n.depth > 0);
+    assertEqual(children.length, 4, `each conflict child must become its own node, got: ${JSON.stringify(children.map((n) => n.label))}`);
+    assert(plan.diagnostics.conflicts.length > 0, "conflict diagnostics must be carried over");
+  });
+
+  test("v3 migration: a missing or invalid v2 map falls back to chained legacy migration", async () => {
+    const inputs = await readHandoffInputs("legacy-1x");
+    const plan = planV2ToV3Migration(inputs);
+    assert(plan.needed, "a legacy 1.x handoff should chain through to v3");
+    assertEqual(plan.map.sections.goals.length, 1);
+    assertEqual(plan.map.sections.goals[0].label, "feat: add rate limiting middleware");
+    assert(plan.map.sections.tasks.length >= 3, "legacy tasks must be preserved");
+    assert(
+      plan.map.sections.tasks.every((n) => n.id && n.id.startsWith("task")),
+      "every chained task must receive a stable ID"
+    );
+  });
+
+  test("v3 migration: already-v3 and empty handoffs need no migration", async () => {
+    const v3Json = JSON.stringify({ protocolVersion: "3.0.0" });
+    const already = planV2ToV3Migration({ contextJson: v3Json, contextMapMd: "# Context Map\n" });
+    assert(!already.needed, `v3 handoff must not re-migrate: ${already.reason}`);
+    assert(/already/i.test(already.reason));
+
+    const withContent = planV2ToV3Migration({
+      contextMapMd: "# Context Map\n",
+      contentFiles: { "tasks.md": "# Tasks\n" },
+    });
+    assert(!withContent.needed, "a content/ layout must not re-migrate");
+
+    const empty = planV2ToV3Migration({});
+    assert(!empty.needed, "no handoff data means nothing to migrate");
+  });
+
+  test("v3 migration: apply backs up originals, installs v3 files, retires root views, upgrades config last", async () => {
+    const inputs = await readV2CompleteInputs();
+    const plan = planV2ToV3Migration({ ...inputs, config: V3M_CONFIG_BODY });
+    const io = makeFakeIo(seedV2Complete(inputs));
+
+    const result = await applyV3Migration(io, plan, { handoffDir: V3M_DIR, configPath: V3M_CONFIG }, { timestamp: "2026-08-02T00:00:00.000Z" });
+    assert(result.migrated, "applyV3Migration should report migrated");
+
+    const backupDir = `${V3M_DIR}/history/migrations/2026-08-02T00-00-00-000Z`;
+    assertEqual(result.backupDir, backupDir);
+    assertEqual(io.store.get(`${backupDir}/context-map.md`), inputs.contextMapMd);
+    assertEqual(io.store.get(`${backupDir}/HANDOFF.md`), inputs.handoffMd);
+    assertEqual(io.store.get(`${backupDir}/tasks.md`), inputs.tasksMd);
+    assertEqual(io.store.get(`${backupDir}/decisions.md`), inputs.decisionsMd);
+    assertEqual(io.store.get(`${backupDir}/context.json`), inputs.contextJson);
+    assertEqual(io.store.get(`${backupDir}/.handoff.config.json`), V3M_CONFIG_BODY);
+
+    // v3 layout installed.
+    const map = parseContextMapV3(io.store.get(`${V3M_DIR}/context-map.md`));
+    assert(map, "migrated v3 map must parse");
+    assertEqual(map.sections.tasks.length, 3);
+    for (const name of Object.values(CONTENT_FILES)) {
+      assert(io.store.has(`${V3M_DIR}/${CONTENT_DIR}/${name}`), `content/${name} not installed`);
+    }
+    assert(io.store.has(`${V3M_DIR}/views/HANDOFF.md`), "views/HANDOFF.md not installed");
+    const json = JSON.parse(io.store.get(`${V3M_DIR}/context.json`));
+    assertEqual(json.protocolVersion, "3.0.0");
+    assertEqual(json.idCounters.task, 3, "counters must cover the allocated IDs");
+
+    // Old root views are retired.
+    for (const legacy of ["HANDOFF.md", "tasks.md", "decisions.md"]) {
+      assert(!io.store.has(`${V3M_DIR}/${legacy}`), `legacy root file '${legacy}' must be retired`);
+    }
+
+    // Config version upgrades to 3.0.0 via the FINAL rename.
+    const config = JSON.parse(io.store.get(V3M_CONFIG));
+    assertEqual(config.version, "3.0.0");
+    const renames = io.ops.filter((op) => op[0] === "rename");
+    assertEqual(renames.at(-1)[2], V3M_CONFIG, "the config (version upgrade) must rename last");
+
+    // No temp or rollback residue.
+    for (const key of io.store.keys()) {
+      assert(!key.includes("migration-tmp"), `temp file left behind: ${key}`);
+      assert(!key.includes("migration-rollback"), `rollback file left behind: ${key}`);
+    }
+  });
+
+  test("v3 migration: repeated migration is idempotent", async () => {
+    const inputs = await readV2CompleteInputs();
+    const io = makeFakeIo(seedV2Complete(inputs));
+
+    const first = await applyV3Migration(io, planV2ToV3Migration({ ...inputs, config: V3M_CONFIG_BODY }), { handoffDir: V3M_DIR, configPath: V3M_CONFIG }, { timestamp: "2026-08-02T00-00:00.000Z" });
+    assert(first.migrated, "first migration should write");
+    const snapshot = JSON.stringify([...io.store.entries()].sort());
+
+    const secondPlan = planV2ToV3Migration({
+      contextJson: io.store.get(`${V3M_DIR}/context.json`),
+      contextMapMd: io.store.get(`${V3M_DIR}/context-map.md`),
+    });
+    assert(!secondPlan.needed, `second plan should be a no-op, got: ${secondPlan.reason}`);
+    const second = await applyV3Migration(io, secondPlan, { handoffDir: V3M_DIR, configPath: V3M_CONFIG }, { timestamp: "2026-08-02T01:00:00.000Z" });
+    assert(!second.migrated, "second migration must not write");
+    assertEqual(JSON.stringify([...io.store.entries()].sort()), snapshot, "second migration changed files");
+  });
+
+  test("v3 migration: an invalid plan changes no original byte", async () => {
+    const inputs = await readV2CompleteInputs();
+    const plan = planV2ToV3Migration(inputs);
+    plan.outputs["context-map.md"] = "garbage that is not a context map";
+    const io = makeFakeIo(seedV2Complete(inputs));
+
+    await assertRejects(
+      () => applyV3Migration(io, plan, { handoffDir: V3M_DIR, configPath: V3M_CONFIG }),
+      "a corrupted plan output must be rejected"
+    );
+    assertEqual(io.ops.length, 0, "an invalid plan must not cause any filesystem operation");
+  });
+
+  test("v3 migration: a rename-phase failure rolls every installed file back", async () => {
+    const inputs = await readV2CompleteInputs();
+    const plan = planV2ToV3Migration({ ...inputs, config: V3M_CONFIG_BODY });
+    const seed = seedV2Complete(inputs);
+    const io = makeFakeIo(seed);
+
+    const baseRename = io.rename;
+    let finalRenames = 0;
+    io.rename = async (from, to) => {
+      if (from.endsWith(".migration-tmp")) {
+        finalRenames += 1;
+        if (finalRenames === 3) throw new Error("injected rename failure");
+      }
+      return baseRename(from, to);
+    };
+
+    await assertRejects(
+      () => applyV3Migration(io, plan, { handoffDir: V3M_DIR, configPath: V3M_CONFIG }, { timestamp: "2026-08-02T00:00:00.000Z" }),
+      "injected rename failure should abort the migration"
+    );
+
+    for (const [key, value] of Object.entries(seed)) {
+      assertEqual(io.store.get(key), value, `original file changed despite rollback: ${key}`);
+    }
+    for (const key of io.store.keys()) {
+      assert(!key.includes("migration-tmp"), `temp file left behind: ${key}`);
+      assert(!key.includes("migration-rollback"), `rollback file left behind: ${key}`);
+      assert(!key.includes(`${CONTENT_DIR}/`), `partial v3 content left behind: ${key}`);
+    }
+  });
+
+  test("v3 migration: a cleanup failure after commit leaves a valid v3 state", async () => {
+    const inputs = await readV2CompleteInputs();
+    const plan = planV2ToV3Migration({ ...inputs, config: V3M_CONFIG_BODY });
+    const io = makeFakeIo(seedV2Complete(inputs));
+
+    const baseRemove = io.remove;
+    let rollbackRemoves = 0;
+    io.remove = async (p) => {
+      if (p.endsWith(".migration-rollback")) {
+        rollbackRemoves += 1;
+        if (rollbackRemoves === 2) throw new Error("injected cleanup failure");
+      }
+      return baseRemove(p);
+    };
+
+    const result = await applyV3Migration(io, plan, { handoffDir: V3M_DIR, configPath: V3M_CONFIG }, { timestamp: "2026-08-02T00-00:00.000Z" });
+    assert(result.migrated, "cleanup failure must not fail a committed migration");
+
+    const map = parseContextMapV3(io.store.get(`${V3M_DIR}/context-map.md`));
+    assert(map, "committed v3 map must remain readable");
+    assertEqual(map.sections.tasks.length, 3);
+    const json = JSON.parse(io.store.get(`${V3M_DIR}/context.json`));
+    assertEqual(json.protocolVersion, "3.0.0", "committed metadata must not roll back");
+    for (const key of io.store.keys()) {
+      assert(!key.includes("migration-tmp"), `temp file left behind: ${key}`);
+    }
+  });
+
+  test("v3 migration: planV2ToV3Migration is pure and deterministic", async () => {
+    const inputs = await readV2CompleteInputs();
+    const before = JSON.stringify(inputs);
+    const first = planV2ToV3Migration(inputs);
+    const second = planV2ToV3Migration(inputs);
+    assertEqual(JSON.stringify(first), JSON.stringify(second), "planV2ToV3Migration is not deterministic");
+    assertEqual(JSON.stringify(inputs), before, "planV2ToV3Migration mutated its inputs");
   });
 
   // ── Semantic snapshots (v2.3) ─────────────────────────────────────────────
