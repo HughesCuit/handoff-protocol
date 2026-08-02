@@ -333,6 +333,34 @@ button:focus-visible {
   display: none;
 }
 
+.details-summary {
+  margin: 10px 0 4px;
+  font-weight: 600;
+}
+
+.details-body {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.details-body p {
+  margin: 0 0 8px;
+}
+
+.details-body strong {
+  font-weight: 700;
+}
+
+.details-body code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: rgb(0 0 0 / 8%);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
 .empty-state {
   position: absolute;
   inset: 0;

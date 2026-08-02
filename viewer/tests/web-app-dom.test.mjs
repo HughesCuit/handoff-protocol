@@ -349,3 +349,187 @@ test("tree selection retains its map focus target until Map is measurable", { co
     before.match(/scale\(([^)]+)\)/)?.[1],
   );
 });
+
+// ── v3 lazy node details ─────────────────────────────────────────────────────
+
+const V3_TREE = {
+  root: {
+    id: "context-map",
+    section: "root",
+    text: "Context Map",
+    taskState: null,
+    risk: null,
+    excluded: false,
+    origin: "user",
+    children: [
+      {
+        id: "task1",
+        section: "tasks",
+        text: "Wire the lazy node detail loader",
+        taskState: "open",
+        risk: null,
+        excluded: false,
+        origin: "agent",
+        children: [],
+      },
+      {
+        id: "task2",
+        section: "tasks",
+        text: "Second task with a much longer label",
+        taskState: "open",
+        risk: null,
+        excluded: false,
+        origin: "agent",
+        children: [],
+      },
+    ],
+  },
+  nodeCount: 3,
+};
+
+function v3Snapshot(overrides = {}) {
+  return {
+    status: "synced",
+    version: "v1",
+    tree: structuredClone(V3_TREE),
+    nodeCount: V3_TREE.nodeCount,
+    diagnostic: null,
+    watchMode: "watch",
+    watchDiagnostic: null,
+    bindingId: "binding-v3",
+    source: ".handoff/context-map.md",
+    layout: "v3",
+    contentVersion: "content-v1",
+    ...overrides,
+  };
+}
+
+function v3Detail(id, body) {
+  return {
+    id,
+    section: "tasks",
+    label: id === "task1" ? "Wire lazy node details" : "Second task",
+    summary: `${id} summary.`,
+    body,
+    version: "detail-v1",
+    diagnostic: null,
+  };
+}
+
+async function openV3Viewer({ contentVersion = "content-v1", bodies = {}, delayMs = 0 } = {}) {
+  const state = { contentVersion, bodies };
+  const nodeFetches = [];
+  const fetchImpl = async (url, init) => {
+    const target = String(url);
+    if (target.includes("api/context-map")) {
+      return new Response(JSON.stringify(v3Snapshot({ contentVersion: state.contentVersion })));
+    }
+    const nodeMatch = target.match(/node\/([a-z]+[0-9]+)$/);
+    if (nodeMatch) {
+      const id = nodeMatch[1];
+      nodeFetches.push({ id, signal: init?.signal });
+      if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
+      const body = state.bodies[id] ?? `${id} default body.`;
+      return new Response(JSON.stringify(v3Detail(id, body)));
+    }
+    return new Response("", { status: 404 });
+  };
+  const viewer = await openViewer({ fetchSnapshot: fetchImpl });
+  viewer.nodeFetches = nodeFetches;
+  viewer.state = state;
+  return viewer;
+}
+
+test("v3: opening a node requests its body once and renders summary + body", { concurrency: false }, async (t) => {
+  const viewer = await openV3Viewer({ bodies: { task1: "Full **task1** body." } });
+  t.after(() => viewer.cleanup());
+
+  assert.equal(viewer.nodeFetches.length, 0, "no node fetch before a detail opens");
+  viewer.document.querySelector('.tree-label[data-node-id="task1"]').click();
+  await waitFor(
+    () => viewer.document.getElementById("details-body")?.textContent.includes("Full task1 body."),
+    "task1 body did not render",
+  );
+  assert.equal(viewer.nodeFetches.filter((f) => f.id === "task1").length, 1, "body fetched exactly once");
+  const body = viewer.document.getElementById("details-body");
+  assert.ok(body.querySelector("strong"), "markdown bold rendered as an element");
+  assert.equal(viewer.document.getElementById("details-summary")?.textContent, "task1 summary.");
+});
+
+test("v3: repeated opens reuse the versioned cache (no second fetch)", { concurrency: false }, async (t) => {
+  const viewer = await openV3Viewer({ bodies: { task1: "Cached body." } });
+  t.after(() => viewer.cleanup());
+
+  viewer.document.querySelector('.tree-label[data-node-id="task1"]').click();
+  await waitFor(() => viewer.document.getElementById("details-body")?.textContent.includes("Cached body."), "body did not render");
+  click(viewer.window, viewer.document.getElementById("details-close"));
+  await Promise.resolve();
+
+  viewer.document.querySelector('.tree-label[data-node-id="task1"]').click();
+  await waitFor(() => viewer.document.getElementById("details-body")?.textContent.includes("Cached body."), "body did not re-render");
+  assert.equal(viewer.nodeFetches.filter((f) => f.id === "task1").length, 1, "cache must prevent a second fetch");
+});
+
+test("v3: a newer content version invalidates the cached detail", { concurrency: false }, async (t) => {
+  const viewer = await openV3Viewer({ bodies: { task1: "Original body." }, contentVersion: "content-v1" });
+  t.after(() => viewer.cleanup());
+
+  viewer.document.querySelector('.tree-label[data-node-id="task1"]').click();
+  await waitFor(() => viewer.document.getElementById("details-body")?.textContent.includes("Original body."), "body did not render");
+  assert.equal(viewer.nodeFetches.filter((f) => f.id === "task1").length, 1);
+
+  // Close, then a poll carries a newer contentVersion; the next open refetches.
+  click(viewer.window, viewer.document.getElementById("details-close"));
+  await Promise.resolve();
+  viewer.state.contentVersion = "content-v2";
+  viewer.state.bodies.task1 = "Updated body.";
+  await viewer.poll();
+
+  viewer.document.querySelector('.tree-label[data-node-id="task1"]').click();
+  await waitFor(() => viewer.document.getElementById("details-body")?.textContent.includes("Updated body."), "updated body did not render");
+  assert.equal(viewer.nodeFetches.filter((f) => f.id === "task1").length, 2, "new content version must refetch");
+});
+
+test("v3: a stale response cannot overwrite the currently selected node", { concurrency: false }, async (t) => {
+  const viewer = await openV3Viewer({ delayMs: 0, bodies: { task1: "Slow task1 body.", task2: "Fast task2 body." } });
+  t.after(() => viewer.cleanup());
+
+  // Hold task1's response, then switch selection to task2 before releasing it.
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  const originalFetch = viewer.window.fetch;
+  let task1Held = false;
+  viewer.window.fetch = async (url, init) => {
+    const target = String(url);
+    if (target.includes("node/task1") && !task1Held) {
+      task1Held = true;
+      await held;
+    }
+    return originalFetch(url, init);
+  };
+
+  viewer.document.querySelector('.tree-label[data-node-id="task1"]').click();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  viewer.document.querySelector('.tree-label[data-node-id="task2"]').click();
+  await waitFor(() => viewer.document.getElementById("details-body")?.textContent.includes("Fast task2 body."), "task2 body did not render");
+
+  release();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.ok(
+    viewer.document.getElementById("details-body").textContent.includes("Fast task2 body."),
+    "stale task1 response overwrote the current selection",
+  );
+  assert.ok(!viewer.document.getElementById("details-body").textContent.includes("Slow task1 body."));
+});
+
+test("v3: rendered bodies are HTML-escaped (no script injection) and read-only", { concurrency: false }, async (t) => {
+  const viewer = await openV3Viewer({ bodies: { task1: 'before <script>window.__pwned=1</script> after' } });
+  t.after(() => viewer.cleanup());
+
+  viewer.document.querySelector('.tree-label[data-node-id="task1"]').click();
+  await waitFor(() => viewer.document.getElementById("details-body")?.textContent.includes("after"), "body did not render");
+  assert.equal(viewer.window.__pwned, undefined, "script must not execute");
+  assert.equal(viewer.document.getElementById("details-body").querySelector("script"), null, "no script element may be injected");
+  // Read-only: no editable controls in the detail drawer.
+  assert.equal(viewer.document.querySelector("#details-drawer input, #details-drawer textarea"), null);
+});

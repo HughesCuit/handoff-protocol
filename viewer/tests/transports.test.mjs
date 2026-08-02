@@ -281,3 +281,85 @@ test("page lifecycle cannot start polling after disposal while initialization is
   assert.deepEqual(harness.snapshots, []);
   assert.equal(harness.timers.size, 0);
 });
+
+// ── v3 lazy node detail transport ────────────────────────────────────────────
+
+import { loadNode } from "../web/transports.mjs";
+
+const SESSION_BASE = "http://127.0.0.1:4312/session/token/";
+
+function nodeDetail(overrides = {}) {
+  return {
+    id: "task1",
+    section: "tasks",
+    label: "Wire lazy node details",
+    summary: "Lazy detail summary.",
+    body: "Lazy detail **body**.",
+    version: "v123",
+    diagnostic: null,
+    ...overrides,
+  };
+}
+
+test("loadNode resolves a valid detail from node/<id>", async () => {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push(String(url));
+    return new Response(JSON.stringify(nodeDetail()));
+  };
+  const detail = await loadNode(SESSION_BASE, "task1", undefined, fetchImpl);
+  assert.equal(detail.id, "task1");
+  assert.equal(detail.body, "Lazy detail **body**.");
+  assert.equal(calls.length, 1);
+  assert.ok(calls[0].endsWith("/session/token/node/task1"), `unexpected url: ${calls[0]}`);
+});
+
+test("loadNode rejects an ID that does not match the response", async () => {
+  const fetchImpl = async () => new Response(JSON.stringify(nodeDetail({ id: "task2" })));
+  await assert.rejects(
+    () => loadNode(SESSION_BASE, "task1", undefined, fetchImpl),
+    /INVALID_NODE_DETAIL/,
+  );
+});
+
+test("loadNode rejects a detail missing its version", async () => {
+  const fetchImpl = async () => new Response(JSON.stringify(nodeDetail({ version: undefined })));
+  await assert.rejects(
+    () => loadNode(SESSION_BASE, "task1", undefined, fetchImpl),
+    /INVALID_NODE_DETAIL/,
+  );
+});
+
+test("loadNode maps 404 to NODE_NOT_FOUND and 409 to MIGRATION_REQUIRED", async () => {
+  await assert.rejects(
+    () => loadNode(SESSION_BASE, "task99", undefined, async () => new Response("", { status: 404 })),
+    /NODE_NOT_FOUND/,
+  );
+  await assert.rejects(
+    () => loadNode(SESSION_BASE, "task1", undefined, async () => new Response("", { status: 409 })),
+    /MIGRATION_REQUIRED/,
+  );
+});
+
+test("loadNode rejects an invalid ID grammar without fetching", async () => {
+  let fetched = false;
+  const fetchImpl = async () => {
+    fetched = true;
+    return new Response(JSON.stringify(nodeDetail()));
+  };
+  for (const bad of ["foo", "TASK1", "task0", "task-1", "../task1"]) {
+    await assert.rejects(() => loadNode(SESSION_BASE, bad, undefined, fetchImpl), /ID_INVALID/);
+  }
+  assert.equal(fetched, false, "invalid IDs must never reach the network");
+});
+
+test("loadNode forwards the abort signal", async () => {
+  const controller = new AbortController();
+  let receivedSignal = null;
+  const fetchImpl = async (url, init) => {
+    receivedSignal = init.signal;
+    return new Response(JSON.stringify(nodeDetail()));
+  };
+  await loadNode(SESSION_BASE, "task1", controller.signal, fetchImpl);
+  assert.equal(receivedSignal, controller.signal);
+});

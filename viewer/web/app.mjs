@@ -11,7 +11,7 @@ import {
   transitionSnapshotViewState,
   truncateLabel,
 } from "./model.mjs";
-import { createHttpTransport, createPageLifecycle } from "./transports.mjs";
+import { createHttpTransport, createPageLifecycle, loadNode } from "./transports.mjs";
 
 let snapshot = null;
 let viewState = createViewState();
@@ -37,9 +37,93 @@ const detailsDrawer = document.getElementById("details-drawer");
 const detailsTitle = document.getElementById("details-title");
 const detailsPath = document.getElementById("details-path");
 const detailsText = document.getElementById("details-text");
+const detailsSummary = document.getElementById("details-summary");
+const detailsBody = document.getElementById("details-body");
 const detailsMeta = document.getElementById("details-meta");
 let detailsReturnFocus = null;
 const SVG_NS = "http://www.w3.org/2000/svg";
+
+// ── v3 lazy node details ─────────────────────────────────────────────────────
+// v3 nodes carry stable protocol IDs; their bodies load on demand through
+// GET node/<id>, cached per content version. A monotonically increasing
+// request sequence rejects stale responses so a slow reply can never
+// overwrite a newer selection.
+const NODE_ID_RE = /^(goal|status|task|decision|question|risk|note|excluded)[1-9][0-9]*$/;
+const detailCache = new Map();
+let detailRequestSeq = 0;
+let detailRenderedKey = null;
+
+function isV3DetailNode(node) {
+  return snapshot?.layout === "v3" && NODE_ID_RE.test(node.id);
+}
+
+function renderInlineMarkdown(container, text) {
+  const pattern = /(\*\*[^*]+\*\*|`[^`]+`)/g;
+  let lastIndex = 0;
+  let match;
+  while ((match = pattern.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      container.append(document.createTextNode(text.slice(lastIndex, match.index)));
+    }
+    const token = match[0];
+    if (token.startsWith("**")) {
+      const strong = document.createElement("strong");
+      strong.textContent = token.slice(2, -2);
+      container.append(strong);
+    } else {
+      const code = document.createElement("code");
+      code.textContent = token.slice(1, -1);
+      container.append(code);
+    }
+    lastIndex = pattern.lastIndex;
+  }
+  if (lastIndex < text.length) {
+    container.append(document.createTextNode(text.slice(lastIndex)));
+  }
+}
+
+// Safe by construction: every fragment is inserted as escaped text; only
+// **bold** and `code` become elements, themselves set via textContent. No
+// innerHTML, so no script injection is possible.
+function renderSafeMarkdown(container, markdown) {
+  container.replaceChildren();
+  const text = String(markdown ?? "");
+  if (!text.trim()) return;
+  for (const paragraph of text.split(/\n{2,}/)) {
+    const p = document.createElement("p");
+    renderInlineMarkdown(p, paragraph.replace(/\n/g, " "));
+    container.append(p);
+  }
+}
+
+function renderDetailContent(detail) {
+  detailsSummary.textContent = detail.summary ?? "";
+  renderSafeMarkdown(detailsBody, detail.body ?? "");
+}
+
+async function loadAndRenderDetail(nodeId, contentVersion) {
+  const seq = ++detailRequestSeq;
+  const cacheKey = `${contentVersion}\u0000${nodeId}`;
+  const cached = detailCache.get(cacheKey);
+  if (cached) {
+    renderDetailContent(cached);
+    return;
+  }
+  detailsSummary.textContent = "";
+  detailsBody.textContent = "Loading…";
+  try {
+    const detail = await loadNode(window.location.href, nodeId, undefined, window.fetch.bind(window));
+    if (seq !== detailRequestSeq || viewState.selectedNodeId !== nodeId) return;
+    detailCache.set(cacheKey, detail);
+    renderDetailContent(detail);
+  } catch (error) {
+    if (seq !== detailRequestSeq || viewState.selectedNodeId !== nodeId) return;
+    detailsSummary.textContent = "";
+    detailsBody.textContent = error?.message === "MIGRATION_REQUIRED"
+      ? "Run /handoff save to migrate this handoff to v3."
+      : "Node details unavailable.";
+  }
+}
 
 function mapViewport() {
   return { width: mapPane.clientWidth, height: mapPane.clientHeight };
@@ -174,7 +258,10 @@ function renderDetails() {
   if (!open) {
     detailsPath.textContent = "";
     detailsText.textContent = "";
+    detailsSummary.textContent = "";
+    detailsBody.replaceChildren();
     detailsMeta.replaceChildren();
+    detailRenderedKey = null;
     return;
   }
 
@@ -197,6 +284,20 @@ function renderDetails() {
     const description = document.createElement("dd");
     description.textContent = value;
     detailsMeta.append(term, description);
+  }
+
+  // v3: load the node body lazily, once per (content version, node) pair.
+  if (isV3DetailNode(selected.node)) {
+    const contentVersion = snapshot?.contentVersion ?? "";
+    const key = `${contentVersion}\u0000${selected.node.id}`;
+    if (key !== detailRenderedKey) {
+      detailRenderedKey = key;
+      loadAndRenderDetail(selected.node.id, contentVersion);
+    }
+  } else {
+    detailsSummary.textContent = "";
+    detailsBody.replaceChildren();
+    detailRenderedKey = null;
   }
 }
 
