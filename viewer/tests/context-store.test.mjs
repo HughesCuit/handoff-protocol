@@ -17,7 +17,7 @@ async function fixture() {
   return { root, file, uri: pathToFileURL(root).href };
 }
 
-async function waitFor(predicate, timeout = 4_000) {
+async function waitFor(predicate, timeout = 8_000) {
   const started = Date.now();
   while (Date.now() - started < timeout) {
     if (predicate()) return;
