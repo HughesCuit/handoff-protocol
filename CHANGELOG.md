@@ -2,6 +2,13 @@
 
 All notable changes to Handoff Protocol are documented here.
 
+## 3.0.1
+
+- Publish the protocol and Skill assets as the public `handoff-protocol` npm
+  package for consumers that need a version-locked archive.
+- Correct npm package links to the canonical
+  `HughesCuit/handoff-protocol` GitHub repository.
+
 ## 3.0.0
 
 **Breaking change — Context Map becomes a directory.**

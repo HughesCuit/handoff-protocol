@@ -1,5 +1,5 @@
 /**
- * Handoff Protocol v3.0.0 — documentation consistency tests.
+ * Handoff Protocol v3.0.1 — documentation consistency tests.
  *
  * Asserts that the product/protocol versions agree across package.json,
  * package-lock.json, and SKILL.md; that the v3 layout (eight content files +
@@ -29,18 +29,18 @@ const CONTENT_FILES = [
   "excluded.md",
 ];
 
-test("package.json, package-lock.json, and SKILL.md versions agree on 3.0.0", async () => {
+test("package.json, package-lock.json, and SKILL.md versions agree on 3.0.1", async () => {
   const pkg = JSON.parse(await read("package.json"));
   const lock = JSON.parse(await read("package-lock.json"));
   const skill = await read("SKILL.md");
 
-  assert.equal(pkg.version, "3.0.0", "package.json version");
-  assert.equal(lock.version, "3.0.0", "package-lock.json root version");
-  assert.equal(lock.packages[""].version, "3.0.0", "package-lock.json packages[''] version");
+  assert.equal(pkg.version, "3.0.1", "package.json version");
+  assert.equal(lock.version, "3.0.1", "package-lock.json root version");
+  assert.equal(lock.packages[""].version, "3.0.1", "package-lock.json packages[''] version");
 
   const skillVersion = skill.match(/^\s*version:\s*"([^"]+)"/m);
   assert.ok(skillVersion, "SKILL.md must declare a metadata version");
-  assert.equal(skillVersion[1], "3.0.0", "SKILL.md metadata version");
+  assert.equal(skillVersion[1], "3.0.1", "SKILL.md metadata version");
 });
 
 test("SKILL.md and README document the v3 layout and all eight content files", async () => {

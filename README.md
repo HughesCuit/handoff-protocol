@@ -194,6 +194,19 @@ npx skills add HughesCuit/handoff-protocol --agent opencode
 npx skills add HughesCuit/handoff-protocol --agent kimi-code-cli
 ```
 
+### npm package
+
+For tooling that needs a version-locked copy of the protocol, Skill, scripts,
+and Viewer assets without performing a global Agent installation:
+
+```bash
+npm install handoff-protocol
+```
+
+Installing the npm package only places these resources in `node_modules`.
+Use the Skills CLI commands above when you want to install `handoff` into a
+supported Agent host.
+
 ### Context Map Viewer
 
 `/handoff view` opens the current project's `.handoff/context-map.md` as a live,

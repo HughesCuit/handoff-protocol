@@ -1,6 +1,6 @@
 {
   "name": "handoff-protocol",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "description": "Cross-agent context handoff protocol for AI coding agents",
   "keywords": [
     "ai",
@@ -16,12 +16,15 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/handoff-protocol/handoff-protocol.git"
+    "url": "git+https://github.com/HughesCuit/handoff-protocol.git"
   },
   "bugs": {
-    "url": "https://github.com/handoff-protocol/handoff-protocol/issues"
+    "url": "https://github.com/HughesCuit/handoff-protocol/issues"
   },
-  "homepage": "https://github.com/handoff-protocol/handoff-protocol#readme",
+  "homepage": "https://github.com/HughesCuit/handoff-protocol#readme",
+  "publishConfig": {
+    "access": "public"
+  },
   "files": [
     "assets",
     "docs",
