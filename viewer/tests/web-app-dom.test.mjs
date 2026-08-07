@@ -1,8 +1,13 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import { Window } from "happy-dom";
+
+import { DaemonServer } from "../runtime/daemon-server.mjs";
+import { SessionManager } from "../runtime/session-manager.mjs";
 
 const template = await readFile(
   new URL("../web/standalone.html", import.meta.url),
@@ -123,13 +128,12 @@ function click(window, element) {
 
 async function openViewer({
   fetchSnapshot = async () => new Response(JSON.stringify(snapshot())),
+  url = "http://127.0.0.1:4312/session/token/",
   width = 612,
   mapLeft = 220,
   mapWidth = 392,
 } = {}) {
-  const window = new Window({
-    url: "http://127.0.0.1:4312/session/token/",
-  });
+  const window = new Window({ url });
   window.document.write(template);
   const style = window.document.createElement("style");
   style.textContent = styles;
@@ -490,6 +494,31 @@ test("v3: a newer content version invalidates the cached detail", { concurrency:
   assert.equal(viewer.nodeFetches.filter((f) => f.id === "task1").length, 2, "new content version must refetch");
 });
 
+test("v3: a content-only version bump refetches the open detail without user action", { concurrency: false }, async (t) => {
+  const viewer = await openV3Viewer({ bodies: { task1: "Original body." }, contentVersion: "content-v1" });
+  t.after(() => viewer.cleanup());
+
+  viewer.document.querySelector('.tree-label[data-node-id="task1"]').click();
+  await waitFor(() => viewer.document.getElementById("details-body")?.textContent.includes("Original body."), "body did not render");
+  assert.equal(viewer.nodeFetches.filter((f) => f.id === "task1").length, 1);
+
+  // The drawer stays OPEN; the next poll carries the same map version but a
+  // newer contentVersion (a content-only change on disk).
+  viewer.state.contentVersion = "content-v2";
+  viewer.state.bodies.task1 = "Updated body.";
+  await viewer.poll();
+
+  await waitFor(
+    () => viewer.document.getElementById("details-body")?.textContent.includes("Updated body."),
+    "the open detail did not refresh after a content-only change",
+  );
+  assert.equal(
+    viewer.nodeFetches.filter((f) => f.id === "task1").length,
+    2,
+    "a content-only change must refetch the open detail",
+  );
+});
+
 test("v3: a stale response cannot overwrite the currently selected node", { concurrency: false }, async (t) => {
   const viewer = await openV3Viewer({ delayMs: 0, bodies: { task1: "Slow task1 body.", task2: "Fast task2 body." } });
   t.after(() => viewer.cleanup());
@@ -532,4 +561,94 @@ test("v3: rendered bodies are HTML-escaped (no script injection) and read-only",
   assert.equal(viewer.document.getElementById("details-body").querySelector("script"), null, "no script element may be injected");
   // Read-only: no editable controls in the detail drawer.
   assert.equal(viewer.document.querySelector("#details-drawer input, #details-drawer textarea"), null);
+});
+
+// ── v3 end-to-end: disk → watcher → store → daemon HTTP → frontend ──────────
+
+const E2E_MAP = `# Context Map
+
+<!-- handoff-protocol:v3.0.0 — Semantic directory. -->
+
+## Tasks
+
+- [ ] \`task1\` Wire the lazy node detail loader
+`;
+
+const E2E_CONTENT = {
+  "current-goal.md": "# Current Goal\n",
+  "current-status.md": "# Current Status\n",
+  "tasks.md": "# Tasks\n\n## task1\n\nOriginal summary.\n\nOriginal body.\n",
+  "decisions.md": "# Decisions\n",
+  "open-questions.md": "# Open Questions\n",
+  "risks.md": "# Risks\n",
+  "knowledge-notes.md": "# Knowledge and Notes\n",
+  "excluded.md": "# Excluded\n",
+};
+
+test("v3 e2e: editing only a content file refreshes the open detail through the real daemon", { concurrency: false }, async (t) => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "viewer-e2e-")));
+  const handoffDir = join(root, ".handoff");
+  const contentDir = join(handoffDir, "content");
+  await mkdir(contentDir, { recursive: true });
+  await writeFile(join(handoffDir, "context-map.md"), E2E_MAP);
+  for (const [name, body] of Object.entries(E2E_CONTENT)) {
+    await writeFile(join(contentDir, name), body);
+  }
+  const mapBefore = await readFile(join(handoffDir, "context-map.md"));
+
+  const sessionManager = new SessionManager();
+  const server = new DaemonServer({
+    sessionManager,
+    assets: { html: "<!doctype html>", app: "", model: "", styles: "" },
+    controlToken: "e2e-control-token",
+  });
+  const { port } = await server.start();
+  const created = await sessionManager.create(root, { idleMinutes: 30 });
+  t.after(async () => {
+    await server.close();
+  });
+
+  const viewer = await openViewer({
+    url: `http://127.0.0.1:${port}/session/${created.token}/`,
+    fetchSnapshot: (url, init) => fetch(url, init),
+  });
+  t.after(() => viewer.cleanup());
+
+  // The overview folds sections that carry children; expand to reach the leaf.
+  viewer.document.getElementById("expand").click();
+  viewer.document.querySelector('.tree-label[data-node-id="task1"]').click();
+  await waitFor(
+    () => viewer.document.getElementById("details-body")?.textContent.includes("Original body."),
+    "original body did not render from the real daemon",
+  );
+
+  const sessionBase = `http://127.0.0.1:${port}/session/${created.token}/`;
+  const snapshotBefore = await (await fetch(new URL("api/context-map", sessionBase))).json();
+
+  // Content-only edit; the map stays byte-identical.
+  await writeFile(
+    join(contentDir, "tasks.md"),
+    "# Tasks\n\n## task1\n\nOriginal summary.\n\nUpdated body.\n",
+  );
+
+  const deadline = Date.now() + 6_000;
+  while (Date.now() < deadline) {
+    if (viewer.document.getElementById("details-body")?.textContent.includes("Updated body.")) break;
+    await viewer.poll();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+  }
+  assert.ok(
+    viewer.document.getElementById("details-body").textContent.includes("Updated body."),
+    "the open detail did not refresh after a content-only edit",
+  );
+  assert.ok(
+    (await readFile(join(handoffDir, "context-map.md"))).equals(mapBefore),
+    "the map must remain byte-identical",
+  );
+
+  // The served snapshot proves the version semantics directly: the map version
+  // is unchanged while the content version moved.
+  const snapshotAfter = await (await fetch(new URL("api/context-map", sessionBase))).json();
+  assert.equal(snapshotAfter.version, snapshotBefore.version, "map version must not change");
+  assert.notEqual(snapshotAfter.contentVersion, snapshotBefore.contentVersion, "content version must change");
 });

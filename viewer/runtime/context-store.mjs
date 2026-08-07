@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { watch } from "node:fs";
+import { join } from "node:path";
 
+import { CONTENT_DIR } from "../../scripts/content-files.mjs";
 import {
   ContextMapParseError,
   isV3ContextMap,
@@ -54,11 +56,13 @@ export class ContextMapStore {
     this.parse = options.parse ?? parseRenderTree;
     this.parseV3 = options.parseV3 ?? parseV3RenderTree;
     this.createContentIndex =
-      options.createContentIndex ?? (({ handoffDir }) => new ContentIndex({ handoffDir }));
+      options.createContentIndex ??
+      (({ handoffDir, rootPath }) => new ContentIndex({ handoffDir, rootPath }));
     this.contentIndex = null;
     this.rootUri = null;
     this.source = null;
     this.watcher = null;
+    this.contentWatcher = null;
     this.timer = null;
     this.pollTimer = null;
     this.state = emptyState();
@@ -101,6 +105,7 @@ export class ContextMapStore {
       this.watcher.on?.("error", () => {
         this.watcher?.close();
         this.watcher = null;
+        this.disposeContentWatcher();
         this.state = {
           ...this.state,
           watchMode: "polling",
@@ -108,6 +113,7 @@ export class ContextMapStore {
         };
         this.startPolling();
       });
+      this.ensureContentWatcher();
     } catch {
       this.watcher = null;
       this.state = {
@@ -117,6 +123,34 @@ export class ContextMapStore {
       };
       this.startPolling();
     }
+  }
+
+  /**
+   * Watch `.handoff/content/` in its own right. A watcher on the handoff dir
+   * is not guaranteed to observe nested changes on every platform (directory
+   * watches are non-recursive on Linux), and v3 bodies live one level down.
+   * The content dir may not exist yet (v2 or pre-migration); the handoff-dir
+   * watcher observes its creation and the next v3 refresh retries.
+   */
+  ensureContentWatcher() {
+    if (!this.watcher || this.contentWatcher || !this.source) return;
+    try {
+      const watcher = this.watch(join(this.source.handoffDir, CONTENT_DIR), () =>
+        this.scheduleRefresh(),
+      );
+      this.contentWatcher = watcher;
+      watcher.on?.("error", () => {
+        watcher.close();
+        if (this.contentWatcher === watcher) this.contentWatcher = null;
+      });
+    } catch {
+      this.contentWatcher = null;
+    }
+  }
+
+  disposeContentWatcher() {
+    this.contentWatcher?.close();
+    this.contentWatcher = null;
   }
 
   startPolling() {
@@ -142,14 +176,28 @@ export class ContextMapStore {
       const content = await this.readSource(this.source);
       const version = digest(content);
       if (version === this.state.version && this.state.tree) {
-        this.state = { ...this.state, status: "synced", diagnostic: null };
+        // The directory (map) is unchanged, but v3 bodies live in separate
+        // content files that may have changed on their own. Refresh the
+        // content index so contentVersion/contentDiagnostics still move and
+        // the Viewer's node-detail cache is invalidated.
+        if (this.state.layout === "v3") {
+          await this.refreshContentIndex();
+          this.state = {
+            ...this.state,
+            status: "synced",
+            diagnostic: null,
+            contentVersion: this.contentIndex.version,
+            contentDiagnostics: [...this.contentIndex.diagnostics],
+          };
+          this.ensureContentWatcher();
+        } else {
+          this.state = { ...this.state, status: "synced", diagnostic: null };
+        }
         return this.snapshot();
       }
       if (isV3ContextMap(content)) {
         const tree = this.parseV3(content);
-        const index = this.contentIndex ?? this.createContentIndex({ handoffDir: this.source.handoffDir });
-        this.contentIndex = index;
-        await index.refresh();
+        await this.refreshContentIndex();
         this.state = {
           ...this.state,
           status: "synced",
@@ -158,9 +206,10 @@ export class ContextMapStore {
           nodeCount: tree.nodeCount,
           diagnostic: null,
           layout: "v3",
-          contentVersion: index.version,
-          contentDiagnostics: [...index.diagnostics],
+          contentVersion: this.contentIndex.version,
+          contentDiagnostics: [...this.contentIndex.diagnostics],
         };
+        this.ensureContentWatcher();
       } else {
         this.contentIndex = null;
         const tree = this.parse(content);
@@ -190,6 +239,17 @@ export class ContextMapStore {
     return this.snapshot();
   }
 
+  async refreshContentIndex() {
+    const index = this.contentIndex ??
+      this.createContentIndex({
+        handoffDir: this.source.handoffDir,
+        rootPath: this.source.rootPath,
+      });
+    this.contentIndex = index;
+    await index.refresh();
+    return index;
+  }
+
   /**
    * Lazily resolved node detail for a v3 layout. Unknown IDs return null;
    * v2 layouts report MIGRATION_REQUIRED instead of reading arbitrary root
@@ -215,6 +275,7 @@ export class ContextMapStore {
       this.watcher.close();
       this.watcher = null;
     }
+    this.disposeContentWatcher();
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
       this.pollTimer = null;

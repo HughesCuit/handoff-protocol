@@ -38,6 +38,20 @@ root-level `HANDOFF.md`, `tasks.md`, and `decisions.md` are retired.
   `ID_COUNTER_RECOVERED`.
 - Migration guide: `docs/migrations/v2-to-v3.md`.
 
+### Fixed
+
+- Viewer content-only invalidation: edits confined to `.handoff/content/*.md`
+  (map byte-identical) now refresh the content index, bump the snapshot
+  `contentVersion`/diagnostics, and re-render open node details; the content
+  directory is watched explicitly instead of relying on recursive handoff-dir
+  watch events, and the content version digest frames each file by name and
+  byte length so boundary-shifted bytes cannot collide.
+- Viewer content reads are contained: the Context Map and all eight content
+  files are read through the same TOCTOU-safe, workspace-contained reader
+  (O_NOFOLLOW open, canonical containment, dev/ino verification), so a
+  symlinked content file or a redirected/replaced `content/` directory can
+  never serve bytes from outside the workspace.
+
 ### Changed
 
 - Protocol schema and product version are both `3.0.0`.

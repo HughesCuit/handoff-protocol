@@ -139,7 +139,11 @@ function snapshotRevisionIsUnchanged(next) {
   const nextBindingId = next.bindingId ?? viewState.bindingId;
   if (
     previousBindingId !== nextBindingId ||
-    snapshot.version !== next.version
+    snapshot.version !== next.version ||
+    // A content-only change keeps the directory (map) version but bumps the
+    // content version; it must re-render so open v3 details refetch fresh
+    // bodies instead of serving the versioned client-side cache.
+    (snapshot.contentVersion ?? null) !== (next.contentVersion ?? null)
   ) {
     return false;
   }

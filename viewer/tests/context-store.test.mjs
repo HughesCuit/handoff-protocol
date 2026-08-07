@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rename, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -289,4 +289,140 @@ test("v2: node details report MIGRATION_REQUIRED instead of reading root files",
   assert.equal(store.snapshot().layout, "v2");
   const detail = await store.nodeDetail("task1");
   assert.equal(detail.error, "MIGRATION_REQUIRED");
+});
+
+test("v3: content-only edits update the snapshot content version while the map version stays", async (t) => {
+  const item = await v3Fixture();
+  const store = new ContextMapStore({ debounceMs: 30 });
+  t.after(() => store.close());
+
+  await store.bind(item.uri);
+  const initial = store.snapshot();
+  assert.equal(initial.status, "synced");
+  assert.ok(initial.contentVersion, "v3 snapshots carry a content version");
+
+  // Only a content body changes; the map stays byte-identical. The refresh is
+  // driven explicitly (as each Viewer poll does server-side), so the assertion
+  // measures the unchanged-map path, not OS event delivery.
+  await writeFile(
+    join(item.contentDir, "tasks.md"),
+    "# Tasks\n\n## task1\n\nLazy detail summary.\n\nEdited body.\n\n## task2\n\nIndex summary.\n",
+  );
+
+  await store.refresh();
+  const changed = store.snapshot();
+  assert.notEqual(changed.contentVersion, initial.contentVersion, "content-only edits must bump the content version");
+  assert.equal(changed.version, initial.version, "the map version must not change");
+  assert.equal(changed.status, "synced");
+  const detail = await store.nodeDetail("task1");
+  assert.equal(detail.body, "Edited body.");
+});
+
+test("v3: the content directory is watched explicitly and its events refresh content", async (t) => {
+  const item = await v3Fixture();
+  const root = await realpath(item.root);
+  const watchers = new Map();
+  const store = new ContextMapStore({
+    debounceMs: 10,
+    watch: (path, callback) => {
+      const record = { path, callback, closed: false };
+      watchers.set(path, record);
+      return {
+        close: () => {
+          record.closed = true;
+        },
+        on() {},
+      };
+    },
+  });
+  t.after(() => store.close());
+
+  await store.bind(item.uri);
+  const initial = store.snapshot();
+  assert.equal(initial.status, "synced");
+
+  const handoffDir = join(root, ".handoff");
+  const contentDir = join(handoffDir, "content");
+  assert.ok(watchers.has(handoffDir), "the handoff dir must be watched");
+  assert.ok(watchers.has(contentDir), "the content dir must be watched explicitly");
+
+  // Simulate a platform where only the content-dir watcher observes the edit.
+  await writeFile(
+    join(contentDir, "tasks.md"),
+    "# Tasks\n\n## task1\n\nLazy detail summary.\n\nEdited body.\n\n## task2\n\nIndex summary.\n",
+  );
+  watchers.get(contentDir).callback("change", "tasks.md");
+  await waitFor(() => store.snapshot().contentVersion !== initial.contentVersion);
+  assert.equal(store.snapshot().version, initial.version, "the map version must not change");
+
+  await store.close();
+  assert.equal(watchers.get(handoffDir).closed, true);
+  assert.equal(watchers.get(contentDir).closed, true, "close must dispose the content watcher");
+});
+
+test("v3: content-only edits refresh snapshot diagnostics without a map change", async (t) => {
+  const item = await v3Fixture();
+  const store = new ContextMapStore({ debounceMs: 30 });
+  t.after(() => store.close());
+
+  await store.bind(item.uri);
+  const initial = store.snapshot();
+  assert.deepEqual(initial.contentDiagnostics, []);
+
+  // An orphan body entry appears — a content-only change. Refresh is driven
+  // explicitly (as each Viewer poll does server-side).
+  await writeFile(
+    join(item.contentDir, "tasks.md"),
+    `${V3_CONTENT["tasks.md"]}\n## note99\n\nOrphan body.\n`,
+  );
+
+  await store.refresh();
+  const changed = store.snapshot();
+  assert.ok(changed.contentDiagnostics.length > 0, "content-only edits must refresh diagnostics");
+  assert.equal(changed.version, initial.version, "the map version must not change");
+  assert.ok(
+    changed.contentDiagnostics.includes("CONTENT_ORPHAN: note99"),
+    `expected CONTENT_ORPHAN: note99 in ${JSON.stringify(changed.contentDiagnostics)}`,
+  );
+});
+
+test("v3: a content file symlinked outside the workspace is never served", async (t) => {
+  const outside = await mkdtemp(join(tmpdir(), "viewer-store-outside-"));
+  const secret = join(outside, "secret.md");
+  await writeFile(secret, "# Tasks\n\n## task1\n\nSECRET EXTERNAL BYTES\n");
+  const item = await v3Fixture();
+  await rm(join(item.contentDir, "tasks.md"));
+  await symlink(secret, join(item.contentDir, "tasks.md"));
+
+  const store = new ContextMapStore({ debounceMs: 30 });
+  t.after(() => store.close());
+  await store.bind(item.uri);
+
+  const detail = await store.nodeDetail("task1");
+  assert.equal(detail.diagnostic, "CONTENT_MISSING");
+  assert.equal(detail.body, "");
+  assert.ok(
+    !JSON.stringify(detail).includes("SECRET EXTERNAL BYTES"),
+    "an escaping content symlink must not reach the node-detail surface",
+  );
+});
+
+test("v3: a content directory redirected outside the workspace never leaks bytes", async (t) => {
+  const item = await v3Fixture();
+  const outside = await mkdtemp(join(tmpdir(), "viewer-store-outside-dir-"));
+  await writeFile(join(outside, "tasks.md"), "# Tasks\n\n## task1\n\nOUTSIDE DIR BYTES\n");
+  await rename(item.contentDir, `${item.contentDir}-original`);
+  await symlink(outside, item.contentDir);
+
+  const store = new ContextMapStore({ debounceMs: 30 });
+  t.after(() => store.close());
+  await store.bind(item.uri);
+
+  const detail = await store.nodeDetail("task1");
+  assert.equal(detail.diagnostic, "CONTENT_MISSING");
+  assert.equal(detail.body, "");
+  assert.ok(
+    !JSON.stringify(detail).includes("OUTSIDE DIR BYTES"),
+    "a redirected content directory must not leak external bytes",
+  );
 });
