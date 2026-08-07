@@ -244,3 +244,82 @@ test("close stops the listener and closes the session manager", async () => {
 test("requires a control token at construction", () => {
   assert.throws(() => new DaemonServer({ sessionManager: fakeSessionManager(), assets, controlToken: "" }), /control token/i);
 });
+
+// ── v3 lazy node-detail endpoint ─────────────────────────────────────────────
+
+test("GET /session/<token>/node/<id> returns the node detail with no-store headers", async () => {
+  const fixedToken = `detail-${"d".repeat(28)}`;
+  const sessionManager = fakeSessionManager({ fixedToken });
+  sessionManager.nodeDetail = async (token, id) => {
+    if (token !== fixedToken) return null;
+    if (id !== "task1") return null;
+    return {
+      id: "task1",
+      section: "tasks",
+      label: "Wire lazy node details",
+      summary: "Lazy detail summary.",
+      body: "Lazy detail **body**.",
+      version: "v123",
+      diagnostic: null,
+    };
+  };
+  const { server, base } = await startServer({ sessionManager });
+  try {
+    const response = await fetch(`${base}/session/${fixedToken}/node/task1`);
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("cache-control") ?? "", /no-store/);
+    const detail = await response.json();
+    assert.equal(detail.id, "task1");
+    assert.equal(detail.section, "tasks");
+    assert.equal(detail.label, "Wire lazy node details");
+    assert.equal(detail.summary, "Lazy detail summary.");
+    assert.equal(detail.body, "Lazy detail **body**.");
+    assert.equal(detail.version, "v123");
+  } finally {
+    await server.close();
+  }
+});
+
+test("node endpoint: malformed IDs are 400, unknown IDs are 404, traversal stays 404", async () => {
+  const fixedToken = `detail-${"e".repeat(28)}`;
+  const sessionManager = fakeSessionManager({ fixedToken });
+  sessionManager.nodeDetail = async () => null;
+  const { server, base } = await startServer({ sessionManager });
+  try {
+    for (const bad of ["foo", "TASK1", "task0", "task1x", "1task"]) {
+      const response = await fetch(`${base}/session/${fixedToken}/node/${bad}`);
+      assert.equal(response.status, 400, `'${bad}' must be 400`);
+      assert.equal((await response.json()).error, "ID_INVALID");
+    }
+    const unknown = await fetch(`${base}/session/${fixedToken}/node/task99`);
+    assert.equal(unknown.status, 404);
+
+    // IDs outside the route grammar (hyphens, encoded separators) never reach
+    // the node handler and stay safe 404s. (Literal "%2e%2e" is normalized by
+    // fetch itself before it ever reaches the server, so it is not tested
+    // here; the server-side ENCODED_PATH_CONTROL_PATTERN covers raw requests.)
+    for (const hostile of ["task-1", "..%2ftask1", "task1%2f.."]) {
+      const response = await fetch(`${base}/session/${fixedToken}/node/${hostile}`);
+      assert.equal(response.status, 404, `'${hostile}' must be 404`);
+    }
+
+    const foreign = await fetch(`${base}/session/${"z".repeat(32)}/node/task1`);
+    assert.equal(foreign.status, 404, "another session's token must not resolve nodes");
+  } finally {
+    await server.close();
+  }
+});
+
+test("node endpoint: a v2 layout reports MIGRATION_REQUIRED", async () => {
+  const fixedToken = `detail-${"f".repeat(28)}`;
+  const sessionManager = fakeSessionManager({ fixedToken });
+  sessionManager.nodeDetail = async () => ({ error: "MIGRATION_REQUIRED" });
+  const { server, base } = await startServer({ sessionManager });
+  try {
+    const response = await fetch(`${base}/session/${fixedToken}/node/task1`);
+    assert.equal(response.status, 409);
+    assert.equal((await response.json()).error, "MIGRATION_REQUIRED");
+  } finally {
+    await server.close();
+  }
+});

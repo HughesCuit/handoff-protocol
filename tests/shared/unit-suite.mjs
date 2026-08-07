@@ -10,12 +10,19 @@
 import {
   AGENT_MARKER,
   PROTOCOL_VERSION,
+  V3_PROTOCOL_VERSION,
+  V3_SECTION_KEYS,
+  V3_SECTION_LABELS,
+  v3SectionKeyForLabel,
   emptyContextMap,
+  emptyContextMapV3,
   SECTION_KEYS,
   SECTION_LABELS,
   sectionKeyForLabel,
   parseContextMap,
+  parseContextMapV3,
   renderContextMap,
+  renderContextMapV3,
   reconcileContextMap,
   buildInferredSections,
   contextMapToContext,
@@ -23,8 +30,29 @@ import {
   filterSensitive,
 } from "../../scripts/context-map.mjs";
 import {
+  CONTENT_DIR,
+  CONTENT_FILES,
+  ID_PREFIXES,
+} from "../../scripts/content-files.mjs";
+import {
+  NODE_ID_RE,
+  allocateNodeId,
+  emptyV3Content,
+  indexContextMap,
+  loadHandoffState,
+  parseContentFile,
+  reconcileV3State,
+  recoverIdCounters,
+  renderContentFile,
+  validateHandoffState,
+} from "../../scripts/handoff-state.mjs";
+import {
   GENERATED_MARKER,
+  V3_GENERATED_MARKER,
   buildContextJson,
+  buildInitialV3Files,
+  buildV3ContextJson,
+  generateV3Views,
   generateViews,
   sha256Hex,
   viewTamperWarnings,
@@ -38,23 +66,37 @@ import {
   planMigration,
 } from "../../scripts/migrate.mjs";
 import {
+  applyV3Migration,
+  detectLayout,
+  planV2ToV3Migration,
+} from "../../scripts/migrate-v3.mjs";
+import {
   SNAPSHOT_DIR,
   SNAPSHOT_RETENTION,
   buildSnapshot,
+  buildV3Snapshot,
   snapshotDigest,
+  v3SnapshotDigest,
   writeSnapshot,
+  writeV3Snapshot,
 } from "../../scripts/snapshots.mjs";
 import {
   DEFAULT_BUDGET,
+  EFFORT_LEVELS,
   MIN_BUDGET,
   compileContext,
   estimateTokens,
+  validateEffort,
 } from "../../scripts/context-compiler.mjs";
 import {
   DIFF_FORMATS,
+  V3_DIFF_CLASSES,
   diffStates,
+  diffV3States,
   renderDiffJson,
   renderDiffMarkdown,
+  renderV3DiffJson,
+  renderV3DiffMarkdown,
   runDiff,
 } from "../../scripts/context-diff.mjs";
 import {
@@ -81,6 +123,12 @@ export function assert(cond, msg) {
 export function assertEqual(actual, expected, msg) {
   if (actual !== expected) {
     throw new Error(`${msg || "not equal"}:\n  actual:   ${JSON.stringify(actual)}\n  expected: ${JSON.stringify(expected)}`);
+  }
+}
+
+export function assertNotEqual(actual, expected, msg) {
+  if (actual === expected) {
+    throw new Error(`${msg || "should differ"}: both sides are ${JSON.stringify(actual)}`);
   }
 }
 
@@ -1011,6 +1059,1583 @@ export function defineUnitTests(test, readFixture) {
     const second = await applyMigration(secondPlan, paths, io, { timestamp: "2026-07-26T01:00:00.000Z" });
     assert(!second.migrated, "second migration must not write");
     assertEqual(JSON.stringify([...io.store.entries()].sort()), snapshot, "second migration changed files");
+  });
+
+  // ── v3 canonical state (directory + content files) ─────────────────────────
+
+  const V3_FIXTURE = "v3/basic/.handoff";
+  const V3_DIR = "/v3proj/.handoff";
+  const readV3 = (rel) => readFixture(`${V3_FIXTURE}/${rel}`);
+
+  async function makeV3Io(overrides = {}) {
+    const seed = {};
+    seed[`${V3_DIR}/context-map.md`] = await readV3("context-map.md");
+    for (const name of Object.values(CONTENT_FILES)) {
+      seed[`${V3_DIR}/${CONTENT_DIR}/${name}`] = await readV3(`${CONTENT_DIR}/${name}`);
+    }
+    for (const [path, content] of Object.entries(overrides)) {
+      if (content == null) delete seed[path];
+      else seed[path] = content;
+    }
+    return makeFakeIo(seed);
+  }
+
+  async function loadError(io) {
+    try {
+      await loadHandoffState(io, V3_DIR);
+    } catch (err) {
+      return err;
+    }
+    return null;
+  }
+
+  test("v3 registry: eight content files and ID prefixes in deterministic section order", () => {
+    assertEqual(
+      JSON.stringify(Object.keys(CONTENT_FILES)),
+      JSON.stringify(["goals", "status", "tasks", "decisions", "questions", "risks", "notes", "excluded"]),
+      "CONTENT_FILES must cover the eight semantic sections in deterministic order"
+    );
+    assertEqual(JSON.stringify(Object.keys(ID_PREFIXES)), JSON.stringify(Object.keys(CONTENT_FILES)));
+    assertEqual(CONTENT_FILES.goals, "current-goal.md");
+    assertEqual(CONTENT_FILES.status, "current-status.md");
+    assertEqual(CONTENT_FILES.tasks, "tasks.md");
+    assertEqual(CONTENT_FILES.decisions, "decisions.md");
+    assertEqual(CONTENT_FILES.questions, "open-questions.md");
+    assertEqual(CONTENT_FILES.risks, "risks.md");
+    assertEqual(CONTENT_FILES.notes, "knowledge-notes.md");
+    assertEqual(CONTENT_FILES.excluded, "excluded.md");
+    assertEqual(ID_PREFIXES.goals, "goal");
+    assertEqual(ID_PREFIXES.notes, "note");
+    assertEqual(JSON.stringify([...V3_SECTION_KEYS]), JSON.stringify(Object.keys(CONTENT_FILES)));
+    assert(Object.isFrozen(CONTENT_FILES) && Object.isFrozen(ID_PREFIXES), "registries must be immutable");
+    for (const key of V3_SECTION_KEYS) {
+      assert(V3_SECTION_LABELS[key] && V3_SECTION_LABELS[key].en, `missing labels for '${key}'`);
+      assertEqual(v3SectionKeyForLabel(V3_SECTION_LABELS[key].en), key, `label lookup broken for '${key}'`);
+    }
+    assertEqual(v3SectionKeyForLabel(V3_SECTION_LABELS.goals.zh), "goals", "localized label must resolve");
+    assertEqual(v3SectionKeyForLabel(V3_SECTION_LABELS.notes.zh), "notes", "localized label must resolve");
+  });
+
+  test("v3 grammar: NODE_ID_RE accepts short prefixed IDs and rejects the rest", () => {
+    for (const ok of ["goal1", "status2", "task10", "decision3", "question4", "risk5", "note6", "excluded7"]) {
+      assert(NODE_ID_RE.test(ok), `'${ok}' must be a valid node ID`);
+    }
+    for (const bad of ["task0", "task01", "foo1", "TASK1", "task", "task-1", "1task", "task 1", "", "goal1x"]) {
+      assert(!NODE_ID_RE.test(bad), `'${bad}' must be rejected`);
+    }
+  });
+
+  test("v3 parse: directory exposes eight sections with stable IDs and no bodies", async () => {
+    const map = parseContextMapV3(await readV3("context-map.md"));
+    assert(map, "expected a parsed v3 map");
+    assertEqual(
+      JSON.stringify(Object.keys(map.sections)),
+      JSON.stringify([...V3_SECTION_KEYS]),
+      "sections must appear in deterministic order"
+    );
+
+    const task = map.sections.tasks[0];
+    assertEqual(task.id, "task1");
+    assertEqual(task.label, "Complete the v3 storage migration");
+    assertEqual(task.checked, false);
+    assertEqual(task.priority, "high");
+    assertEqual(task.depth, 0);
+    for (const field of ["text", "body", "summary"]) {
+      assert(!(field in task), `directory node must not carry '${field}'`);
+    }
+
+    const child = map.sections.tasks[1];
+    assertEqual(child.id, "task2");
+    assertEqual(child.depth, 1, "hierarchy must survive the parse");
+    assertEqual(child.checked, true);
+
+    assertEqual(map.sections.goals[0].id, "goal1");
+    assertEqual(map.sections.goals[0].label, "Ship the v3 context directory release");
+    assertEqual(map.sections.status[0].id, "status1");
+    assertEqual(map.sections.decisions[0].id, "decision1");
+    assertEqual(map.sections.questions[0].id, "question1");
+    assertEqual(map.sections.risks[0].id, "risk1");
+    assertEqual(map.sections.risks[0].severity, "high", "risk severity must parse");
+    assertEqual(map.sections.notes[0].id, "note1");
+    assertEqual(map.sections.excluded[0].id, "excluded1");
+  });
+
+  test("v3 parse: an empty Current Goal section is valid", () => {
+    const empty = emptyContextMapV3();
+    empty.sections.tasks.push({ id: "task1", label: "Only task", origin: "user", depth: 0, checked: false });
+    const map = parseContextMapV3(renderContextMapV3(empty));
+    assert(map, "a map without goal nodes must still parse");
+    assertEqual(map.sections.goals.length, 0, "empty Current Goal must stay empty");
+    assertEqual(map.sections.tasks[0].id, "task1");
+  });
+
+  test("v3 render/parse: round-trip preserves IDs, labels, hierarchy, state, and metadata", async () => {
+    const before = parseContextMapV3(await readV3("context-map.md"));
+    for (const lang of ["en", "zh"]) {
+      const after = parseContextMapV3(renderContextMapV3(before, { lang }));
+      assertEqual(
+        JSON.stringify(Object.keys(after.sections)),
+        JSON.stringify([...V3_SECTION_KEYS]),
+        `section order drifted (lang=${lang})`
+      );
+      for (const key of V3_SECTION_KEYS) {
+        assertEqual(after.sections[key].length, before.sections[key].length, `node count drift in ${key} (lang=${lang})`);
+        for (let i = 0; i < before.sections[key].length; i++) {
+          const a = after.sections[key][i];
+          const b = before.sections[key][i];
+          for (const field of ["id", "label", "depth", "checked", "priority", "severity", "origin"]) {
+            assertEqual(a[field], b[field], `${field} drift in ${key}[${i}] (lang=${lang})`);
+          }
+        }
+      }
+    }
+    const rendered = renderContextMapV3(before);
+    assertIncludes(rendered, "- [ ] `task1` **high** Complete the v3 storage migration");
+    assertIncludes(rendered, "- `decision1` Context Map is the semantic directory");
+    assertIncludes(rendered, "v3.0.0");
+  });
+
+  test("v3 render/parse: agent ownership markers round-trip and edits transfer ownership", () => {
+    const map = emptyContextMapV3();
+    map.sections.tasks.push({ id: "task9", label: "Agent inferred task", origin: "agent", depth: 0, checked: false });
+    const rendered = renderContextMapV3(map);
+    assertIncludes(rendered, AGENT_MARKER, "agent node must carry the ownership marker");
+
+    const parsed = parseContextMapV3(rendered);
+    assertEqual(parsed.sections.tasks[0].origin, "agent", "fresh agent node must stay agent-owned");
+
+    const edited = rendered.replace("Agent inferred task", "User refined task");
+    const reparsed = parseContextMapV3(edited);
+    assertEqual(reparsed.sections.tasks[0].origin, "user", "editing the label must transfer ownership");
+    assertEqual(reparsed.sections.tasks[0].id, "task9", "ownership transfer must keep the ID");
+  });
+
+  test("v3 content: entries are addressed by stable node ID with summary/body split", async () => {
+    const entries = parseContentFile(await readV3(`${CONTENT_DIR}/tasks.md`), "tasks");
+    assertEqual(entries.length, 2, "expected two task entries");
+    assertEqual(entries[0].id, "task1");
+    assertEqual(
+      entries[0].summary,
+      "Split embedded v2 Context Map semantics into section body files without losing hierarchy or text."
+    );
+    assertIncludes(entries[0].body, "temporary siblings");
+    assertEqual(entries[1].id, "task2");
+    assertEqual(entries[1].summary, "Use short, stable, monotonically increasing IDs for node addressing.");
+    assertEqual(entries[1].body, "", "single-paragraph entry has summary only");
+    for (const entry of entries) {
+      assert(!("label" in entry), "content entries must not duplicate the node label");
+    }
+  });
+
+  test("v3 content: render/parse round-trip preserves every entry verbatim", async () => {
+    for (const key of V3_SECTION_KEYS) {
+      const entries = parseContentFile(await readV3(`${CONTENT_DIR}/${CONTENT_FILES[key]}`), key);
+      const rendered = renderContentFile(key, entries);
+      const reparsed = parseContentFile(rendered, key);
+      assertEqual(reparsed.length, entries.length, `entry count drift in ${key}`);
+      for (let i = 0; i < entries.length; i++) {
+        for (const field of ["id", "summary", "body", "origin"]) {
+          assertEqual(reparsed[i][field], entries[i][field], `${field} drift in ${key}[${i}]`);
+        }
+      }
+      assertIncludes(rendered, `## ${entries[0].id}`, `entry heading missing in ${key}`);
+    }
+  });
+
+  test("v3 content: agent body markers round-trip and body edits transfer ownership", () => {
+    const entries = [{ id: "note3", summary: "Agent summary.", body: "Agent detail.", origin: "agent" }];
+    const rendered = renderContentFile("notes", entries);
+    assertIncludes(rendered, AGENT_MARKER);
+    const parsed = parseContentFile(rendered, "notes");
+    assertEqual(parsed[0].origin, "agent");
+
+    const edited = rendered.replace("Agent detail.", "User edited detail.");
+    const reparsed = parseContentFile(edited, "notes");
+    assertEqual(reparsed[0].origin, "user", "editing the body must transfer ownership");
+    assertEqual(reparsed[0].summary, "Agent summary.", "summary must survive a body edit");
+  });
+
+  test("v3 state: loadHandoffState joins the directory and content by stable ID", async () => {
+    const io = await makeV3Io();
+    const state = await loadHandoffState(io, V3_DIR);
+    assertEqual(state.version, V3_PROTOCOL_VERSION);
+    assertEqual(state.diagnostics.length, 0, `unexpected diagnostics: ${JSON.stringify(state.diagnostics)}`);
+    assertEqual(state.map.sections.tasks[0].id, "task1");
+    assertEqual(state.content.tasks[0].id, "task1");
+    assertIncludes(state.content.tasks[0].body, "temporary siblings");
+    assertEqual(state.content.goals[0].summary, "Release Handoff Protocol v3.0.0 with the Context Map as a semantic directory.");
+    for (const key of V3_SECTION_KEYS) {
+      assert(Array.isArray(state.content[key]), `missing content bucket '${key}'`);
+    }
+  });
+
+  test("v3 state: indexContextMap resolves every Map ID to its section", async () => {
+    const map = parseContextMapV3(await readV3("context-map.md"));
+    const index = indexContextMap(map);
+    assertEqual(index.duplicates.length, 0, "fixture must not contain duplicate IDs");
+    assertEqual(index.invalid.length, 0, "fixture must not contain invalid IDs");
+    assertEqual(index.byId.get("task1").sectionKey, "tasks");
+    assertEqual(index.byId.get("task2").sectionKey, "tasks");
+    assertEqual(index.byId.get("goal1").sectionKey, "goals");
+    assertEqual(index.byId.get("note1").sectionKey, "notes");
+  });
+
+  test("v3 state: missing required content files fail with an actionable diagnostic", async () => {
+    const io = await makeV3Io({ [`${V3_DIR}/${CONTENT_DIR}/risks.md`]: null });
+    const err = await loadError(io);
+    assert(err, "a missing content file must fail the load");
+    assertIncludes(err.message, "risks.md", "error must name the missing file");
+    assert(/missing/i.test(err.message), "error must call the file missing");
+  });
+
+  test("v3 state: duplicate IDs in the directory fail with an actionable diagnostic", async () => {
+    const dup = (await readV3("context-map.md")).replace(
+      "- `excluded1` No vector database in v3",
+      "- `excluded1` No vector database in v3\n- `task1` Duplicate ID reference"
+    );
+    const err = await loadError(await makeV3Io({ [`${V3_DIR}/context-map.md`]: dup }));
+    assert(err, "duplicate Map IDs must fail the load");
+    assertIncludes(err.message, "task1");
+    assert(/duplicate/i.test(err.message));
+  });
+
+  test("v3 state: unknown and malformed node IDs fail with an actionable diagnostic", async () => {
+    for (const badId of ["foo9", "task0"]) {
+      const broken = (await readV3("context-map.md")).replace("`task1`", `\`${badId}\``);
+      const err = await loadError(await makeV3Io({ [`${V3_DIR}/context-map.md`]: broken }));
+      assert(err, `invalid ID '${badId}' must fail the load`);
+      assertIncludes(err.message, badId, `error must name '${badId}'`);
+      assert(/ID_INVALID|invalid/i.test(err.message), `error must flag the ID as invalid: ${err.message}`);
+    }
+  });
+
+  test("v3 state: cross-section ID prefixes fail with an actionable diagnostic", async () => {
+    // A risk-prefixed entry inside the tasks content file with no matching Map move.
+    const misplaced = "# Tasks\n\n## risk1\n\nMisplaced body.\n";
+    const err = await loadError(await makeV3Io({ [`${V3_DIR}/${CONTENT_DIR}/tasks.md`]: misplaced }));
+    assert(err, "a cross-section body prefix must fail the load");
+    assertIncludes(err.message, "risk1");
+    assert(/CONTENT_MISPLACED|misplaced|section/i.test(err.message), `error must explain the mismatch: ${err.message}`);
+  });
+
+  test("v3 state: the same ID in two content files fails as CONTENT_DUPLICATE", async () => {
+    const dup = (await readV3(`${CONTENT_DIR}/decisions.md`)) + "\n## task1\n\nDuplicate body.\n";
+    const err = await loadError(await makeV3Io({ [`${V3_DIR}/${CONTENT_DIR}/decisions.md`]: dup }));
+    assert(err, "an ID in two body files must fail the load");
+    assertIncludes(err.message, "task1");
+    assertIncludes(err.message, "CONTENT_DUPLICATE");
+  });
+
+  test("v3 state: missing bodies and orphan content are diagnostics, not failures", async () => {
+    // Map references task3 with no body; content gains an unreferenced entry.
+    const withRef = (await readV3("context-map.md")).replace(
+      "  - [x] `task2` Define node addressing",
+      "  - [x] `task2` Define node addressing\n- [ ] `task3` Document the layout"
+    );
+    const orphanNotes = (await readV3(`${CONTENT_DIR}/knowledge-notes.md`)) + "\n## note9\n\nOrphaned note body.\n";
+    const io = await makeV3Io({
+      [`${V3_DIR}/context-map.md`]: withRef,
+      [`${V3_DIR}/${CONTENT_DIR}/knowledge-notes.md`]: orphanNotes,
+    });
+    const state = await loadHandoffState(io, V3_DIR);
+    const diag = state.diagnostics.join("\n");
+    assertIncludes(diag, "CONTENT_MISSING", "missing body must be diagnosed");
+    assertIncludes(diag, "task3");
+    assertIncludes(diag, "CONTENT_ORPHAN", "orphan body must be diagnosed");
+    assertIncludes(diag, "note9");
+    assertEqual(state.content.notes.at(-1).id, "note9", "orphan content must be retained, not deleted");
+  });
+
+  test("v3 state: a non-empty body without a first-paragraph summary is diagnosed", async () => {
+    const noSummary = "# Risks\n\n## risk1\n\n### Details first\n\nA body with no summary paragraph.\n";
+    const io = await makeV3Io({ [`${V3_DIR}/${CONTENT_DIR}/risks.md`]: noSummary });
+    const state = await loadHandoffState(io, V3_DIR);
+    const diag = state.diagnostics.join("\n");
+    assertIncludes(diag, "CONTENT_SUMMARY_MISSING");
+    assertIncludes(diag, "risk1");
+    const entry = state.content.risks[0];
+    assertEqual(entry.summary, "");
+    assertIncludes(entry.body, "Details first");
+  });
+
+  test("v3 state: a node moved across sections keeps its ID and resolves its body", async () => {
+    // task1 moves to Knowledge and Notes; its body moves to knowledge-notes.md,
+    // still keyed `task1`. The historical prefix no longer matches the section.
+    const moved = (await readV3("context-map.md")).replace(
+      "- [ ] `task1` **high** Complete the v3 storage migration\n",
+      ""
+    ).replace(
+      "- `note1` Deno and Node share one canonical state loader",
+      "- `task1` Complete the v3 storage migration\n- `note1` Deno and Node share one canonical state loader"
+    );
+    const movedBody = (await readV3(`${CONTENT_DIR}/tasks.md`)).replace(
+      /## task1\n[\s\S]*?(?=## task2)/,
+      ""
+    );
+    const notesBody = (await readV3(`${CONTENT_DIR}/knowledge-notes.md`)) +
+      "\n## task1\n\nSplit embedded v2 Context Map semantics into section body files without losing hierarchy or text.\n\nMigration builds the complete v3 state in temporary siblings, verifies every reference, and installs it atomically.\n";
+    const io = await makeV3Io({
+      [`${V3_DIR}/context-map.md`]: moved,
+      [`${V3_DIR}/${CONTENT_DIR}/tasks.md`]: movedBody,
+      [`${V3_DIR}/${CONTENT_DIR}/knowledge-notes.md`]: notesBody,
+    });
+    const state = await loadHandoffState(io, V3_DIR);
+    assertEqual(state.diagnostics.length, 0, `a legal move must not be diagnosed: ${JSON.stringify(state.diagnostics)}`);
+    assertEqual(state.map.sections.notes[0].id, "task1", "moved node must keep its ID");
+    assertEqual(state.map.sections.notes[0].checked, undefined, "a non-task section node carries no checkbox");
+    assertIncludes(state.content.notes.at(-1).body, "temporary siblings");
+  });
+
+  test("v3 state: validateHandoffState reports soft issues without throwing", async () => {
+    const io = await makeV3Io();
+    const state = await loadHandoffState(io, V3_DIR);
+    assertEqual(JSON.stringify(validateHandoffState(state)), JSON.stringify([]), "clean fixture must validate clean");
+    state.content.excluded.push({ id: "excluded9", summary: "Orphan.", body: "", origin: "user" });
+    const diag = validateHandoffState(state).join("\n");
+    assertIncludes(diag, "CONTENT_ORPHAN");
+    assertIncludes(diag, "excluded9");
+  });
+
+  // ── v3 stable IDs and ownership-aware reconciliation ───────────────────────
+
+  function makeV3State({ sections = {}, content = {} } = {}) {
+    const map = emptyContextMapV3();
+    for (const [key, nodes] of Object.entries(sections)) map.sections[key] = nodes;
+    const bodies = emptyV3Content();
+    for (const [key, entries] of Object.entries(content)) bodies[key] = entries;
+    return { version: V3_PROTOCOL_VERSION, map, content: bodies, diagnostics: [] };
+  }
+
+  test("v3 ids: allocation starts at 1 per section prefix and never fills holes", () => {
+    const counters = {};
+    assertEqual(allocateNodeId("tasks", counters), "task1");
+    assertEqual(allocateNodeId("tasks", counters), "task2");
+    assertEqual(allocateNodeId("goals", counters), "goal1");
+    assertEqual(allocateNodeId("status", counters), "status1");
+    assertEqual(allocateNodeId("decisions", counters), "decision1");
+    assertEqual(allocateNodeId("questions", counters), "question1");
+    assertEqual(allocateNodeId("risks", counters), "risk1");
+    assertEqual(allocateNodeId("notes", counters), "note1");
+    assertEqual(allocateNodeId("excluded", counters), "excluded1");
+    // Holes are never filled and counters never decrement.
+    const holed = { task: 5 };
+    assertEqual(allocateNodeId("tasks", holed), "task6");
+    let threw = false;
+    try {
+      allocateNodeId("bogus", {});
+    } catch (err) {
+      threw = true;
+      assertIncludes(err.message, "bogus");
+    }
+    assert(threw, "unknown section must be rejected");
+  });
+
+  test("v3 ids: counters recover from live nodes, bodies, and historical metadata", async () => {
+    const state = await loadHandoffState(await makeV3Io(), V3_DIR);
+
+    const missing = recoverIdCounters(state, null);
+    assertEqual(missing.counters.goal, 1);
+    assertEqual(missing.counters.status, 1);
+    assertEqual(missing.counters.task, 2);
+    assertEqual(missing.counters.decision, 1);
+    assertEqual(missing.counters.question, 1);
+    assertEqual(missing.counters.risk, 1);
+    assertEqual(missing.counters.note, 1);
+    assertEqual(missing.counters.excluded, 1);
+    assert(missing.recovered, "missing metadata counters must be reconstructed");
+
+    const healthy = recoverIdCounters(state, { idCounters: { task: 7, goal: 1 } });
+    assertEqual(healthy.counters.task, 7, "stored counters win when they exceed live state");
+    assertEqual(healthy.counters.goal, 1);
+    assert(!healthy.recovered, "valid metadata counters are not a recovery");
+
+    const ahead = recoverIdCounters(state, { idCounters: { task: 1 } });
+    assertEqual(ahead.counters.task, 2, "live nodes raise a stale counter");
+    assert(!ahead.recovered);
+
+    const damaged = recoverIdCounters(state, { idCounters: "garbage" });
+    assertEqual(damaged.counters.task, 2, "damaged metadata falls back to live state");
+    assert(damaged.recovered, "damaged metadata counters must be flagged as recovered");
+  });
+
+  test("v3 reconcile: renamed and moved nodes keep their IDs", () => {
+    const existing = makeV3State({
+      sections: {
+        tasks: [{ id: "task1", label: "Renamed by the user", origin: "user", depth: 0, checked: false }],
+        notes: [{ id: "task2", label: "Moved into notes", origin: "user", depth: 0 }],
+      },
+      content: {
+        tasks: [{ id: "task1", summary: "Original summary.", body: "Original body.", origin: "user" }],
+        notes: [{ id: "task2", summary: "Moved summary.", body: "", origin: "user" }],
+      },
+    });
+    const result = reconcileV3State({ existing, inferred: {} });
+    assertEqual(result.map.sections.tasks.length, 1);
+    assertEqual(result.map.sections.tasks[0].id, "task1", "a rename must keep the ID");
+    assertEqual(result.map.sections.tasks[0].label, "Renamed by the user");
+    assertEqual(result.map.sections.notes[0].id, "task2", "a move must keep the ID");
+    assertEqual(result.content.tasks[0].summary, "Original summary.", "user body must be untouched");
+    assertEqual(result.content.notes[0].id, "task2", "the body follows its node to the new section");
+    assertEqual(
+      result.content.tasks.filter((e) => e.id === "task2").length,
+      0,
+      "a moved body must not linger in the old section"
+    );
+  });
+
+  test("v3 reconcile: a task state flip changes only the directory", () => {
+    const existing = makeV3State({
+      sections: {
+        tasks: [{ id: "task1", label: "Wire the migration", origin: "agent", depth: 0, checked: false }],
+      },
+      content: {
+        tasks: [{ id: "task1", summary: "Keep this summary.", body: "Keep this body.", origin: "agent" }],
+      },
+    });
+    const result = reconcileV3State({
+      existing,
+      inferred: { tasks: [{ label: "Wire the migration", checked: true }] },
+    });
+    assertEqual(result.map.sections.tasks.length, 1, "state flip must not duplicate the node");
+    assertEqual(result.map.sections.tasks[0].id, "task1");
+    assertEqual(result.map.sections.tasks[0].checked, true);
+    assertEqual(result.content.tasks[0].summary, "Keep this summary.", "content must be untouched");
+    assertEqual(result.content.tasks[0].body, "Keep this body.", "content must be untouched");
+  });
+
+  test("v3 reconcile: a summary/body update changes only the content entry", () => {
+    const existing = makeV3State({
+      sections: {
+        notes: [{ id: "note1", label: "Shared loader", origin: "agent", depth: 0 }],
+      },
+      content: {
+        notes: [{ id: "note1", summary: "Old summary.", body: "Old body.", origin: "agent" }],
+      },
+    });
+    const result = reconcileV3State({
+      existing,
+      inferred: { notes: [{ label: "Shared loader", summary: "New summary.", body: "New body." }] },
+    });
+    const node = result.map.sections.notes[0];
+    assertEqual(node.id, "note1");
+    assertEqual(node.label, "Shared loader");
+    assertEqual(node.depth, 0);
+    assertEqual(result.content.notes[0].summary, "New summary.");
+    assertEqual(result.content.notes[0].body, "New body.");
+  });
+
+  test("v3 reconcile: a user-edited label wins over an inferred replacement", () => {
+    const existing = makeV3State({
+      sections: {
+        tasks: [{ id: "task1", label: "User refined label", origin: "user", depth: 0, checked: false }],
+      },
+      content: {
+        tasks: [{ id: "task1", summary: "User summary.", body: "", origin: "user" }],
+      },
+    });
+    const result = reconcileV3State({
+      existing,
+      inferred: { tasks: [{ label: "Agent replacement", summary: "Agent summary." }] },
+    });
+    assertEqual(result.map.sections.tasks.length, 2, "the inference is appended, never a takeover");
+    assertEqual(result.map.sections.tasks[0].id, "task1");
+    assertEqual(result.map.sections.tasks[0].label, "User refined label");
+    assertEqual(result.map.sections.tasks[1].origin, "agent");
+    assertEqual(result.map.sections.tasks[1].label, "Agent replacement");
+    assertNotEqual(
+      result.map.sections.tasks[1].id,
+      "task1",
+      "the appended inference must allocate a fresh ID"
+    );
+    assertEqual(result.content.tasks[0].summary, "User summary.", "user body must win");
+  });
+
+  test("v3 reconcile: id-targeted inference against a user-owned node is rejected", () => {
+    const existing = makeV3State({
+      sections: {
+        decisions: [{ id: "decision1", label: "User decision", origin: "user", depth: 0 }],
+      },
+      content: {
+        decisions: [{ id: "decision1", summary: "User rationale.", body: "", origin: "user" }],
+      },
+    });
+    const result = reconcileV3State({
+      existing,
+      inferred: { decisions: [{ id: "decision1", label: "Agent override", summary: "Agent rationale." }] },
+    });
+    assertEqual(result.map.sections.decisions.length, 1);
+    assertEqual(result.map.sections.decisions[0].label, "User decision");
+    assertEqual(result.content.decisions[0].summary, "User rationale.");
+    const diag = result.diagnostics.join("\n");
+    assertIncludes(diag, "INFERENCE_REJECTED");
+    assertIncludes(diag, "decision1");
+  });
+
+  test("v3 reconcile: a deleted node is not recreated from its leftover body", () => {
+    const existing = makeV3State({
+      sections: { tasks: [] },
+      content: { tasks: [{ id: "task5", summary: "Leftover body.", body: "", origin: "agent" }] },
+    });
+    const result = reconcileV3State({ existing, inferred: {} });
+    assertEqual(result.map.sections.tasks.length, 0, "the deleted node must stay deleted");
+    assertEqual(result.content.tasks.length, 1, "the orphan body is retained, never auto-deleted");
+    assertEqual(result.content.tasks[0].id, "task5");
+    const diag = result.diagnostics.join("\n");
+    assertIncludes(diag, "CONTENT_ORPHAN");
+    assertIncludes(diag, "task5");
+  });
+
+  test("v3 reconcile: deleted IDs are never reused for new nodes", () => {
+    const existing = makeV3State({
+      sections: {
+        tasks: [{ id: "task1", label: "Survivor", origin: "user", depth: 0, checked: false }],
+      },
+      content: { tasks: [{ id: "task1", summary: "S.", body: "", origin: "user" }] },
+    });
+    const result = reconcileV3State({
+      existing,
+      inferred: { tasks: [{ label: "Brand new task" }] },
+      metadata: { idCounters: { task: 3 } },
+    });
+    const appended = result.map.sections.tasks.at(-1);
+    assertEqual(appended.label, "Brand new task");
+    assertEqual(appended.id, "task4", "allocation must continue past the historical high-water mark");
+    assertEqual(result.counters.task, 4);
+  });
+
+  test("v3 reconcile: empty Current Goal stays empty without an explicit user goal", () => {
+    const inferred = {
+      goals: [{ label: "release: prepare 3.0.0" }],
+      status: [{ label: "in-progress" }],
+    };
+    const result = reconcileV3State({ existing: null, inferred });
+    assertEqual(result.map.sections.goals.length, 0, "inference must never invent a goal");
+    const diag = result.diagnostics.join("\n");
+    assertIncludes(diag, "INFERENCE_REJECTED", "the rejected goal inference must be reported");
+
+    const explicit = reconcileV3State({ existing: null, inferred: {}, userIntent: { goal: "Ship v3" } });
+    assertEqual(explicit.map.sections.goals.length, 1);
+    assertEqual(explicit.map.sections.goals[0].id, "goal1");
+    assertEqual(explicit.map.sections.goals[0].label, "Ship v3");
+    assertEqual(explicit.map.sections.goals[0].origin, "user", "an explicit goal is user-owned");
+
+    const updated = reconcileV3State({
+      existing: explicit,
+      inferred: { goals: [{ label: "commit-derived goal" }] },
+      userIntent: { goal: "Ship v3.0.0 instead" },
+    });
+    assertEqual(updated.map.sections.goals.length, 1, "singleton goal must not duplicate");
+    assertEqual(updated.map.sections.goals[0].id, "goal1", "an explicit goal update keeps the ID");
+    assertEqual(updated.map.sections.goals[0].label, "Ship v3.0.0 instead");
+  });
+
+  test("v3 reconcile: user-owned status suppresses inference like v2 singletons", () => {
+    const existing = makeV3State({
+      sections: { status: [{ id: "status1", label: "User status", origin: "user", depth: 0 }] },
+      content: { status: [{ id: "status1", summary: "User status body.", body: "", origin: "user" }] },
+    });
+    const result = reconcileV3State({
+      existing,
+      inferred: { status: [{ label: "in-progress - 3 file(s) modified" }] },
+    });
+    assertEqual(result.map.sections.status.length, 1);
+    assertEqual(result.map.sections.status[0].label, "User status");
+
+    const agentExisting = makeV3State({
+      sections: { status: [{ id: "status1", label: "old status", origin: "agent", depth: 0 }] },
+      content: { status: [{ id: "status1", summary: "old", body: "", origin: "agent" }] },
+    });
+    const updated = reconcileV3State({
+      existing: agentExisting,
+      inferred: { status: [{ label: "in-progress - 3 file(s) modified" }] },
+    });
+    assertEqual(updated.map.sections.status.length, 1, "agent status is updated in place");
+    assertEqual(updated.map.sections.status[0].id, "status1", "status update keeps the ID");
+    assertEqual(updated.map.sections.status[0].label, "in-progress - 3 file(s) modified");
+  });
+
+  test("v3 reconcile: semantic duplicates are not appended", () => {
+    const existing = makeV3State({
+      sections: { excluded: [{ id: "excluded1", label: "No vector database in v3", origin: "user", depth: 0 }] },
+      content: { excluded: [{ id: "excluded1", summary: "S.", body: "", origin: "user" }] },
+    });
+    const result = reconcileV3State({
+      existing,
+      inferred: { excluded: [{ label: "**high** No vector database in v3." }] },
+    });
+    assertEqual(result.map.sections.excluded.length, 1, "a semantic duplicate must not be appended");
+  });
+
+  test("v3 reconcile: user-owned bodies are never overwritten by inference", () => {
+    const existing = makeV3State({
+      sections: {
+        tasks: [{ id: "task1", label: "Stable task", origin: "user", depth: 0, checked: false }],
+      },
+      content: { tasks: [{ id: "task1", summary: "User body.", body: "User detail.", origin: "user" }] },
+    });
+    const result = reconcileV3State({
+      existing,
+      inferred: { tasks: [{ label: "Stable task", summary: "Agent rewrite.", body: "Agent detail." }] },
+    });
+    assertEqual(result.map.sections.tasks.length, 1);
+    assertEqual(result.content.tasks[0].summary, "User body.");
+    assertEqual(result.content.tasks[0].body, "User detail.");
+    assertIncludes(result.diagnostics.join("\n"), "INFERENCE_REJECTED");
+  });
+
+  test("v3 reconcile: output renders and reparses through the production parsers", () => {
+    const existing = makeV3State({
+      sections: {
+        tasks: [
+          { id: "task1", label: "Parent", origin: "user", depth: 0, checked: false, priority: "high" },
+          { id: "task2", label: "Child", origin: "agent", depth: 1, checked: true },
+        ],
+        risks: [{ id: "risk1", label: "Risky", origin: "agent", depth: 0, severity: "high" }],
+      },
+      content: {
+        tasks: [
+          { id: "task1", summary: "Parent summary.", body: "Parent body.", origin: "user" },
+          { id: "task2", summary: "Child summary.", body: "", origin: "agent" },
+        ],
+        risks: [{ id: "risk1", summary: "Risk summary.", body: "", origin: "agent" }],
+      },
+    });
+    const result = reconcileV3State({
+      existing,
+      inferred: { tasks: [{ label: "Fresh task", summary: "Fresh summary." }] },
+    });
+    const reparsed = parseContextMapV3(renderContextMapV3(result.map));
+    for (const key of V3_SECTION_KEYS) {
+      assertEqual(reparsed.sections[key].length, result.map.sections[key].length, `drift in ${key}`);
+    }
+    for (const key of V3_SECTION_KEYS) {
+      const rendered = renderContentFile(key, result.content[key]);
+      const entries = parseContentFile(rendered, key);
+      assertEqual(entries.length, result.content[key].length, `content drift in ${key}`);
+    }
+    const fresh = result.map.sections.tasks.at(-1);
+    assertEqual(fresh.id, "task3", "the new task continues the sequence");
+    assertEqual(fresh.origin, "agent");
+    assertEqual(result.counters.task, 3);
+  });
+
+  // ── v3 views, metadata, and initial layout ─────────────────────────────────
+
+  const V3_META = {
+    timestamp: "2026-08-02T00:00:00.000Z",
+    agent: "test-agent",
+    project: "fixture-app",
+    lang: "en",
+    git: { branch: "feature/v3", latest_commit: "abc1234", commit_message: "feat: v3", is_dirty: false },
+  };
+
+  test("v3 init: the initial layout holds the Map, eight content files, the view, and metadata", () => {
+    const files = buildInitialV3Files({ project: "demo", timestamp: V3_META.timestamp, agent: "test", lang: "en" });
+    const names = Object.keys(files).sort();
+
+    assert(names.includes("context-map.md"), "Context Map missing from the initial layout");
+    for (const name of Object.values(CONTENT_FILES)) {
+      assert(names.includes(`${CONTENT_DIR}/${name}`), `content/${name} missing from the initial layout`);
+    }
+    assert(names.includes(`${"views"}/HANDOFF.md`), "views/HANDOFF.md missing from the initial layout");
+    assert(names.includes("context.json"), "context.json missing from the initial layout");
+
+    // No legacy root-level views in a fresh v3 directory.
+    for (const legacy of ["HANDOFF.md", "tasks.md", "decisions.md"]) {
+      assert(!names.includes(legacy), `legacy root file '${legacy}' must not be created in v3`);
+    }
+
+    // The initial Map parses, has all eight sections, and an empty Current Goal.
+    const map = parseContextMapV3(files["context-map.md"]);
+    assert(map, "initial Context Map must parse");
+    assertEqual(map.sections.goals.length, 0, "initial Current Goal must be empty");
+    for (const key of V3_SECTION_KEYS) {
+      assertEqual(map.sections[key].length, 0, `initial section '${key}' must be empty`);
+      const entries = parseContentFile(files[`${CONTENT_DIR}/${CONTENT_FILES[key]}`], key);
+      assertEqual(entries.length, 0, `initial content file for '${key}' must have no entries`);
+    }
+
+    const json = JSON.parse(files["context.json"]);
+    assertEqual(json.protocolVersion, "3.0.0");
+    assert(json.idCounters && typeof json.idCounters === "object", "initial counters missing");
+    for (const prefix of Object.values(ID_PREFIXES)) {
+      assertEqual(json.idCounters[prefix], 0, `initial counter for '${prefix}' must be 0`);
+    }
+  });
+
+  test("v3 views: HANDOFF.md is deterministic and carries a prominent do-not-edit notice", async () => {
+    const state = await loadHandoffState(await makeV3Io(), V3_DIR);
+    const first = generateV3Views(state, V3_META);
+    const second = generateV3Views(state, V3_META);
+
+    assertEqual(JSON.stringify(Object.keys(first)), JSON.stringify(["views/HANDOFF.md"]));
+    const handoff = first["views/HANDOFF.md"];
+    assertEqual(second["views/HANDOFF.md"], handoff, "v3 view generation is not deterministic");
+    assert(handoff.startsWith(V3_GENERATED_MARKER), "view must start with the generated marker");
+    assert(/do not edit/i.test(handoff), "view must carry a do-not-edit notice");
+    assert(/context-map\.md/.test(handoff) && /content\//.test(handoff), "notice must point at the Map and content files");
+
+    // Every node appears with label, summary, and body in stable section order.
+    const tasksAt = handoff.indexOf("## Tasks");
+    const decisionsAt = handoff.indexOf("## Decisions");
+    assert(tasksAt > -1 && decisionsAt > tasksAt, "sections must follow the canonical order");
+    assertIncludes(handoff, "task1");
+    assertIncludes(handoff, "Complete the v3 storage migration");
+    assertIncludes(handoff, "Split embedded v2 Context Map semantics into section body files without losing hierarchy or text.");
+    assertIncludes(handoff, "temporary siblings");
+    assertIncludes(handoff, "decision1");
+    assertIncludes(handoff, "Context Map is the semantic directory");
+    assertIncludes(handoff, "**Branch**: feature/v3");
+  });
+
+  test("v3 views: an empty Current Goal renders a documented placeholder", () => {
+    const files = buildInitialV3Files({ project: "demo", timestamp: V3_META.timestamp, agent: "test", lang: "en" });
+    assertIncludes(files["views/HANDOFF.md"], "No explicit goal set.");
+  });
+
+  test("v3 metadata: context.json carries the protocol version, counters, and every file hash", async () => {
+    const state = await loadHandoffState(await makeV3Io(), V3_DIR);
+    const json = buildV3ContextJson({
+      state,
+      project: V3_META.project,
+      git: V3_META.git,
+      environment: { timestamp: V3_META.timestamp, agent: V3_META.agent, lang: "en" },
+      diagnostics: {},
+    });
+
+    assertEqual(json.protocolVersion, "3.0.0");
+    assertEqual(json.timestamp, V3_META.timestamp);
+    assertEqual(json.agent, "test-agent");
+    assertEqual(json.project, "fixture-app");
+    assertEqual(json.git.branch, "feature/v3");
+
+    // Monotonic ID counters recovered from the canonical state.
+    assertEqual(json.idCounters.task, 2);
+    assertEqual(json.idCounters.goal, 1);
+    assertEqual(json.idCounters.note, 1);
+
+    // Hashes cover the Map, every content file, and the generated view.
+    const expectedFiles = ["context-map.md", ...Object.values(CONTENT_FILES).map((n) => `${CONTENT_DIR}/${n}`), "views/HANDOFF.md"];
+    assertEqual(JSON.stringify(Object.keys(json.hashes).sort()), JSON.stringify(expectedFiles.sort()));
+    assertEqual(json.hashes["context-map.md"], sha256Hex(renderContextMapV3(state.map, { lang: "en" })));
+    assertEqual(
+      json.hashes[`${CONTENT_DIR}/tasks.md`],
+      sha256Hex(renderContentFile("tasks", state.content.tasks))
+    );
+    assertEqual(json.hashes["views/HANDOFF.md"], sha256Hex(generateV3Views(state, V3_META)["views/HANDOFF.md"]));
+
+    // No semantic fields leak into metadata.
+    for (const field of ["current_goal", "status", "todos", "decisions", "risks", "notes", "goal"]) {
+      assert(!(field in json), `semantic field '${field}' must not appear in v3 context.json`);
+    }
+  });
+
+  // ── v2→v3 migration ────────────────────────────────────────────────────────
+
+  async function readV2CompleteInputs() {
+    const read = async (rel) => {
+      try {
+        return await readFixture(`migration/v2-complete/.handoff/${rel}`);
+      } catch {
+        return undefined;
+      }
+    };
+    return {
+      contextJson: await read("context.json"),
+      handoffMd: await read("HANDOFF.md"),
+      tasksMd: await read("tasks.md"),
+      decisionsMd: await read("decisions.md"),
+      contextMapMd: await read("context-map.md"),
+    };
+  }
+
+  const V3M_DIR = "/v3m/.handoff";
+  const V3M_CONFIG = "/v3m/.handoff.config.json";
+  const V3M_CONFIG_BODY = JSON.stringify({ version: "2.0.0", storage: { mode: "direct", path: ".handoff" } }, null, 2) + "\n";
+
+  function seedV2Complete(inputs) {
+    const seed = { [V3M_CONFIG]: V3M_CONFIG_BODY };
+    seed[`${V3M_DIR}/context-map.md`] = inputs.contextMapMd;
+    seed[`${V3M_DIR}/context.json`] = inputs.contextJson;
+    seed[`${V3M_DIR}/HANDOFF.md`] = inputs.handoffMd;
+    seed[`${V3M_DIR}/tasks.md`] = inputs.tasksMd;
+    seed[`${V3M_DIR}/decisions.md`] = inputs.decisionsMd;
+    return seed;
+  }
+
+  test("v3 migration: detectLayout classifies empty, legacy, v2, and v3 layouts", () => {
+    assertEqual(detectLayout([]), "empty");
+    assertEqual(detectLayout(["HANDOFF.md", "tasks.md", "context.json"]), "legacy");
+    assertEqual(detectLayout(["context-map.md", "HANDOFF.md", "context.json"]), "v2");
+    assertEqual(detectLayout(["context-map.md", "content/tasks.md", "views/HANDOFF.md", "context.json"]), "v3");
+    assertEqual(detectLayout(new Set(["context-map.md", "content/current-goal.md"])), "v3");
+  });
+
+  test("v3 migration: plan maps every v2 node to stable IDs and content files", async () => {
+    const plan = planV2ToV3Migration(await readV2CompleteInputs());
+    assert(plan.needed, "a v2 handoff should need v3 migration");
+
+    const { map, content } = plan;
+
+    assertEqual(map.sections.goals.length, 1);
+    assertEqual(map.sections.goals[0].id, "goal1");
+    assertEqual(map.sections.goals[0].label, "Ship the context directory release");
+    assertEqual(map.sections.goals[0].origin, "agent", "detected v2 ownership must carry over");
+
+    assertEqual(map.sections.status[0].id, "status1");
+    assertEqual(map.sections.status[0].label, "Implementation in progress, tests passing");
+
+    assertEqual(map.sections.tasks.length, 3);
+    assertEqual(map.sections.tasks[0].id, "task1");
+    assertEqual(map.sections.tasks[0].label, "Implement the storage migration", "label stops at the first clause delimiter");
+    assertEqual(map.sections.tasks[0].priority, "high", "priority becomes directory metadata");
+    assertEqual(map.sections.tasks[0].checked, false);
+    assertEqual(map.sections.tasks[1].id, "task2");
+    assertEqual(map.sections.tasks[1].depth, 1, "hierarchy must be preserved");
+    assertEqual(map.sections.tasks[1].checked, true, "task state must be preserved");
+    assertEqual(map.sections.tasks[2].id, "task3");
+
+    assertEqual(map.sections.decisions[0].id, "decision1");
+    assertEqual(map.sections.questions[0].id, "question1");
+    assertEqual(map.sections.risks[0].id, "risk1");
+    assertEqual(map.sections.risks[0].label, "Migration may produce orphaned content");
+    assertEqual(map.sections.notes[0].id, "note1");
+    assertEqual(
+      map.sections.notes[0].label,
+      "Deno and Node share one canonical state loader so behavior s…",
+      "long delimiter-less labels truncate at 60 code points with an ellipsis"
+    );
+    assertEqual(map.sections.excluded[0].id, "excluded1");
+
+    // Bodies hold the complete original node text (priority prefix excluded —
+    // it is directory-owned now).
+    assertEqual(
+      content.tasks[0].summary,
+      "Implement the storage migration. Validate every generated file before replacing any v2 file."
+    );
+    assertEqual(content.tasks[0].id, "task1");
+    assertEqual(content.goals[0].summary, "Ship the context directory release");
+    assertEqual(
+      content.notes[0].summary,
+      "Deno and Node share one canonical state loader so behavior stays identical across runtimes",
+      "the body keeps the full untruncated text"
+    );
+    assertEqual(content.decisions[0].summary.includes("content files own summaries and bodies"), true);
+  });
+
+  test("v3 migration: every original semantic text survives in the proposed state", async () => {
+    const inputs = await readV2CompleteInputs();
+    const plan = planV2ToV3Migration(inputs);
+    assert(plan.valid, `proposed state lost semantic text: ${JSON.stringify(plan.diagnostics.migration)}`);
+
+    const v2map = parseContextMap(inputs.contextMapMd);
+    const bodies = [];
+    for (const key of V3_SECTION_KEYS) {
+      for (const entry of plan.content[key]) bodies.push(`${entry.summary}\n${entry.body}`);
+    }
+    const allBodies = bodies.join("\n");
+    for (const key of SECTION_KEYS) {
+      for (const node of v2map.sections[key]) {
+        const cleaned = node.text.replace(/^\*\*(high|medium|low)\*\*\s+/i, "");
+        assert(allBodies.includes(cleaned), `original text lost: ${JSON.stringify(cleaned)}`);
+      }
+    }
+  });
+
+  test("v3 migration: conflicting legacy sources chain through with source attribution", async () => {
+    const plan = planV2ToV3Migration(await readHandoffInputs("conflicting"));
+    assert(plan.needed, "a conflicting legacy handoff should migrate");
+
+    // Precedence: the v2 map goal wins over context.json and HANDOFF.md.
+    assertEqual(plan.map.sections.goals.length, 1);
+    assertEqual(plan.map.sections.goals[0].label, "Ship the map-approved compiler release");
+
+    // Superseded values survive as their own attributed nodes/bodies.
+    const questionBodies = plan.content.questions.map((e) => e.summary).join("\n");
+    assertIncludes(questionBodies, "(source: context.json)");
+    assertIncludes(questionBodies, "(source: HANDOFF.md)");
+    assertIncludes(questionBodies, "JSON draft goal superseded by the map");
+    const conflictParent = plan.map.sections.questions.find((n) => n.label === MIGRATION_CONFLICT_LABEL);
+    assert(conflictParent, "Migration conflict parent node missing");
+    const children = plan.map.sections.questions.filter((n) => n.depth > 0);
+    assertEqual(children.length, 4, `each conflict child must become its own node, got: ${JSON.stringify(children.map((n) => n.label))}`);
+    assert(plan.diagnostics.conflicts.length > 0, "conflict diagnostics must be carried over");
+  });
+
+  test("v3 migration: a missing or invalid v2 map falls back to chained legacy migration", async () => {
+    const inputs = await readHandoffInputs("legacy-1x");
+    const plan = planV2ToV3Migration(inputs);
+    assert(plan.needed, "a legacy 1.x handoff should chain through to v3");
+    assertEqual(plan.map.sections.goals.length, 1);
+    assertEqual(plan.map.sections.goals[0].label, "feat: add rate limiting middleware");
+    assert(plan.map.sections.tasks.length >= 3, "legacy tasks must be preserved");
+    assert(
+      plan.map.sections.tasks.every((n) => n.id && n.id.startsWith("task")),
+      "every chained task must receive a stable ID"
+    );
+  });
+
+  test("v3 migration: already-v3 and empty handoffs need no migration", async () => {
+    const v3Json = JSON.stringify({ protocolVersion: "3.0.0" });
+    const already = planV2ToV3Migration({ contextJson: v3Json, contextMapMd: "# Context Map\n" });
+    assert(!already.needed, `v3 handoff must not re-migrate: ${already.reason}`);
+    assert(/already/i.test(already.reason));
+
+    const withContent = planV2ToV3Migration({
+      contextMapMd: "# Context Map\n",
+      contentFiles: { "tasks.md": "# Tasks\n" },
+    });
+    assert(!withContent.needed, "a content/ layout must not re-migrate");
+
+    const empty = planV2ToV3Migration({});
+    assert(!empty.needed, "no handoff data means nothing to migrate");
+  });
+
+  test("v3 migration: apply backs up originals, installs v3 files, retires root views, upgrades config last", async () => {
+    const inputs = await readV2CompleteInputs();
+    const plan = planV2ToV3Migration({ ...inputs, config: V3M_CONFIG_BODY });
+    const io = makeFakeIo(seedV2Complete(inputs));
+
+    const result = await applyV3Migration(io, plan, { handoffDir: V3M_DIR, configPath: V3M_CONFIG }, { timestamp: "2026-08-02T00:00:00.000Z" });
+    assert(result.migrated, "applyV3Migration should report migrated");
+
+    const backupDir = `${V3M_DIR}/history/migrations/2026-08-02T00-00-00-000Z`;
+    assertEqual(result.backupDir, backupDir);
+    assertEqual(io.store.get(`${backupDir}/context-map.md`), inputs.contextMapMd);
+    assertEqual(io.store.get(`${backupDir}/HANDOFF.md`), inputs.handoffMd);
+    assertEqual(io.store.get(`${backupDir}/tasks.md`), inputs.tasksMd);
+    assertEqual(io.store.get(`${backupDir}/decisions.md`), inputs.decisionsMd);
+    assertEqual(io.store.get(`${backupDir}/context.json`), inputs.contextJson);
+    assertEqual(io.store.get(`${backupDir}/.handoff.config.json`), V3M_CONFIG_BODY);
+
+    // v3 layout installed.
+    const map = parseContextMapV3(io.store.get(`${V3M_DIR}/context-map.md`));
+    assert(map, "migrated v3 map must parse");
+    assertEqual(map.sections.tasks.length, 3);
+    for (const name of Object.values(CONTENT_FILES)) {
+      assert(io.store.has(`${V3M_DIR}/${CONTENT_DIR}/${name}`), `content/${name} not installed`);
+    }
+    assert(io.store.has(`${V3M_DIR}/views/HANDOFF.md`), "views/HANDOFF.md not installed");
+    const json = JSON.parse(io.store.get(`${V3M_DIR}/context.json`));
+    assertEqual(json.protocolVersion, "3.0.0");
+    assertEqual(json.idCounters.task, 3, "counters must cover the allocated IDs");
+
+    // Old root views are retired.
+    for (const legacy of ["HANDOFF.md", "tasks.md", "decisions.md"]) {
+      assert(!io.store.has(`${V3M_DIR}/${legacy}`), `legacy root file '${legacy}' must be retired`);
+    }
+
+    // Config version upgrades to 3.0.0 via the FINAL rename.
+    const config = JSON.parse(io.store.get(V3M_CONFIG));
+    assertEqual(config.version, "3.0.0");
+    const renames = io.ops.filter((op) => op[0] === "rename");
+    assertEqual(renames.at(-1)[2], V3M_CONFIG, "the config (version upgrade) must rename last");
+
+    // No temp or rollback residue.
+    for (const key of io.store.keys()) {
+      assert(!key.includes("migration-tmp"), `temp file left behind: ${key}`);
+      assert(!key.includes("migration-rollback"), `rollback file left behind: ${key}`);
+    }
+  });
+
+  test("v3 migration: repeated migration is idempotent", async () => {
+    const inputs = await readV2CompleteInputs();
+    const io = makeFakeIo(seedV2Complete(inputs));
+
+    const first = await applyV3Migration(io, planV2ToV3Migration({ ...inputs, config: V3M_CONFIG_BODY }), { handoffDir: V3M_DIR, configPath: V3M_CONFIG }, { timestamp: "2026-08-02T00-00:00.000Z" });
+    assert(first.migrated, "first migration should write");
+    const snapshot = JSON.stringify([...io.store.entries()].sort());
+
+    const secondPlan = planV2ToV3Migration({
+      contextJson: io.store.get(`${V3M_DIR}/context.json`),
+      contextMapMd: io.store.get(`${V3M_DIR}/context-map.md`),
+    });
+    assert(!secondPlan.needed, `second plan should be a no-op, got: ${secondPlan.reason}`);
+    const second = await applyV3Migration(io, secondPlan, { handoffDir: V3M_DIR, configPath: V3M_CONFIG }, { timestamp: "2026-08-02T01:00:00.000Z" });
+    assert(!second.migrated, "second migration must not write");
+    assertEqual(JSON.stringify([...io.store.entries()].sort()), snapshot, "second migration changed files");
+  });
+
+  test("v3 migration: an invalid plan changes no original byte", async () => {
+    const inputs = await readV2CompleteInputs();
+    const plan = planV2ToV3Migration(inputs);
+    plan.outputs["context-map.md"] = "garbage that is not a context map";
+    const io = makeFakeIo(seedV2Complete(inputs));
+
+    await assertRejects(
+      () => applyV3Migration(io, plan, { handoffDir: V3M_DIR, configPath: V3M_CONFIG }),
+      "a corrupted plan output must be rejected"
+    );
+    assertEqual(io.ops.length, 0, "an invalid plan must not cause any filesystem operation");
+  });
+
+  test("v3 migration: a rename-phase failure rolls every installed file back", async () => {
+    const inputs = await readV2CompleteInputs();
+    const plan = planV2ToV3Migration({ ...inputs, config: V3M_CONFIG_BODY });
+    const seed = seedV2Complete(inputs);
+    const io = makeFakeIo(seed);
+
+    const baseRename = io.rename;
+    let finalRenames = 0;
+    io.rename = async (from, to) => {
+      if (from.endsWith(".migration-tmp")) {
+        finalRenames += 1;
+        if (finalRenames === 3) throw new Error("injected rename failure");
+      }
+      return baseRename(from, to);
+    };
+
+    await assertRejects(
+      () => applyV3Migration(io, plan, { handoffDir: V3M_DIR, configPath: V3M_CONFIG }, { timestamp: "2026-08-02T00:00:00.000Z" }),
+      "injected rename failure should abort the migration"
+    );
+
+    for (const [key, value] of Object.entries(seed)) {
+      assertEqual(io.store.get(key), value, `original file changed despite rollback: ${key}`);
+    }
+    for (const key of io.store.keys()) {
+      assert(!key.includes("migration-tmp"), `temp file left behind: ${key}`);
+      assert(!key.includes("migration-rollback"), `rollback file left behind: ${key}`);
+      assert(!key.includes(`${CONTENT_DIR}/`), `partial v3 content left behind: ${key}`);
+    }
+  });
+
+  test("v3 migration: a cleanup failure after commit leaves a valid v3 state", async () => {
+    const inputs = await readV2CompleteInputs();
+    const plan = planV2ToV3Migration({ ...inputs, config: V3M_CONFIG_BODY });
+    const io = makeFakeIo(seedV2Complete(inputs));
+
+    const baseRemove = io.remove;
+    let rollbackRemoves = 0;
+    io.remove = async (p) => {
+      if (p.endsWith(".migration-rollback")) {
+        rollbackRemoves += 1;
+        if (rollbackRemoves === 2) throw new Error("injected cleanup failure");
+      }
+      return baseRemove(p);
+    };
+
+    const result = await applyV3Migration(io, plan, { handoffDir: V3M_DIR, configPath: V3M_CONFIG }, { timestamp: "2026-08-02T00-00:00.000Z" });
+    assert(result.migrated, "cleanup failure must not fail a committed migration");
+
+    const map = parseContextMapV3(io.store.get(`${V3M_DIR}/context-map.md`));
+    assert(map, "committed v3 map must remain readable");
+    assertEqual(map.sections.tasks.length, 3);
+    const json = JSON.parse(io.store.get(`${V3M_DIR}/context.json`));
+    assertEqual(json.protocolVersion, "3.0.0", "committed metadata must not roll back");
+    for (const key of io.store.keys()) {
+      assert(!key.includes("migration-tmp"), `temp file left behind: ${key}`);
+    }
+  });
+
+  test("v3 migration: planV2ToV3Migration is pure and deterministic", async () => {
+    const inputs = await readV2CompleteInputs();
+    const before = JSON.stringify(inputs);
+    const first = planV2ToV3Migration(inputs);
+    const second = planV2ToV3Migration(inputs);
+    assertEqual(JSON.stringify(first), JSON.stringify(second), "planV2ToV3Migration is not deterministic");
+    assertEqual(JSON.stringify(inputs), before, "planV2ToV3Migration mutated its inputs");
+  });
+
+  // ── v3 effort-aware context compiler ───────────────────────────────────────
+
+  function compilerV3State() {
+    return makeV3State({
+      sections: {
+        goals: [{ id: "goal1", label: "Ship the v3 release", origin: "user", depth: 0 }],
+        status: [{ id: "status1", label: "Compiler green", origin: "agent", depth: 0 }],
+        tasks: [
+          { id: "task1", label: "Wire the context compiler", origin: "agent", depth: 0, checked: false, priority: "high" },
+          { id: "task2", label: "Normalization lowercases keywords", origin: "agent", depth: 1, checked: false },
+          { id: "task3", label: "Grandchild cleanup", origin: "agent", depth: 2, checked: true },
+          { id: "task4", label: "Done long ago", origin: "agent", depth: 0, checked: true },
+        ],
+        decisions: [
+          { id: "decision1", label: "Keyword overlap scoring", origin: "user", depth: 0 },
+          { id: "decision2", label: "Normalization lowercases focus", origin: "agent", depth: 1 },
+          { id: "decision3", label: "Unrelated storage choice", origin: "user", depth: 0 },
+        ],
+        risks: [
+          { id: "risk1", label: "Token blowout", origin: "agent", depth: 0, severity: "high" },
+          { id: "risk2", label: "Minor formatting", origin: "agent", depth: 0, severity: "low" },
+        ],
+      },
+      content: {
+        goals: [{ id: "goal1", summary: "Goal summary.", body: "Goal body.", origin: "user" }],
+        status: [{ id: "status1", summary: "Status summary.", body: "", origin: "agent" }],
+        tasks: [
+          { id: "task1", summary: "Compiler summary.", body: "Compiler body details.", origin: "agent" },
+          { id: "task2", summary: "Normalization summary.", body: "Normalization body with zebra-only-body-keyword.", origin: "agent" },
+          { id: "task3", summary: "Grandchild cleanup done.", body: "Wrapped up earlier.", origin: "agent" },
+          { id: "task4", summary: "Done summary.", body: "Done body.", origin: "agent" },
+        ],
+        decisions: [
+          { id: "decision1", summary: "Scoring summary.", body: "Scoring body.", origin: "user" },
+          { id: "decision2", summary: "Lowercase summary.", body: "zebra-only-body-keyword details.", origin: "agent" },
+          { id: "decision3", summary: "Storage summary.", body: "Storage body.", origin: "user" },
+        ],
+        risks: [
+          { id: "risk1", summary: "Blowout summary.", body: "Blowout body.", origin: "agent" },
+          { id: "risk2", summary: "Formatting summary.", body: "Formatting body.", origin: "agent" },
+        ],
+      },
+    });
+  }
+
+  function compileV3(args) {
+    return compileContext({ state: compilerV3State(), ...args });
+  }
+
+  function entryOf(result, key, id) {
+    return (result.state.content[key] || []).find((e) => e.id === id) || null;
+  }
+
+  test("compiler v3: effort levels validate and med is the default", () => {
+    assertEqual(JSON.stringify([...EFFORT_LEVELS]), JSON.stringify(["min", "low", "med", "high", "max"]));
+    for (const ok of EFFORT_LEVELS) assertEqual(validateEffort(ok), ok);
+    for (const bad of ["MIN", "medium", "", "extreme", 42, null]) {
+      let threw = false;
+      try {
+        validateEffort(bad);
+      } catch (err) {
+        threw = true;
+        assert(/effort/i.test(err.message), `error should name the effort, got: ${err.message}`);
+      }
+      assert(threw, `effort ${JSON.stringify(bad)} must be rejected`);
+    }
+    const implicit = compileV3({ focus: "keyword overlap scoring" });
+    const explicit = compileV3({ focus: "keyword overlap scoring", effort: "med" });
+    assertEqual(implicit.effort, "med", "omitted effort must default to med");
+    assertEqual(JSON.stringify(implicit), JSON.stringify(explicit), "default and explicit med diverge");
+  });
+
+  test("compiler v3: min returns the directory only, with the ancestor path intact", () => {
+    const r = compileV3({ focus: "zebra-only-body-keyword", effort: "min" });
+    assertEqual(r.effort, "min");
+    for (const key of V3_SECTION_KEYS) {
+      assertEqual((r.state.content[key] || []).length, 0, `min must strip all bodies (${key})`);
+    }
+    assert(r.selectedIds.includes("decision2"), "matching node not selected");
+    assert(r.selectedIds.includes("decision1"), "a selected node must retain its full ancestor path");
+    assert(r.state.map.sections.decisions.length === 2, "directory entries remain without bodies");
+    assert(!r.selectedIds.includes("decision3"), "unmatched node must stay omitted");
+  });
+
+  test("compiler v3: low keeps summaries and strips detail bodies", () => {
+    const r = compileV3({ focus: "keyword overlap scoring", effort: "low" });
+    const decision = entryOf(r, "decisions", "decision1");
+    assert(decision, "selected node missing from low output");
+    assertEqual(decision.summary, "Scoring summary.");
+    assertEqual(decision.body, "", "low must strip the detail body");
+    const goal = entryOf(r, "goals", "goal1");
+    assertEqual(goal.summary, "Goal summary.");
+    assertEqual(goal.body, "");
+  });
+
+  test("compiler v3: med keeps complete bodies for selected nodes", () => {
+    const r = compileV3({ focus: "keyword overlap scoring", effort: "med" });
+    const decision = entryOf(r, "decisions", "decision1");
+    assertEqual(decision.body, "Scoring body.", "med must keep the complete body");
+    assert(!r.selectedIds.includes("decision3"), "unmatched node must stay omitted");
+    assert(!r.selectedIds.includes("task3"), "descendants are not pulled in at med");
+    assert(!r.selectedIds.includes("task4"), "completed tasks are not core");
+  });
+
+  test("compiler v3: high adds ancestors and direct subtrees with complete bodies", () => {
+    const focus = "zebra-only-body-keyword";
+    const med = compileV3({ focus, effort: "med" });
+    assert(med.selectedIds.includes("task2"), "matching task not selected at med");
+    assert(!med.selectedIds.includes("task3"), "med must not include the direct child");
+
+    const high = compileV3({ focus: "zebra-only-body-keyword", effort: "high" });
+    assert(high.selectedIds.includes("task2"), "matching task not selected at high");
+    assert(high.selectedIds.includes("task1"), "ancestor not preserved at high");
+    assert(high.selectedIds.includes("task3"), "high must include the direct subtree");
+    assertEqual(entryOf(high, "tasks", "task3").body, "Wrapped up earlier.", "high must keep complete bodies");
+    assert(!high.selectedIds.includes("task4"), "unrelated completed task must stay omitted");
+  });
+
+  test("compiler v3: max returns the complete map and every body", () => {
+    const r = compileV3({ effort: "max" });
+    assertEqual(r.fallbackReason, null, "max is an explicit choice, not a fallback");
+    assertEqual(r.selectedIds.length, 11, `max must select every node, got: ${JSON.stringify(r.selectedIds)}`);
+    assertEqual(r.omittedCount, 0);
+    assertEqual(entryOf(r, "decisions", "decision3").body, "Storage body.");
+    assertEqual(entryOf(r, "tasks", "task4").body, "Done body.");
+  });
+
+  test("compiler v3: focus matches across label, summary, body, and ancestor path", () => {
+    // Body-only keyword.
+    const byBody = compileV3({ focus: "zebra-only-body-keyword", effort: "med" });
+    assert(byBody.selectedIds.includes("decision2"), "body keyword did not select its node");
+
+    // Summary keyword.
+    const bySummary = compileV3({ focus: "lowercase summary", effort: "med" });
+    assert(bySummary.selectedIds.includes("decision2"), "summary keyword did not select its node");
+
+    // Ancestor path contributes the missing keyword ("keyword" lives on the parent).
+    const byPath = compileV3({ focus: "keyword lowercases", effort: "med" });
+    assertEqual(byPath.fallbackReason, null, "ancestor-path scoring should prevent fallback");
+    assert(byPath.selectedIds.includes("decision2"), "branch matching via ancestor path not selected");
+    assert(byPath.selectedIds.includes("decision1"), "ancestor not included");
+  });
+
+  test("compiler v3: selection is deterministic and preserves document order", () => {
+    const first = compileV3({ focus: "keyword overlap scoring", effort: "med" });
+    const second = compileV3({ focus: "keyword overlap scoring", effort: "med" });
+    assertEqual(JSON.stringify(first), JSON.stringify(second), "compilation is not deterministic");
+    const expected = ["goal1", "status1", "task1", "task2", "decision1", "decision2", "risk1"];
+    assertEqual(JSON.stringify(first.selectedIds), JSON.stringify(expected), "selected IDs must follow document order");
+  });
+
+  test("compiler v3: an explicit budget degrades bodies before omitting and reports every step", () => {
+    const state = compilerV3State();
+    const big = "paragraph ".repeat(600); // ~1650 estimated tokens
+    state.content.decisions.find((e) => e.id === "decision1").body = big;
+    state.content.decisions.find((e) => e.id === "decision2").body = big;
+    const r = compileContext({ state, focus: "keyword overlap scoring", effort: "med", budget: MIN_BUDGET });
+
+    for (const core of ["goal1", "status1", "task1", "task2", "risk1"]) {
+      assert(r.selectedIds.includes(core), `core node '${core}' was dropped to satisfy the budget`);
+    }
+    assert(r.degradations.length > 0, "budget pressure must report degradation steps");
+    assert(r.degradations.some((d) => d.to === "summary"), "full bodies must degrade to summaries first");
+    for (const d of r.degradations) {
+      assert(d.id && ["summary", "directory"].includes(d.to), `malformed degradation: ${JSON.stringify(d)}`);
+    }
+    // Degradation is paragraph-granular: entries keep either their complete
+    // body, their summary, or nothing — never a mid-paragraph cut.
+    for (const key of V3_SECTION_KEYS) {
+      for (const entry of r.state.content[key] || []) {
+        const original = state.content[key].find((e) => e.id === entry.id);
+        assert(entry.body === "" || entry.body === original.body, `body of '${entry.id}' was truncated mid-paragraph`);
+      }
+    }
+  });
+
+  test("compiler v3: --full selects all nodes but an explicit budget still degrades", () => {
+    const state = compilerV3State();
+    state.content.decisions.find((e) => e.id === "decision1").body = "paragraph ".repeat(600);
+    const r = compileContext({ state, full: true, effort: "max", budget: MIN_BUDGET });
+    assertEqual(r.fallbackReason, null, "--full is an explicit choice, not a fallback");
+    assertEqual(r.selectedIds.length, 11, "--full must select every node");
+    assert(r.degradations.length > 0, "an explicit budget must still force reported degradation");
+  });
+
+  test("compiler v3: without an explicit budget there is no hidden hard cap", () => {
+    const state = compilerV3State();
+    state.content.decisions.find((e) => e.id === "decision1").body = "paragraph ".repeat(2000);
+    const r = compileContext({ state, focus: "keyword overlap scoring", effort: "med" });
+    assert(!r.overflow, "no explicit budget means no cap to overflow");
+    assertEqual(r.degradations.length, 0, "no budget means no degradation");
+    assert(entryOf(r, "decisions", "decision1").body.length > 1000, "the complete body loads without a budget");
+  });
+
+  test("compiler v3: no reliable match falls back to the full map with a reason", () => {
+    const r = compileV3({ focus: "quokka zzz", effort: "med" });
+    assert(r.fallbackReason, "expected a fallback reason when nothing matches reliably");
+    assertEqual(r.omittedCount, 0, "fallback must return the full map");
+    assertEqual(r.selectedIds.length, 11, "fallback must select every node");
+  });
+
+  // ── v3 snapshots and stable-ID semantic diff ───────────────────────────────
+
+  function v3SnapState(edit) {
+    const state = makeV3State({
+      sections: {
+        goals: [{ id: "goal1", label: "Ship v3", origin: "user", depth: 0 }],
+        tasks: [
+          { id: "task1", label: "Parent task", origin: "user", depth: 0, checked: false, priority: "high" },
+          { id: "task2", label: "Child task", origin: "agent", depth: 1, checked: true },
+        ],
+        risks: [{ id: "risk1", label: "Risky", origin: "agent", depth: 0, severity: "high" }],
+      },
+      content: {
+        goals: [{ id: "goal1", summary: "Goal summary.", body: "", origin: "user" }],
+        tasks: [
+          { id: "task1", summary: "Parent summary.", body: "Parent body.", origin: "user" },
+          { id: "task2", summary: "Child summary.", body: "Child body.", origin: "agent" },
+        ],
+        risks: [{ id: "risk1", summary: "Risk summary.", body: "Risk body.", origin: "agent" }],
+      },
+    });
+    if (edit) edit(state);
+    return state;
+  }
+
+  test("snapshots v3: content-only changes create a snapshot", async () => {
+    const io = makeFakeIo({});
+    const first = await writeV3Snapshot(v3SnapState(), SNAP_PATHS, io, { timestamp: "2026-08-02T00:00:00.000Z" });
+    assert(first.written, "first save should write a v3 snapshot");
+    const raw = io.store.get(first.path);
+    const parsed = JSON.parse(raw);
+    assertEqual(parsed.version, V3_PROTOCOL_VERSION);
+    assert(Array.isArray(parsed.state.nodes), "v3 snapshot must normalize nodes");
+    const task1 = parsed.state.nodes.find((n) => n.id === "task1");
+    assertEqual(task1.section, "tasks");
+    assertEqual(task1.priority, "high");
+    assertEqual(task1.taskState, false);
+    assertEqual(task1.summary, "Parent summary.");
+    assertEqual(task1.body, "Parent body.");
+    const task2 = parsed.state.nodes.find((n) => n.id === "task2");
+    assertEqual(task2.parentId, "task1", "hierarchy must normalize to parent IDs");
+
+    const changed = await writeV3Snapshot(
+      v3SnapState((s) => { s.content.tasks[0].body = "Edited parent body."; }),
+      SNAP_PATHS,
+      io,
+      { timestamp: "2026-08-02T01:00:00.000Z" }
+    );
+    assert(changed.written, "a body-only edit must change the semantic digest");
+    assertEqual(snapshotFiles(io).length, 2);
+  });
+
+  test("snapshots v3: normalized no-op changes do not create a duplicate snapshot", async () => {
+    const io = makeFakeIo({});
+    await writeV3Snapshot(v3SnapState(), SNAP_PATHS, io, { timestamp: "2026-08-02T00:00:00.000Z" });
+    // Re-render and reparse the state: localized headings and regenerated
+    // ownership fingerprints must not change the semantic digest.
+    const state = v3SnapState();
+    const roundTripped = {
+      version: V3_PROTOCOL_VERSION,
+      map: parseContextMapV3(renderContextMapV3(state.map, { lang: "zh" })),
+      content: Object.fromEntries(
+        V3_SECTION_KEYS.map((key) => [key, parseContentFile(renderContentFile(key, state.content[key]), key)])
+      ),
+    };
+    const second = await writeV3Snapshot(roundTripped, SNAP_PATHS, io, { timestamp: "2026-08-02T01:00:00.000Z" });
+    assert(!second.written, "a normalized no-op must not write a snapshot");
+    assertEqual(second.reason, "unchanged");
+    assertEqual(snapshotFiles(io).length, 1);
+  });
+
+  test("snapshots v3: sensitive values are filtered from labels and bodies", async () => {
+    const io = makeFakeIo({});
+    const result = await writeV3Snapshot(
+      v3SnapState((s) => {
+        s.map.sections.notes.push({ id: "note1", label: "deploy key: api_key=abcdefghijklmnop123456", origin: "user", depth: 0 });
+        s.content.notes.push({ id: "note1", summary: "token ghp_0123456789abcdef0123456789abcdef0123", body: "", origin: "user" });
+      }),
+      SNAP_PATHS,
+      io,
+      { timestamp: "2026-08-02T00:00:00.000Z" }
+    );
+    const raw = io.store.get(result.path);
+    assertNotIncludes(raw, "abcdefghijklmnop123456", "api key leaked into the snapshot");
+    assertNotIncludes(raw, "ghp_0123456789abcdef0123456789abcdef0123", "token leaked into the snapshot");
+    assertIncludes(raw, "[REDACTED]");
+  });
+
+  function v3SnapDiffModel(afterEdit) {
+    const before = buildV3Snapshot(v3SnapState());
+    const after = buildV3Snapshot(v3SnapState(afterEdit));
+    return diffV3States(before, after);
+  }
+
+  test("diff v3: added and deleted nodes are reported by stable ID", () => {
+    const model = v3SnapDiffModel((s) => {
+      s.map.sections.risks.push({ id: "risk2", label: "Fresh risk", origin: "agent", depth: 0 });
+      s.content.risks.push({ id: "risk2", summary: "Fresh summary.", body: "", origin: "agent" });
+      s.map.sections.goals = [];
+      s.content.goals = [];
+    });
+    assertEqual(model.added.length, 1);
+    assertEqual(model.added[0].id, "risk2");
+    assertEqual(model.added[0].after, "Fresh risk");
+    assertEqual(model.deleted.length, 1);
+    assertEqual(model.deleted[0].id, "goal1");
+    for (const key of V3_DIFF_CLASSES) {
+      assert(Array.isArray(model[key]), `${key} must be an array`);
+    }
+  });
+
+  test("diff v3: label, summary, and body edits are separate categories", () => {
+    const model = v3SnapDiffModel((s) => {
+      s.map.sections.tasks[0].label = "Renamed parent";
+      s.content.tasks[1].summary = "Edited child summary.";
+      s.content.risks[0].body = "Edited risk body.";
+    });
+    assertEqual(model.labelEdited.length, 1);
+    assertEqual(model.labelEdited[0].id, "task1");
+    assertEqual(model.labelEdited[0].before, "Parent task");
+    assertEqual(model.labelEdited[0].after, "Renamed parent");
+    assertEqual(model.summaryEdited.length, 1);
+    assertEqual(model.summaryEdited[0].id, "task2");
+    assertEqual(model.summaryEdited[0].after, "Edited child summary.");
+    assertEqual(model.bodyEdited.length, 1);
+    assertEqual(model.bodyEdited[0].id, "risk1");
+    assertEqual(model.bodyEdited[0].after, "Edited risk body.");
+    assertEqual(model.added.length + model.deleted.length, 0, "edits are not add+delete");
+  });
+
+  test("diff v3: a move keeps its ID and reports the section/parent change", () => {
+    const model = v3SnapDiffModel((s) => {
+      // Move task2 from under task1 (tasks) into notes, keeping the ID.
+      s.map.sections.tasks = s.map.sections.tasks.filter((n) => n.id !== "task2");
+      s.map.sections.notes.push({ id: "task2", label: "Child task", origin: "agent", depth: 0 });
+      s.content.notes.push(s.content.tasks.find((e) => e.id === "task2"));
+      s.content.tasks = s.content.tasks.filter((e) => e.id !== "task2");
+    });
+    assertEqual(model.moved.length, 1, "the move must be reported once, not as add+delete");
+    assertEqual(model.moved[0].id, "task2");
+    assertEqual(model.moved[0].before.section, "tasks");
+    assertEqual(model.moved[0].after.section, "notes");
+    assertEqual(model.moved[0].before.parentId, "task1");
+    assertEqual(model.moved[0].after.parentId, null);
+    assertEqual(model.added.length + model.deleted.length, 0, "a move is not add+delete");
+  });
+
+  test("diff v3: task state and priority/severity changes are separate categories", () => {
+    const model = v3SnapDiffModel((s) => {
+      s.map.sections.tasks[0].checked = true;
+      s.map.sections.tasks[0].priority = "low";
+      s.map.sections.risks[0].severity = "medium";
+    });
+    assertEqual(model.taskStateChanged.length, 1);
+    assertEqual(model.taskStateChanged[0].id, "task1");
+    assertEqual(model.taskStateChanged[0].task.before, false);
+    assertEqual(model.taskStateChanged[0].task.after, true);
+    assertEqual(model.attributesChanged.length, 2);
+    const taskAttr = model.attributesChanged.find((c) => c.id === "task1");
+    assertEqual(taskAttr.before.priority, "high");
+    assertEqual(taskAttr.after.priority, "low");
+    const riskAttr = model.attributesChanged.find((c) => c.id === "risk1");
+    assertEqual(riskAttr.before.severity, "high");
+    assertEqual(riskAttr.after.severity, "medium");
+    assertEqual(model.labelEdited.length, 0, "attribute changes are not label edits");
+  });
+
+  test("diff v3: JSON and Markdown render the same model with v3 headings", () => {
+    const model = v3SnapDiffModel((s) => {
+      s.map.sections.tasks[0].checked = true;
+      s.content.tasks[0].body = "Edited body.";
+    });
+    const meta = { from: "latest", snapshotId: "snap-v3", capturedAt: "2026-08-02T00:00:00.000Z" };
+
+    const json = JSON.parse(renderV3DiffJson(model, meta));
+    assertEqual(json.snapshot.id, "snap-v3");
+    for (const key of V3_DIFF_CLASSES) {
+      assert(Array.isArray(json[key]), `json.${key} must be an array`);
+      assertEqual(json[key].length, model[key].length, `json.${key} diverges from the model`);
+    }
+
+    const md = renderV3DiffMarkdown(model, meta);
+    assertIncludes(md, "Context diff");
+    assertIncludes(md, "snap-v3");
+    assertIncludes(md, "Added");
+    assertIncludes(md, "Deleted");
+    assertIncludes(md, "Moved");
+    assertIncludes(md, "Label edited");
+    assertIncludes(md, "Summary edited");
+    assertIncludes(md, "Body edited");
+    assertIncludes(md, "Task state changed");
+    assertIncludes(md, "Attributes changed");
+    assertIncludes(md, "task1");
+
+    const empty = renderV3DiffMarkdown(diffV3States(buildV3Snapshot(v3SnapState()), buildV3Snapshot(v3SnapState())), meta);
+    assertIncludes(empty, "No changes", "an empty diff should say so");
+  });
+
+  test("diff v3: output is sensitive-filtered even from a hostile snapshot", () => {
+    const before = buildV3Snapshot(v3SnapState((s) => {
+      s.map.sections.notes.push({ id: "note1", label: "deploy key: api_key=abcdefghijklmnop123456", origin: "user", depth: 0 });
+      s.content.notes.push({ id: "note1", summary: "api_key=abcdefghijklmnop123456", body: "", origin: "user" });
+    }));
+    const after = buildV3Snapshot(v3SnapState());
+    for (const out of [renderV3DiffJson(diffV3States(before, after), {}), renderV3DiffMarkdown(diffV3States(before, after), {})]) {
+      assertNotIncludes(out, "abcdefghijklmnop123456", "raw secret leaked into v3 diff output");
+      assertIncludes(out, "[REDACTED]");
+    }
+  });
+
+  test("diff v3: redacting cookie/PEM content never corrupts the rendered JSON", () => {
+    // Regression: filtering the serialized JSON (instead of field-by-field)
+    // let a greedy `cookie: ...` redaction consume a structural quote and
+    // crash renderV3DiffJson with "Unterminated string in JSON".
+    const secretLabel = "set cookie: session=abc123def456";
+    const pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIBsecretkeymaterial\n-----END RSA PRIVATE KEY-----";
+    const before = buildV3Snapshot(v3SnapState());
+    const after = buildV3Snapshot(v3SnapState((s) => {
+      s.map.sections.notes.push({ id: "note1", label: secretLabel, origin: "user", depth: 0 });
+      s.content.notes.push({ id: "note1", summary: secretLabel, body: pem, origin: "user" });
+    }));
+    const model = diffV3States(before, after);
+
+    let json;
+    try {
+      json = renderV3DiffJson(model, { snapshotId: "snap-x" });
+    } catch (err) {
+      assert.fail(`renderV3DiffJson threw on secret-bearing content: ${err.message}`);
+    }
+    // The rendered document must still be valid JSON.
+    const parsed = JSON.parse(json);
+    assert(Array.isArray(parsed.added), "rendered v3 diff JSON is structurally corrupt");
+    assertNotIncludes(json, "abc123def456", "cookie value leaked");
+    assertNotIncludes(json, "MIIBsecretkeymaterial", "PEM material leaked");
+    assertIncludes(json, "[REDACTED]");
+
+    // Markdown rendering must not throw either.
+    let md;
+    try {
+      md = renderV3DiffMarkdown(model, { snapshotId: "snap-x" });
+    } catch (err) {
+      assert.fail(`renderV3DiffMarkdown threw on secret-bearing content: ${err.message}`);
+    }
+    assertNotIncludes(md, "abc123def456", "cookie value leaked into markdown");
+    assertNotIncludes(md, "MIIBsecretkeymaterial", "PEM material leaked into markdown");
+  });
+
+  test("diff v3: runDiff compares v3 snapshots with the current state and never mutates", async () => {
+    const before = v3SnapState();
+    const io = makeFakeIo({});
+    const snap = await writeV3Snapshot(before, { handoffDir: DIFF_HANDOFF_DIR }, io, {
+      timestamp: "2026-08-02T00:00:00.000Z",
+    });
+    // Current state: task1 completed, risk body edited.
+    const current = v3SnapState((s) => {
+      s.map.sections.tasks[0].checked = true;
+      s.content.risks[0].body = "Edited risk body.";
+    });
+    io.store.set(`${DIFF_HANDOFF_DIR}/context-map.md`, renderContextMapV3(current.map, { lang: "en" }));
+    for (const key of V3_SECTION_KEYS) {
+      io.store.set(`${DIFF_HANDOFF_DIR}/${CONTENT_DIR}/${CONTENT_FILES[key]}`, renderContentFile(key, current.content[key]));
+    }
+
+    const opsBefore = io.ops.length;
+    const result = await runDiff({ handoffDir: DIFF_HANDOFF_DIR }, io);
+    assert(result.ok, `runDiff failed: ${result.error}`);
+    assertEqual(result.format, "markdown");
+    assertIncludes(result.output, "Task state changed");
+    assertIncludes(result.output, "Body edited");
+    assertIncludes(result.output, "task1");
+    assertIncludes(result.output, "risk1");
+
+    const json = await runDiff({ handoffDir: DIFF_HANDOFF_DIR }, io, { format: "json" });
+    const parsed = JSON.parse(json.output);
+    assertEqual(parsed.taskStateChanged.length, 1);
+    assertEqual(parsed.bodyEdited.length, 1);
+
+    // Read-only contract: no writes, renames, or removals beyond the seeded snapshot write.
+    const opsAfter = io.ops.slice(opsBefore);
+    assertEqual(opsAfter.length, 0, `diff must not mutate state, ops: ${JSON.stringify(opsAfter)}`);
+  });
+
+  test("diff v3: v2 snapshots are not eligible baselines in a v3 layout", async () => {
+    const v2 = diffState({ goal: [{ text: "Old v2 goal", depth: 0 }] });
+    const [v2Name, v2Body] = diffSnapshotFile(v2, "2026-07-28T00-00-00-000Z");
+    const current = v3SnapState();
+    const io = makeFakeIo({
+      [`${DIFF_SNAP_DIR}/${v2Name.split("/").pop()}`]: v2Body,
+      [`${DIFF_HANDOFF_DIR}/context-map.md`]: renderContextMapV3(current.map, { lang: "en" }),
+    });
+    for (const key of V3_SECTION_KEYS) {
+      io.store.set(`${DIFF_HANDOFF_DIR}/${CONTENT_DIR}/${CONTENT_FILES[key]}`, renderContentFile(key, current.content[key]));
+    }
+
+    const result = await runDiff({ handoffDir: DIFF_HANDOFF_DIR }, io);
+    assert(!result.ok, "a v2-only snapshot history must not serve a v3 diff");
+    assertIncludes(result.error, "snapshot");
+    assert(result.guidance && result.guidance.includes("save"), `guidance should be actionable: ${result.guidance}`);
   });
 
   // ── Semantic snapshots (v2.3) ─────────────────────────────────────────────

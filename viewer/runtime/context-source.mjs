@@ -55,14 +55,27 @@ export async function resolveContextMap(rootUri, fsApi = { realpath }) {
   };
 }
 
-export async function readContextMapSource(
-  source,
-  fsApi = { open, realpath, stat },
+/**
+ * TOCTOU-safe read of one fixed file inside a canonical workspace root.
+ *
+ * Security properties (shared by the Context Map source and every v3 content
+ * file):
+ * - O_NOFOLLOW open: the final path component must not be a symlink.
+ * - The opened handle is stat'ed: it must be a regular file within maxBytes.
+ * - The path is canonicalized with realpath AFTER opening and must stay
+ *   inside rootPath (canonical containment).
+ * - The realpath target's dev/ino must match the opened handle, so replacing
+ *   a parent directory between validation and read cannot redirect the bytes.
+ */
+export async function readContainedFile(
+  filePath,
+  rootPath,
+  { maxBytes = MAX_SOURCE_BYTES, fsApi = { open, realpath, stat } } = {},
 ) {
   let handle;
   try {
     handle = await fsApi.open(
-      source.filePath,
+      filePath,
       constants.O_RDONLY | constants.O_NOFOLLOW,
     );
   } catch (error) {
@@ -73,10 +86,10 @@ export async function readContextMapSource(
   try {
     const info = await handle.stat();
     if (!info.isFile()) throw new ContextSourceError("ACCESS_DENIED");
-    if (info.size > MAX_SOURCE_BYTES) throw new ContextSourceError("TOO_LARGE");
+    if (info.size > maxBytes) throw new ContextSourceError("TOO_LARGE");
 
-    const targetPath = await fsApi.realpath(source.filePath);
-    if (!isInside(source.rootPath, targetPath)) {
+    const targetPath = await fsApi.realpath(filePath);
+    if (!isInside(rootPath, targetPath)) {
       throw new ContextSourceError("ACCESS_DENIED");
     }
     const targetInfo = await fsApi.stat(targetPath);
@@ -84,7 +97,7 @@ export async function readContextMapSource(
       throw new ContextSourceError("ACCESS_DENIED");
     }
 
-    const bytes = Buffer.allocUnsafe(MAX_SOURCE_BYTES + 1);
+    const bytes = Buffer.allocUnsafe(maxBytes + 1);
     let offset = 0;
     while (offset < bytes.byteLength) {
       const { bytesRead } = await handle.read(
@@ -96,7 +109,7 @@ export async function readContextMapSource(
       if (bytesRead === 0) break;
       offset += bytesRead;
     }
-    if (offset > MAX_SOURCE_BYTES) {
+    if (offset > maxBytes) {
       throw new ContextSourceError("TOO_LARGE");
     }
     return bytes.subarray(0, offset).toString("utf8");
@@ -106,4 +119,14 @@ export async function readContextMapSource(
   } finally {
     await handle.close().catch(() => {});
   }
+}
+
+export async function readContextMapSource(
+  source,
+  fsApi = { open, realpath, stat },
+) {
+  return readContainedFile(source.filePath, source.rootPath, {
+    maxBytes: MAX_SOURCE_BYTES,
+    fsApi,
+  });
 }

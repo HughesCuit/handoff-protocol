@@ -419,6 +419,12 @@ export function planMigration(inputs = {}, userInstructions) {
   }
   const mapUsable = mapParsed !== null;
 
+  // A v3 context directory is never a legacy-migration source: the v2 parser
+  // can read its headings, but its semantics belong to the v3 layout.
+  if (mapUsable && /handoff-protocol:v3/i.test(String(inputs.contextMapMd).slice(0, 500))) {
+    return emptyPlan("already v3 (v3 context directory)", diagnostics);
+  }
+
   // Structured legacy context.json outranks the human-readable files.
   let json = null;
   if (inputs.contextJson != null) {

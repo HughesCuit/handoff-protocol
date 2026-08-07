@@ -124,6 +124,13 @@ export class SessionManager {
     };
   }
 
+  /** Lazily resolved node detail for a session's own workspace. */
+  async nodeDetail(token, nodeId) {
+    const session = await this.touch(token);
+    if (!session) return null;
+    return session.store.nodeDetail(nodeId);
+  }
+
   async prune() {
     const now = this.now();
     await Promise.all(

@@ -25,22 +25,24 @@
 
 import { parse } from "https://deno.land/std@0.224.0/flags/mod.ts";
 import { ensureDir, walk, exists } from "https://deno.land/std@0.224.0/fs/mod.ts";
-import { join, extname } from "https://deno.land/std@0.224.0/path/mod.ts";
+import { join, extname, dirname } from "https://deno.land/std@0.224.0/path/mod.ts";
 import {
   filterSensitive,
-  HANDOFF_FILES,
-  PROTOCOL_VERSION,
+  V3_PROTOCOL_VERSION,
   CONTEXT_MAP_FILE,
-  buildInferredSections,
-  parseContextMap,
-  reconcileContextMap,
-  renderContextMap,
 } from "./context-map.ts";
 import {
-  buildContextJson,
-  generateViews,
+  buildInferredV3Sections,
+  loadHandoffState,
+  reconcileV3State,
+} from "./handoff-state.mjs";
+import { V3_TRACKED_PATHS } from "./content-files.mjs";
+import {
+  buildInitialV3Files,
+  buildV3ContextJson,
+  renderV3Files,
   sha256Hex,
-  viewTamperWarnings,
+  writeFilesAtomically,
 } from "./views.mjs";
 import {
   extractTodoComments,
@@ -48,8 +50,8 @@ import {
   SOURCE_EXTENSIONS,
 } from "./source-comments.mjs";
 import { validateProjectConfig } from "./config.mjs";
-import { applyMigration, planMigration } from "./migrate.mjs";
-import { writeSnapshot } from "./snapshots.mjs";
+import { applyV3Migration, detectLayout, planV2ToV3Migration } from "./migrate-v3.mjs";
+import { writeV3Snapshot } from "./snapshots.mjs";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -241,7 +243,7 @@ async function ensureSubmoduleReady(cwd: string): Promise<boolean> {
 }
 
 async function commitAndPushSubmodule(handoffDir: string): Promise<boolean> {
-  for (const file of HANDOFF_FILES) {
+  for (const file of V3_TRACKED_PATHS) {
     await run(["git", "add", file], { cwd: handoffDir });
   }
 
@@ -278,6 +280,25 @@ async function promptUser(message: string): Promise<string> {
 async function initStorage(cwd: string, mode?: string): Promise<StorageConfig | null> {
   let selectedMode = mode;
 
+  // Write the initial v3 layout (empty Context Map with an empty Current
+  // Goal, eight empty content files, the generated view, and v3 metadata)
+  // into a freshly initialized handoff directory. An existing handoff —
+  // including a legacy v2 one awaiting migration — is left untouched.
+  const writeInitialV3Layout = async (handoffDir: string, project: string): Promise<boolean> => {
+    if (await exists(join(handoffDir, CONTEXT_MAP_FILE))) return false;
+    const files = buildInitialV3Files({
+      project,
+      timestamp: new Date().toISOString(),
+      agent: Deno.env.get("AGENT_NAME") || "opencode",
+    });
+    for (const [rel, content] of Object.entries(files)) {
+      const path = join(handoffDir, rel);
+      await ensureDir(dirname(path));
+      await Deno.writeTextFile(path, content);
+    }
+    return true;
+  };
+
   if (!selectedMode) {
     console.log("");
     console.log("Handoff storage is not configured.");
@@ -309,7 +330,7 @@ async function initStorage(cwd: string, mode?: string): Promise<StorageConfig | 
     await ensureDir(join(cwd, ".handoff"));
 
     const config: StorageConfig = {
-      version: PROTOCOL_VERSION,
+      version: V3_PROTOCOL_VERSION,
       storage: { mode: "direct", path: ".handoff" },
     };
     validateConfigOrExit(config);
@@ -342,6 +363,9 @@ async function initStorage(cwd: string, mode?: string): Promise<StorageConfig | 
     }
 
     console.log("Initialized direct storage mode.");
+    if (await writeInitialV3Layout(join(cwd, ".handoff"), (await readProjectInfo()).name)) {
+      console.log("Created the initial v3 layout (context-map.md, content/, views/HANDOFF.md, context.json).");
+    }
     return config;
 
   } else if (selectedMode === "submodule") {
@@ -378,7 +402,7 @@ async function initStorage(cwd: string, mode?: string): Promise<StorageConfig | 
     }
 
     const config: StorageConfig = {
-      version: PROTOCOL_VERSION,
+      version: V3_PROTOCOL_VERSION,
       storage: { mode: "submodule", path: ".handoff", remote: remoteUrl },
     };
     validateConfigOrExit(config);
@@ -386,6 +410,9 @@ async function initStorage(cwd: string, mode?: string): Promise<StorageConfig | 
 
     console.log(`Initialized submodule storage mode.`);
     console.log(`Remote: ${remoteUrl}`);
+    if (await writeInitialV3Layout(join(cwd, ".handoff"), (await readProjectInfo()).name)) {
+      console.log("Created the initial v3 layout (context-map.md, content/, views/HANDOFF.md, context.json).");
+    }
     return config;
   }
 
@@ -681,18 +708,35 @@ const snapshotIo = {
 };
 
 /**
- * Migrate a legacy (pre-v2) handoff into the canonical model before the save
- * proceeds. The migration is atomic: originals are backed up under
+ * Migrate a pre-v3 handoff (v2 or legacy 1.x) into the canonical v3 model
+ * before the save proceeds. Atomic: originals are backed up under
  * .handoff/history/migrations/<UTC-timestamp>/ and only replaced after every
- * temporary output validates. Migrated nodes enter the map as user-owned
- * content, so they always win over this save's fresh inference. Returns the
- * migration diagnostics (recorded in context.json), or null when the handoff
- * is already v2.
+ * temporary output validates; the config version upgrade renames last.
+ * Returns the migration diagnostics (recorded in context.json), or null when
+ * the handoff is already v3 or has no data.
  */
-async function migrateLegacyHandoff(
+async function layoutOfDir(handoffDir: string): Promise<string> {
+  const files: string[] = [];
+  try {
+    for await (const entry of Deno.readDir(handoffDir)) files.push(entry.name);
+  } catch {
+    return "empty";
+  }
+  for (const sub of ["content", "views"]) {
+    try {
+      for await (const entry of Deno.readDir(join(handoffDir, sub))) files.push(`${sub}/${entry.name}`);
+    } catch {
+      // Subdirectory absent: not a v3 marker.
+    }
+  }
+  return detectLayout(files);
+}
+
+async function migrateToV3(
   cwd: string,
   handoffDir: string,
 ): Promise<{ migration: string[]; conflicts: unknown[] } | null> {
+  if ((await layoutOfDir(handoffDir)) === "v3") return null;
   const readIfExists = async (p: string): Promise<string | undefined> => {
     try {
       return await Deno.readTextFile(p);
@@ -700,22 +744,28 @@ async function migrateLegacyHandoff(
       return undefined;
     }
   };
-  const plan = planMigration({
+  const inputs = {
     config: await readIfExists(join(cwd, ".handoff.config.json")),
     contextJson: await readIfExists(join(handoffDir, "context.json")),
     handoffMd: await readIfExists(join(handoffDir, "HANDOFF.md")),
     tasksMd: await readIfExists(join(handoffDir, "tasks.md")),
     decisionsMd: await readIfExists(join(handoffDir, "decisions.md")),
     contextMapMd: await readIfExists(join(handoffDir, CONTEXT_MAP_FILE)),
-  });
+  };
+  const hasAnyInput = Object.entries(inputs)
+    .filter(([key]) => key !== "config")
+    .some(([, value]) => value != null);
+  if (!hasAnyInput) return null;
+
+  const plan = planV2ToV3Migration(inputs);
   if (!plan.needed) return null;
 
-  const result = await applyMigration(
+  const result = await applyV3Migration(
+    migrationIo,
     plan,
     { handoffDir, configPath: join(cwd, ".handoff.config.json") },
-    migrationIo,
   );
-  console.log(`Legacy handoff detected — migrated to Handoff Protocol v${PROTOCOL_VERSION}.`);
+  console.log(`Previous handoff layout detected — migrated to Handoff Protocol v${V3_PROTOCOL_VERSION}.`);
   console.log(`Backup: ${result.backupDir}`);
   for (const entry of plan.diagnostics.migration) console.log(`  - ${entry}`);
   if (plan.diagnostics.conflicts.length > 0) {
@@ -760,9 +810,9 @@ async function save(mode: string, lang?: string, verbosity?: string): Promise<vo
     await ensureDir(handoffDir);
   }
 
-  // Legacy (pre-v2) handoffs migrate atomically into the canonical model
-  // before inference reconciles into the map below.
-  const migrationDiagnostics = await migrateLegacyHandoff(cwd, handoffDir);
+  // Pre-v3 handoffs (v2 or legacy 1.x) migrate atomically into the canonical
+  // v3 model before inference reconciles below.
+  const migrationDiagnostics = await migrateToV3(cwd, handoffDir);
 
   const { name, language } = await readProjectInfo();
   const git = await getGitState();
@@ -771,8 +821,6 @@ async function save(mode: string, lang?: string, verbosity?: string): Promise<vo
 
   // Auto-analysis
   const todos = config.includeTodoScan ? await scanTodos(cwd) : [];
-  const inferredGoal = inferGoalFromCommits(recentCommits);
-  const completed = inferCompletedFromCommits(recentCommits);
   const status = inferStatusFromGit(git, modifiedFiles);
   const risks = config.includeRiskAnalysis
     ? inferRisksFromState(git, todos, modifiedFiles)
@@ -787,122 +835,101 @@ async function save(mode: string, lang?: string, verbosity?: string): Promise<vo
     }
   }
 
-  const ctx: HandoffContext = {
-    version: PROTOCOL_VERSION,
-    timestamp: new Date().toISOString(),
-    agent: Deno.env.get("AGENT_NAME") || "opencode",
-    project: name,
-    current_goal: inferredGoal,
+  const timestamp = new Date().toISOString();
+  const agent = Deno.env.get("AGENT_NAME") || "opencode";
+
+  // Verified project evidence becomes inference. Current Goal is never
+  // inferred: commit messages (including release commits) describe history,
+  // not goals — only an explicit user goal or an existing valid goal
+  // populates that section.
+  const inferred = buildInferredV3Sections({
     status,
-    completed,
-    modified_files: modifiedFiles,
     todos: todos.slice(0, config.maxTodos),
-    blockers: [],
+    nextSteps: [],
     decisions: [],
-    next_steps: [],
-    git,
     risks,
+    blockers: [],
     notes,
-    lang,
-    verbosity,
-  };
+  });
 
-  // Context Map: the only writable semantic source. Inference reconciles
-  // into context-map.md on every save, at every mode and verbosity level;
-  // user-edited nodes always win over agent inference, and agent-managed
-  // nodes are refreshed only by non-empty inference, so a low-verbosity save
-  // never degrades the map. The sensitive-data filter is applied before any
-  // content is written.
-  const inferred = buildInferredSections(ctx);
-  const mapPath = join(handoffDir, CONTEXT_MAP_FILE);
-  let existingMap = null;
+  // Previous metadata supplies monotonic ID counters and view hashes.
+  let previousJson: Record<string, unknown> | null = null;
   try {
-    existingMap = parseContextMap(await Deno.readTextFile(mapPath));
+    previousJson = JSON.parse(await Deno.readTextFile(join(handoffDir, "context.json")));
   } catch {
-    // Absent or unreadable: start from a fresh map.
+    // No readable previous context.json: counters recover from durable state.
   }
-  const reconciled = reconcileContextMap(existingMap, inferred);
-  const mapContent = filterSensitive(renderContextMap(reconciled, { lang }));
 
-  // HANDOFF.md / tasks.md / decisions.md are deterministic views generated
-  // from the reconciled map plus save-time machine metadata — never from
-  // inference directly.
-  const metadata = {
-    timestamp: ctx.timestamp,
-    agent: ctx.agent,
-    project: ctx.project,
-    lang: lang || language,
-    verbosity: ctx.verbosity,
-    git: ctx.git,
-    completed,
-    modifiedFiles,
-    blockers: ctx.blockers,
-    nextSteps: ctx.next_steps,
+  // Reconcile the existing canonical state with fresh inference. User-owned
+  // labels, bodies, hierarchy, and task states always win; IDs allocate only
+  // for genuinely new semantic nodes. A present-but-invalid state aborts the
+  // save rather than destroying user content.
+  let existing = null;
+  if (await exists(join(handoffDir, CONTEXT_MAP_FILE))) {
+    existing = await loadHandoffState(migrationIo, handoffDir);
+  }
+  const reconciled = reconcileV3State({ existing, inferred, metadata: previousJson });
+  const state = {
+    version: V3_PROTOCOL_VERSION,
+    map: reconciled.map,
+    content: reconciled.content,
+    diagnostics: reconciled.diagnostics,
   };
-  const views: Record<string, string> = {};
-  for (const [name, content] of Object.entries(generateViews(reconciled, metadata, { verbosity }))) {
-    views[name] = filterSensitive(content as string);
-  }
 
-  // Manual edits to generated views are overwritten, never imported. Warn
+  // Manual edits to the generated view are overwritten, never imported. Warn
   // when the on-disk view no longer matches the hash stored by the last save.
-  let previousViews: Record<string, string> | null = null;
-  try {
-    previousViews = JSON.parse(await Deno.readTextFile(join(handoffDir, "context.json"))).views;
-  } catch {
-    // No readable previous context.json: nothing to compare against.
-  }
-  const currentContents: Record<string, string> = {};
-  if (previousViews) {
-    for (const name of Object.keys(previousViews)) {
-      try {
-        currentContents[name] = await Deno.readTextFile(join(handoffDir, name));
-      } catch {
-        // Missing views are regenerated silently.
+  const storedViewHash = previousJson && (previousJson.hashes as Record<string, string> | undefined)?.["views/HANDOFF.md"];
+  if (storedViewHash) {
+    try {
+      const current = await Deno.readTextFile(join(handoffDir, "views", "HANDOFF.md"));
+      if (sha256Hex(current) !== storedViewHash) {
+        console.error(
+          "Warning: views/HANDOFF.md was manually edited, but it is generated from context-map.md and the content/ files. " +
+          "Edit those instead — manual view changes are never imported and are overwritten on save."
+        );
       }
-    }
-    for (const warning of viewTamperWarnings(previousViews, currentContents)) {
-      console.error(warning);
+    } catch {
+      // Missing views are regenerated silently.
     }
   }
 
-  const writeOps: Promise<void>[] = [Deno.writeTextFile(mapPath, mapContent)];
-  for (const [name, content] of Object.entries(views)) {
-    writeOps.push(Deno.writeTextFile(join(handoffDir, name), content));
+  // Render every file from the canonical state and filter sensitive data
+  // before anything is persisted.
+  const metadata = { timestamp, agent, project: name, lang: lang || language, git };
+  const files: Record<string, string> = {};
+  for (const [file, content] of Object.entries(renderV3Files(state, metadata))) {
+    files[file] = filterSensitive(content as string);
   }
-  await Promise.all(writeOps);
+  const contextJson = buildV3ContextJson({
+    state,
+    project: name,
+    git,
+    environment: { timestamp, agent, lang: metadata.lang },
+    diagnostics: {
+      migration: (migrationDiagnostics && migrationDiagnostics.migration) || [],
+      conflicts: (migrationDiagnostics && migrationDiagnostics.conflicts) || [],
+      integrity: reconciled.diagnostics,
+    },
+    files,
+  } as never);
+  // Counters are monotonic across deletions; the reconciled high-water marks
+  // win over what a fresh recovery would observe.
+  contextJson.idCounters = reconciled.counters;
+  files["context.json"] = filterSensitive(JSON.stringify(contextJson, null, 2));
 
-  // context.json v2: metadata + Git state + hashes of the views just written.
-  const viewHashes: Record<string, string> = {};
-  for (const [name, content] of Object.entries(views)) {
-    viewHashes[name] = sha256Hex(content);
-  }
-  // Low-verbosity saves do not rewrite tasks.md/decisions.md; carry their
-  // stored hashes forward so tamper detection keeps covering them. Views
-  // deleted on disk are dropped instead of haunting future saves.
-  for (const [name, hash] of Object.entries(previousViews || {})) {
-    if (!(name in viewHashes) && currentContents[name] != null) {
-      viewHashes[name] = hash;
-    }
-  }
-  const contextJson = buildContextJson(metadata, viewHashes, migrationDiagnostics || undefined);
-  await Deno.writeTextFile(
-    join(handoffDir, "context.json"),
-    filterSensitive(JSON.stringify(contextJson, null, 2))
-  );
+  await writeFilesAtomically(migrationIo, handoffDir, files);
 
-  // Semantic snapshot (v2.3): record the reconciled map after a successful
-  // canonical save. Best-effort — a failed snapshot never fails the save.
+  for (const diagnostic of reconciled.diagnostics) {
+    console.error(`Note: ${diagnostic}`);
+  }
+
+  // Semantic snapshot: record the canonical state after a successful save.
+  // Best-effort — a failed snapshot never fails the save.
   try {
-    const snapshot = await writeSnapshot(reconciled, { handoffDir }, snapshotIo);
+    const snapshot = await writeV3Snapshot(state, { handoffDir }, snapshotIo);
     if (snapshot.written) console.log(`Snapshot: ${snapshot.path}`);
   } catch (err) {
     console.error(`Warning: snapshot failed: ${(err as Error).message}`);
-  }
-
-  let fileSummary = "HANDOFF.md, context.json, context-map.md";
-  if (verbosity !== "low") {
-    fileSummary += ", tasks.md, decisions.md";
   }
 
   // Post-save actions based on storage mode
@@ -925,8 +952,7 @@ async function save(mode: string, lang?: string, verbosity?: string): Promise<vo
   console.log(`Lang: ${lang || "(auto-detect)"}`);
   console.log(`Verbosity: ${verbosity || "med (default)"}`);
   console.log(`Project: ${name} (${language})`);
-  console.log(`Goal: ${inferredGoal || "(inferred from commits)"}`);
-  console.log(`Files: ${fileSummary}`);
+  console.log(`Files: context-map.md, content/ (8 section files), views/HANDOFF.md, context.json`);
   if (todos.length > 0) {
     console.log(`Scanned: ${todos.length} TODO/FIXME items found`);
   }

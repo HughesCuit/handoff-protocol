@@ -10,25 +10,50 @@ Handoff Protocol is a standardized way to save, restore, and share work context 
 
 It manages a `.handoff/` directory - the **Agent Context Protocol** equivalent of `.git/` for AI agent collaboration.
 
-> **Versioning note:** the protocol *schema* version (`PROTOCOL_VERSION` in `scripts/context-map.mjs`, embedded in `context.json` and generated files) tracks the `.handoff/` data format — it is `2.0.0` for the whole v2 line. The *product* release version (`package.json`, release tags) tracks feature releases (v2.1, v2.2, v2.3, …). They advance independently: a v2.3.0 install still speaks schema 2.0.0.
+> **Versioning note:** the protocol *schema* version (`protocolVersion` in `context.json`, `V3_PROTOCOL_VERSION` in `scripts/context-map.mjs`) tracks the `.handoff/` data format — it is `3.0.0` for the v3 line. The *product* release version (`package.json`, release tags) tracks feature releases.
 
-Since v2, `.handoff/context-map.md` is the canonical, human-editable source of
-all semantic state. `HANDOFF.md`, `tasks.md`, and `decisions.md` are
-deterministic views generated from the map (marked `do not edit`), and
-`context.json` keeps only metadata plus SHA-256 view hashes — manual view
-edits warn and are never imported. Nested Markdown list indentation expresses
-parent-child relationships, and agent-generated nodes carry a content
-fingerprint, so direct text or checkbox edits automatically become user-owned
-and survive later saves.
+Since v3, the Context Map is a **directory**: `.handoff/context-map.md` is a
+compact semantic directory (stable node IDs, labels, hierarchy, task state),
+and the full node bodies live in eight section files under `.handoff/content/`,
+keyed by those IDs. `views/HANDOFF.md` is the only generated view (marked
+`do not edit`), and `context.json` keeps only metadata, monotonic ID counters,
+and SHA-256 file hashes — manual view edits warn and are never imported. Nested
+Markdown list indentation expresses parent-child relationships, and
+agent-generated nodes/entries carry a fingerprint, so direct edits automatically
+become user-owned and survive later saves. v2 and legacy 1.x handoffs stay
+readable; the first `/handoff save` migrates them automatically (see
+[`docs/migrations/v2-to-v3.md`](docs/migrations/v2-to-v3.md)).
+
+**v3 layout:**
+
+```
+.handoff/
+  context-map.md          # directory: stable IDs, labels, hierarchy, state
+  content/
+    current-goal.md       # node bodies (summary + detail), keyed by stable ID
+    current-status.md
+    tasks.md
+    decisions.md
+    open-questions.md
+    risks.md
+    knowledge-notes.md
+    excluded.md
+  views/
+    HANDOFF.md            # the only generated view (do not edit)
+  context.json            # protocolVersion 3.0.0, ID counters, file hashes
+  history/
+    snapshots/
+    migrations/           # sensitive-filtered backups of pre-migration originals
+```
 
 ## Features
 
 - **Cross-agent**: Core workflow verified on Codex, Claude Code, OpenCode, and Kimi Code CLI — see [Agent Compatibility](#agent-compatibility) for honest tiers
 - **Standard**: Unix-style commands, machine-readable formats (JSON Schema)
-- **Canonical Context Map** (v2): Human-editable `context-map.md` is the only writable semantic source — your edits win over agent inference, and generated views make tampering visible
-- **Focused Load**: `/handoff load --focus "current task"` compiles the map down to relevant nodes within a token budget, never omitting goal/status, and falls back to full context safely
-- **Semantic Diff**: `/handoff diff` reports added/removed/edited/moved/task-state changes against bounded, sanitized snapshots
-- **Safe Migration**: Legacy 1.x / v1.5 handoffs migrate atomically on the next save, with sensitive-filtered backups and no silent loss
+- **Canonical Context Map** (v3): A compact directory (`context-map.md`) plus eight `content/` body files, keyed by stable node IDs — your edits win over agent inference, and the generated view makes tampering visible
+- **Effort-aware Load**: `/handoff load --effort min|low|med|high|max --focus "current task"` compiles the directory + bodies down to relevant nodes, never omitting goal/status, and falls back to full context safely
+- **Semantic Diff**: `/handoff diff` reports added/deleted/moved/label/summary/body/task-state/attribute changes by stable ID against bounded, sanitized snapshots
+- **Safe Migration**: v2 and legacy 1.x / v1.5 handoffs migrate atomically to v3 on the next save, with sensitive-filtered backups, rollback, and no silent loss
 - **Obsidian Adapter** (optional UI): Observe live `.handoff/` state from an Obsidian Vault via a link — the adapter never copies or owns project state
 - **Secure**: Automatic sensitive data filtering (API keys, tokens, passwords, JWT, cloud credentials) before anything is persisted or displayed
 - **Smart**: Auto-analyzes codebase comments for TODO/FIXME, infers goals from git history
@@ -95,7 +120,7 @@ Stores `.handoff/` directly in the current project directory.
 **Config (`.handoff.config.json`):**
 ```json
 {
-  "version": "2.0.0",
+  "version": "3.0.0",
   "storage": {
     "mode": "direct",
     "path": ".handoff"
@@ -127,7 +152,7 @@ Submodule mode keeps this data in a separate private repository while maintainin
 **Config (`.handoff.config.json`):**
 ```json
 {
-  "version": "2.0.0",
+  "version": "3.0.0",
   "storage": {
     "mode": "submodule",
     "path": ".handoff",
@@ -290,14 +315,13 @@ When you run `/handoff save`, the skill:
 
 1. Reads `.handoff.config.json` for storage mode
 2. For submodule: ensures submodule is initialized
-3. Migrates legacy 1.x / v1.5 handoffs atomically (originals backed up under `.handoff/history/migrations/`)
+3. Detects the layout; migrates pre-v3 (v2 or legacy 1.x / v1.5) handoffs atomically to v3 (originals backed up under `.handoff/history/migrations/`)
 4. Collects git state (status, diff, log)
 5. Scans codebase comments for TODO/FIXME
-6. Infers current goal from recent commits
-7. Generates or reconciles the canonical `context-map.md` (preserving your edits, at every verbosity)
-8. Regenerates the `HANDOFF.md`, `tasks.md`, `decisions.md` views and `context.json` (metadata + view hashes)
-9. Writes a bounded, sanitized snapshot under `.handoff/history/snapshots/` when the semantic state changed
-10. For submodule: commits and pushes to submodule repo
+6. Reconciles the canonical v3 state — directory (`context-map.md`) plus the eight `content/` body files — preserving your edits and allocating stable IDs only for genuinely new nodes (a goal is never inferred from commits)
+7. Atomically writes `context-map.md`, `content/`, `views/HANDOFF.md`, and `context.json` (metadata + ID counters + file hashes)
+8. Writes a bounded, sanitized snapshot under `.handoff/history/snapshots/` when the semantic state changed
+9. For submodule: commits and pushes to submodule repo
 
 ### Language & Verbosity
 
@@ -320,19 +344,20 @@ When you run `/handoff load`, the skill:
 
 1. Reads storage configuration
 2. For submodule: initializes submodule if needed
-3. Reads `.handoff/context-map.md` first (the canonical source), supplemented by machine state from `context.json` (falls back to `context.json`, then `HANDOFF.md` for legacy 1.x handoffs; v2 handoffs with a missing map fall back to the `HANDOFF.md` view)
-4. Warns about manually edited generated views and legacy formats pending migration
-5. With `--focus`/`--budget`, compiles the map down to relevant nodes — core goal/status is never omitted, and an unreliable focus falls back to the full map with a reported reason
+3. Reads the canonical v3 state — the `context-map.md` directory plus the `content/` bodies — supplemented by machine state from `context.json` (falls back to `views/HANDOFF.md`, then legacy `context.json`/`HANDOFF.md` for v2 / 1.x handoffs)
+4. Warns about a manually edited generated view and pre-v3 formats pending migration
+5. With `--effort min|low|med|high|max` (default `med`) and `--focus`/`--budget`, compiles the directory + bodies down to relevant nodes — core goal/status is never omitted, an explicit budget degrades bodies → summaries → directory-only with reported steps, and an unreliable focus falls back to the full map with a reported reason
 6. Sanitizes output (security filtering)
 7. Generates recommended next actions
 
 ### Migration Backup & Recovery
 
-Legacy handoffs load read-only forever; the next `/handoff save` migrates them to v2 automatically:
+v2 and legacy 1.x / v1.5 handoffs load read-only; the first `/handoff save` migrates them to the v3 directory layout automatically (see [`docs/migrations/v2-to-v3.md`](docs/migrations/v2-to-v3.md)):
 
-- Migration is **atomic**: outputs are written through temporary files, originals (including `.handoff.config.json`) are backed up to `.handoff/history/migrations/<UTC-timestamp>/`, and renames happen only after validation — the config version upgrade renames last. If any rename fails mid-phase, every file already replaced is rolled back, leaving the originals byte-identical.
-- Backups are **sensitive-data filtered**: if a legacy file contained credential-like content, its backup holds the filtered text, not the original bytes.
-- If a failure strikes **during** the rename phase, already-replaced files are rolled back automatically; the backup directory remains as an additional safety net.
+- Migration is **atomic**: outputs are written through temporary files, originals (including `.handoff.config.json`) are backed up to `.handoff/history/migrations/<UTC-timestamp>/`, and renames happen only after validation — the config version upgrade (`3.0.0`) renames last, and the old root `HANDOFF.md`/`tasks.md`/`decisions.md` are retired. If any rename fails mid-phase, every file already replaced is rolled back, leaving the originals byte-identical.
+- Backups are **sensitive-data filtered**: if an old file contained credential-like content, its backup holds the filtered text, not the original bytes.
+- Migration is **idempotent**: an already-v3 handoff is never re-migrated and creates no second backup.
+- Every migrated node receives a **stable ID**; the complete original text becomes the body summary. **Do not** manually copy old root `tasks.md`/`decisions.md` into `content/`.
 - Conflicting values are never silently dropped — superseded goal/status values stay visible under Open Questions → "Migration conflict", labeled with their source file.
 
 ### Obsidian Adapter (Optional UI)
@@ -357,7 +382,7 @@ node scripts/node/adapter.mjs obsidian link --vault /path/to/vault
 node scripts/node/diff.mjs
 ```
 
-Both runtimes share the runtime-agnostic ESM core under `scripts/` (`context-map.mjs`, `views.mjs`, `migrate.mjs`, `context-compiler.mjs`, `snapshots.mjs`, `context-diff.mjs`, `config.mjs`, `source-comments.mjs`, `adapters/obsidian.mjs`) so behavior is identical.
+Both runtimes share the runtime-agnostic ESM core under `scripts/` (`context-map.mjs`, `content-files.mjs`, `handoff-state.mjs`, `views.mjs`, `migrate.mjs`, `migrate-v3.mjs`, `context-compiler.mjs`, `snapshots.mjs`, `context-diff.mjs`, `config.mjs`, `source-comments.mjs`, `adapters/obsidian.mjs`) so behavior is identical.
 
 ## Tests
 

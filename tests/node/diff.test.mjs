@@ -186,3 +186,50 @@ test("diff: a flag-like token is never bound as a flag value", async () => {
   assertEqual(trailing.code, 1, "trailing --from with no value must be rejected");
   assertIncludes(trailing.stderr, "--from requires a value");
 });
+
+// ── v3 stable-ID diff ────────────────────────────────────────────────────────
+
+test("diff: a v3 layout reports stable-ID change categories and stays read-only", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "handoff-diff-v3-"));
+  await writeFile(join(dir, "package.json"), JSON.stringify({ name: "diff-v3" }) + "\n");
+  await writeFile(
+    join(dir, ".handoff.config.json"),
+    JSON.stringify({ version: "2.0.0", storage: { mode: "direct", path: ".handoff" } }, null, 2) + "\n"
+  );
+  await mkdir(join(dir, "src"), { recursive: true });
+  await writeFile(join(dir, "src", "app.ts"), "// TODO: wire the v3 diff\n");
+
+  const save = spawnSync(process.execPath, [join(root, "scripts", "node", "save.mjs")], { cwd: dir, encoding: "utf-8" });
+  assertEqual(save.status, 0, `save failed: ${save.stderr}`);
+
+  const mapPath = join(dir, ".handoff", "context-map.md");
+  const tasksPath = join(dir, ".handoff", "content", "tasks.md");
+  const snapDir = join(dir, ".handoff", "history", "snapshots");
+  const snapBefore = await readdir(snapDir);
+  assertEqual(snapBefore.length, 1, "save should record one v3 snapshot");
+  const snapshotBody = await readFile(join(snapDir, snapBefore[0]), "utf-8");
+
+  // Unsaved edits: complete task1 and edit its summary.
+  await writeFile(mapPath, (await readFile(mapPath, "utf-8")).replace("- [ ] `task1`", "- [x] `task1`"));
+  await writeFile(tasksPath, (await readFile(tasksPath, "utf-8")).replace("wire the v3 diff", "wire the v3 diff (edited)"));
+
+  const md = runDiff(dir);
+  assertEqual(md.code, 0, `diff failed: ${md.stderr}`);
+  assertIncludes(md.stdout, "Task state changed");
+  assertIncludes(md.stdout, "Summary edited");
+  assertIncludes(md.stdout, "task1");
+
+  const json = runDiff(dir, ["--format", "json"]);
+  assertEqual(json.code, 0, `diff failed: ${json.stderr}`);
+  const parsed = JSON.parse(json.stdout);
+  for (const key of ["added", "deleted", "moved", "labelEdited", "summaryEdited", "bodyEdited", "taskStateChanged", "attributesChanged"]) {
+    assert(Array.isArray(parsed[key]), `json.${key} must be an array`);
+  }
+  assertEqual(parsed.taskStateChanged.length, 1);
+  assertEqual(parsed.taskStateChanged[0].id, "task1");
+  assertEqual(parsed.summaryEdited.length, 1);
+
+  // Read-only: the snapshot is untouched and no new snapshot appeared.
+  assertEqual((await readdir(snapDir)).length, 1, "diff wrote a snapshot");
+  assertEqual(await readFile(join(snapDir, snapBefore[0]), "utf-8"), snapshotBody, "diff mutated the snapshot");
+});
